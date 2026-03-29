@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Scent Diffuser Setup",
+        "description": "Choose how to connect your scent diffuser.",
+        "menu_options": {
+          "ble_scan": "Bluetooth",
+          "cloud": "WiFi / Cloud (Aroma-Link only)"
+        }
+      },
+      "ble_scan": {
+        "title": "Select Bluetooth Device",
+        "description": "Select your scent diffuser from the list of discovered devices. Bluetooth provides local control with no cloud account required. All features are available including fan control and real-time status updates.",
+        "data": {
+          "ble_address": "Device"
+        }
+      },
+      "cloud": {
+        "title": "Aroma-Link Cloud Login",
+        "description": "Connect via the Aroma-Link cloud service. Requires an Aroma-Link account and internet connection. Only available for Aroma-Link diffusers (not ShinePick). Note: Fan control and real-time status updates are only available via Bluetooth.",
+        "data": {
+          "cloud_username": "Username",
+          "cloud_password": "Password"
+        }
+      },
+      "cloud_device": {
+        "title": "Select Device",
+        "description": "Select the device to add.",
+        "data": {
+          "cloud_device_id": "Device"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to device",
+      "invalid_auth": "Invalid credentials",
+      "no_devices": "No devices found",
+      "unknown": "Unknown error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  }
+}
