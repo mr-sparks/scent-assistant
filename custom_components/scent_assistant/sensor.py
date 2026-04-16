@@ -44,6 +44,8 @@ class DiffuserStatusSensor(SensorEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
@@ -71,7 +73,7 @@ class DiffuserConnectionSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_name = "Connection"
     _attr_icon = "mdi:bluetooth-connect"
-    _attr_entity_registry_enabled_default = False  # hidden by default
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
         self._device = device
@@ -82,6 +84,8 @@ class DiffuserConnectionSensor(SensorEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
