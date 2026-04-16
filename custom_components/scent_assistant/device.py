@@ -353,7 +353,7 @@ class ScentDiffuserDevice:
 
         # Cloud fallback
         if self.supports_cloud and self._cloud:
-            day_indices = [i for i in range(7) if weekday_mask & (1 << i)]
+            day_indices = [i + 1 for i in range(7) if weekday_mask & (1 << i)]
             success = await self._cloud.set_schedule(
                 self._cloud_device_id,
                 work_seconds=work, pause_seconds=pause,

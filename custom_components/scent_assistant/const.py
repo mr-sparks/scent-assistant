@@ -85,14 +85,14 @@ AL_PHASE_PAUSED = 0x02
 # Aroma-Link Cloud API constants
 # ---------------------------------------------------------------------------
 
-CLOUD_BASE_URL = "http://www.aroma-link.com"
+CLOUD_BASE_URL = "https://www.aroma-link.com"
 CLOUD_WEB_URL = "https://www.aroma-link.com"
 
 CLOUD_ENDPOINT_TOKEN = "/v2/app/token"
 CLOUD_ENDPOINT_DEVICES = "/v1/app/device/listAll/{user_id}"
 CLOUD_ENDPOINT_SWITCH = "/v1/app/data/newSwitch"
 CLOUD_ENDPOINT_STATUS = "/v1/app/device/newWork/{device_id}"
-CLOUD_ENDPOINT_SCHEDULE = "/device/workSet"
+CLOUD_ENDPOINT_SCHEDULE = "/v1/app/data/workSetApp"
 
 # ---------------------------------------------------------------------------
 # Weekday bitmask (shared by both protocols)
