@@ -19,6 +19,7 @@ from .const import (
     CONF_CLOUD_USER_ID,
     CONF_CONNECTION_MODE,
     DEFAULT_SCAN_TIMEOUT,
+    DeviceType,
 )
 from .protocol_ble import detect_device_type
 from .protocol_cloud import AromaLinkCloudClient
@@ -59,7 +60,13 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            address = user_input["ble_address"]
+            address = user_input.get("ble_address")
+            if not address:
+                return self.async_show_form(
+                    step_id="ble_scan",
+                    data_schema=vol.Schema({}),
+                    errors={"base": "cannot_connect"},
+                )
             device_info = self._discovered_devices.get(address, {})
             self._selected_ble_address = address
             self._selected_ble_name = device_info.get("name", "")
