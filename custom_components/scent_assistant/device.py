@@ -384,6 +384,13 @@ class ScentDiffuserDevice:
                     self._state.phase = status["phase"]
                 self._notify_state_changed()
 
+    async def sync_time(self) -> bool:
+        """Sync device clock to current local time (BLE only)."""
+        if not self._ble_address:
+            return False
+        self._ble_has_synced_time = False
+        return await self._ble_connect()
+
     # ------------------------------------------------------------------
     # Startup / Shutdown
     # ------------------------------------------------------------------

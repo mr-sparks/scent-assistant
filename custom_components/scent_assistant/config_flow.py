@@ -61,31 +61,29 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             address = user_input.get("ble_address")
-            if not address:
-                return self.async_show_form(
-                    step_id="ble_scan",
-                    data_schema=vol.Schema({}),
-                    errors={"base": "cannot_connect"},
+            if address:
+                # User selected a device – proceed to create entry
+                device_info = self._discovered_devices.get(address, {})
+                self._selected_ble_address = address
+                self._selected_ble_name = device_info.get("name", "")
+                self._selected_device_type = device_info.get("device_type", "aroma_link")
+
+                # Check if already configured
+                await self.async_set_unique_id(address)
+                self._abort_if_unique_id_configured()
+
+                # Create entry directly - no extra steps needed for BLE
+                return self.async_create_entry(
+                    title=self._selected_ble_name or "Scent Diffuser",
+                    data={
+                        CONF_BLE_ADDRESS: self._selected_ble_address,
+                        CONF_BLE_NAME: self._selected_ble_name,
+                        CONF_DEVICE_TYPE: self._selected_device_type,
+                        CONF_CONNECTION_MODE: "ble",
+                    },
                 )
-            device_info = self._discovered_devices.get(address, {})
-            self._selected_ble_address = address
-            self._selected_ble_name = device_info.get("name", "")
-            self._selected_device_type = device_info.get("device_type", "aroma_link")
-
-            # Check if already configured
-            await self.async_set_unique_id(address)
-            self._abort_if_unique_id_configured()
-
-            # Create entry directly - no extra steps needed for BLE
-            return self.async_create_entry(
-                title=self._selected_ble_name or "Scent Diffuser",
-                data={
-                    CONF_BLE_ADDRESS: self._selected_ble_address,
-                    CONF_BLE_NAME: self._selected_ble_name,
-                    CONF_DEVICE_TYPE: self._selected_device_type,
-                    CONF_CONNECTION_MODE: "ble",
-                },
-            )
+            # If address is missing, user clicked Submit on an empty error
+            # form – fall through to re-scan.
 
         # Scan for devices
         self._discovered_devices = {}
