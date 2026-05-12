@@ -385,8 +385,8 @@ class AromaLinkCloudClient:
                 ssl=False,
             ) as resp:
                 response_text = await resp.text()
-                _LOGGER.warning("Cloud schedule payload: %s", payload)
-                _LOGGER.warning("Cloud schedule response [%s]: %s", resp.status, response_text)
+                _LOGGER.debug("Cloud schedule payload: %s", payload)
+                _LOGGER.debug("Cloud schedule response [%s]: %s", resp.status, response_text)
 
                 if resp.status != 200:
                     _LOGGER.error("Cloud schedule failed: HTTP %s", resp.status)
@@ -402,7 +402,7 @@ class AromaLinkCloudClient:
                     return False
 
                 if self._response_ok(data):
-                    _LOGGER.warning("Cloud schedule set for %s", device_id)
+                    _LOGGER.debug("Cloud schedule set for %s", device_id)
                     return True
 
                 _LOGGER.error("Cloud schedule API indicated failure: %s", data)
