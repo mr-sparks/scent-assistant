@@ -120,6 +120,7 @@ Control your diffuser via the Aroma-Link cloud service. No Bluetooth required.
 | Work Duration | Number | Spray duration in seconds |
 | Pause Duration | Number | Pause between sprays in seconds |
 | Status | Sensor | Current phase: spraying / paused / idle / off |
+| Time Sync | Button | Manually sync the device clock to current local time (BLE only) |
 
 ---
 
