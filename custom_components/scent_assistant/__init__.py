@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
@@ -19,6 +21,7 @@ from .const import (
     CONF_CLOUD_PASSWORD,
     CONF_CLOUD_DEVICE_ID,
     CONF_CONNECTION_MODE,
+    CLOUD_POLL_INTERVAL_SECONDS,
     WEEKDAY_MON, WEEKDAY_TUE, WEEKDAY_WED, WEEKDAY_THU,
     WEEKDAY_FRI, WEEKDAY_SAT, WEEKDAY_SUN,
     DeviceType,
@@ -101,6 +104,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = device
 
+    # Cloud-mode devices have no push channel for autonomous state changes
+    # (BLE devices push notifications when connected). Poll the cloud
+    # periodically so HA reflects the device's real state, not just the
+    # last command we sent. See CLOUD_POLL_INTERVAL_SECONDS in const.py.
+    if connection_mode == "cloud" and cloud_client is not None:
+        async def _periodic_cloud_poll(now=None) -> None:
+            try:
+                await device.refresh_state()
+            except Exception as err:
+                _LOGGER.debug("Cloud state poll failed (will retry): %s", err)
+
+        device._unsub_cloud_poll = async_track_time_interval(
+            hass,
+            _periodic_cloud_poll,
+            timedelta(seconds=CLOUD_POLL_INTERVAL_SECONDS),
+        )
+
     # Register services (once for all entries)
     if not hass.services.has_service(DOMAIN, SERVICE_SET_SCHEDULE):
         async def handle_set_schedule(call: ServiceCall) -> None:
@@ -165,6 +185,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if unload_ok:
         device: ScentDiffuserDevice = hass.data[DOMAIN].pop(entry.entry_id)
+        unsub = getattr(device, "_unsub_cloud_poll", None)
+        if unsub is not None:
+            unsub()
         await device.async_shutdown()
 
     return unload_ok

@@ -99,8 +99,14 @@ CLOUD_WEB_URL = "https://www.aroma-link.com"
 CLOUD_ENDPOINT_TOKEN = "/v2/app/token"
 CLOUD_ENDPOINT_DEVICES = "/v1/app/device/listAll/{user_id}"
 CLOUD_ENDPOINT_SWITCH = "/v1/app/data/newSwitch"
-CLOUD_ENDPOINT_STATUS = "/v1/app/device/newWork/{device_id}"
+CLOUD_ENDPOINT_STATUS = "/v1/app/device/work/{device_id}"
 CLOUD_ENDPOINT_SCHEDULE = "/v1/app/data/workSetApp"
+
+# Polling interval for cloud-mode devices. The integration previously had no
+# periodic refresh, so HA never observed autonomous spray cycles between
+# user-initiated commands. The Aroma-Link cloud exposes near-real-time state
+# (onOff, workStatus, work/pauseRemainTime, pumpCount) via /v1/app/device/work/{id}.
+CLOUD_POLL_INTERVAL_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # Weekday bitmask (shared by both protocols)
