@@ -35,7 +35,7 @@ SCENTIMENT_CHAR_INFO_UUID = "0000fef4-0000-1000-8000-00805f9b34fb"   # Device me
 BLE_NAME_PATTERNS = {
     DeviceType.AROMA_LINK: ["Scent "],
     DeviceType.TUYA_BLE: ["BT-ivy"],
-    DeviceType.SCENTIMENT: ["SCENTI"],
+    DeviceType.SCENTIMENT: ["Scentiment"],
 }
 
 # ---------------------------------------------------------------------------

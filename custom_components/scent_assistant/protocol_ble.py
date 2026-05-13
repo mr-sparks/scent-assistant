@@ -491,15 +491,16 @@ def get_protocol(device_type: DeviceType) -> BleProtocol:
 
 
 def detect_device_type(ble_name: str) -> DeviceType | None:
-    """Detect device type from BLE advertisement name."""
+    """Detect device type from BLE advertisement name (case-insensitive)."""
     if not ble_name:
         return None
+    lowered = ble_name.lower()
     for dtype, patterns in {
         DeviceType.AROMA_LINK: ["Scent "],
         DeviceType.TUYA_BLE: ["BT-ivy"],
-        DeviceType.SCENTIMENT: ["SCENTI"],
+        DeviceType.SCENTIMENT: ["Scentiment"],
     }.items():
         for pattern in patterns:
-            if ble_name.startswith(pattern):
+            if lowered.startswith(pattern.lower()):
                 return dtype
     return None
