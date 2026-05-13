@@ -10,6 +10,7 @@ DOMAIN = "scent_assistant"
 class DeviceType(StrEnum):
     TUYA_BLE = "tuya_ble"          # ShinePick QT-I300 and similar
     AROMA_LINK = "aroma_link"      # Aroma-Link WiFi+BLE diffusers
+    SCENTIMENT = "scentiment"      # Scentiment Diffuser Air 2 (BLE, JSON protocol)
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +22,12 @@ CHAR_WRITE_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
 CHAR_NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
 CHAR_INDICATE_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"  # Aroma-Link only
 
+# Scentiment Diffuser Air 2 — custom 16-bit UUIDs in the SIG base
+SCENTIMENT_SERVICE_UUID = "00000180-0000-1000-8000-00805f9b34fb"
+SCENTIMENT_CHAR_WRITE_UUID = "0000dead-0000-1000-8000-00805f9b34fb"  # Commands (JSON)
+SCENTIMENT_CHAR_NOTIFY_UUID = "0000fef3-0000-1000-8000-00805f9b34fb"  # State notifications
+SCENTIMENT_CHAR_INFO_UUID = "0000fef4-0000-1000-8000-00805f9b34fb"   # Device metadata (read)
+
 # ---------------------------------------------------------------------------
 # BLE name patterns for device detection
 # ---------------------------------------------------------------------------
@@ -28,6 +35,7 @@ CHAR_INDICATE_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"  # Aroma-Link only
 BLE_NAME_PATTERNS = {
     DeviceType.AROMA_LINK: ["Scent "],
     DeviceType.TUYA_BLE: ["BT-ivy"],
+    DeviceType.SCENTIMENT: ["SCENTI"],
 }
 
 # ---------------------------------------------------------------------------

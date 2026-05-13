@@ -14,8 +14,6 @@ from bleak import BleakClient, BleakScanner, BleakError
 
 from .const import (
     DeviceType,
-    CHAR_WRITE_UUID,
-    CHAR_NOTIFY_UUID,
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_WORK_DURATION,
     DEFAULT_PAUSE_DURATION,
@@ -160,15 +158,22 @@ class ScentDiffuserDevice:
 
                 # Subscribe to notifications for responses
                 try:
-                    await self._ble_client.start_notify(CHAR_NOTIFY_UUID, self._on_ble_notification)
+                    await self._ble_client.start_notify(
+                        self._protocol.notify_char_uuid, self._on_ble_notification
+                    )
                 except Exception:
                     _LOGGER.debug("Could not subscribe to notifications")
 
-                # Time sync on first connection of this session
+                # Time sync on first connection of this session (skipped for
+                # protocols that don't support it).
                 if not self._ble_has_synced_time:
-                    await self._ble_send(self._protocol.build_time_sync())
+                    time_sync = self._protocol.build_time_sync()
+                    if time_sync:
+                        await self._ble_send(time_sync)
+                        _LOGGER.info("BLE connected + time synced: %s", self._ble_name)
+                    else:
+                        _LOGGER.info("BLE connected: %s", self._ble_name)
                     self._ble_has_synced_time = True
-                    _LOGGER.info("BLE connected + time synced: %s", self._ble_name)
 
                 self._schedule_disconnect()
                 return True
@@ -202,7 +207,9 @@ class ScentDiffuserDevice:
         if not self._ble_client or not self._ble_client.is_connected:
             return False
         try:
-            await self._ble_client.write_gatt_char(CHAR_WRITE_UUID, data, response=True)
+            await self._ble_client.write_gatt_char(
+                self._protocol.write_char_uuid, data, response=True
+            )
             return True
         except (BleakError, asyncio.TimeoutError, OSError) as err:
             _LOGGER.warning("BLE write failed: %s", err)

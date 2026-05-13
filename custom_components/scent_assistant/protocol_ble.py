@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 from .const import (
     DeviceType,
+    SERVICE_UUID, CHAR_WRITE_UUID, CHAR_NOTIFY_UUID,
+    SCENTIMENT_SERVICE_UUID, SCENTIMENT_CHAR_WRITE_UUID, SCENTIMENT_CHAR_NOTIFY_UUID,
     TUYA_HEADER, TUYA_VERSION,
     TUYA_CMD_DP_WRITE, TUYA_CMD_DP_REPORT, TUYA_CMD_QUERY, TUYA_CMD_TIME_SYNC,
     TUYA_DP_TYPE_BOOL, TUYA_DP_TYPE_RAW,
@@ -20,6 +22,8 @@ from .const import (
     AL_SLOT_ENABLED, AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
 )
+
+import json
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,13 +85,19 @@ class BleProtocol(ABC):
 
     device_type: DeviceType
 
+    # Per-protocol BLE characteristic UUIDs (defaults to FFF0 family used by
+    # Tuya BLE and Aroma-Link). Override for devices with different GATT layout.
+    service_uuid: str = SERVICE_UUID
+    write_char_uuid: str = CHAR_WRITE_UUID
+    notify_char_uuid: str = CHAR_NOTIFY_UUID
+
     @abstractmethod
     def build_power(self, on: bool) -> bytes:
         """Build power on/off command."""
 
-    @abstractmethod
-    def build_time_sync(self, now: datetime | None = None) -> bytes:
-        """Build time synchronisation command."""
+    def build_time_sync(self, now: datetime | None = None) -> bytes | None:
+        """Build time synchronisation command. Return None if not supported."""
+        return None
 
     @abstractmethod
     def build_query(self) -> bytes:
@@ -350,6 +360,67 @@ class AromaLinkBleProtocol(BleProtocol):
 
 
 # ---------------------------------------------------------------------------
+# Scentiment Diffuser Air 2 — JSON-over-BLE
+# ---------------------------------------------------------------------------
+
+class ScentimentProtocol(BleProtocol):
+    """Scentiment Diffuser Air 2 — JSON commands on 0xDEAD, text status on 0xFEF3."""
+
+    device_type = DeviceType.SCENTIMENT
+    service_uuid = SCENTIMENT_SERVICE_UUID
+    write_char_uuid = SCENTIMENT_CHAR_WRITE_UUID
+    notify_char_uuid = SCENTIMENT_CHAR_NOTIFY_UUID
+
+    @staticmethod
+    def _encode(action: str, payload: dict) -> bytes:
+        return json.dumps({"action": action, "payload": payload}, separators=(",", ":")).encode("utf-8")
+
+    def build_power(self, on: bool) -> bytes:
+        return self._encode("TURN_ON", {"on": 1 if on else 0})
+
+    def build_set_level(self, level: int) -> bytes:
+        return self._encode("SET LEVEL", {"intensity": int(level)})
+
+    def build_query(self) -> bytes:
+        return b""
+
+    def parse_notification(self, data: bytes) -> dict:
+        try:
+            text = data.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return {}
+
+        result: dict = {}
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    result.update(parsed)
+            except Exception:
+                _LOGGER.debug("Scentiment: unparseable JSON notification: %r", text)
+            return result
+
+        if ":" in text:
+            key, _, value = text.partition(":")
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "level":
+                try:
+                    lvl = int(value)
+                    result["level"] = lvl
+                    result["power"] = lvl > 0
+                    result["phase"] = "spraying" if lvl > 0 else "off"
+                except ValueError:
+                    pass
+            else:
+                result[key] = value
+        else:
+            _LOGGER.debug("Scentiment: unrecognised notification: %r", text)
+
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -359,6 +430,8 @@ def get_protocol(device_type: DeviceType) -> BleProtocol:
         return TuyaBleProtocol()
     elif device_type == DeviceType.AROMA_LINK:
         return AromaLinkBleProtocol()
+    elif device_type == DeviceType.SCENTIMENT:
+        return ScentimentProtocol()
     raise ValueError(f"Unknown device type: {device_type}")
 
 
@@ -369,6 +442,7 @@ def detect_device_type(ble_name: str) -> DeviceType | None:
     for dtype, patterns in {
         DeviceType.AROMA_LINK: ["Scent "],
         DeviceType.TUYA_BLE: ["BT-ivy"],
+        DeviceType.SCENTIMENT: ["SCENTI"],
     }.items():
         for pattern in patterns:
             if ble_name.startswith(pattern):
