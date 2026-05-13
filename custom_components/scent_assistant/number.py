@@ -8,7 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, DeviceType
 from .device import ScentDiffuserDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,6 +21,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up number entities."""
     device: ScentDiffuserDevice = hass.data[DOMAIN][entry.entry_id]
+
+    if device.device_type == DeviceType.SCENTIMENT:
+        async_add_entities([ScentimentLevelNumber(device, entry)])
+        return
 
     async_add_entities([
         WorkDurationNumber(device, entry),
@@ -96,3 +100,39 @@ class PauseDurationNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._device.set_pause_duration(int(value))
+
+
+class ScentimentLevelNumber(NumberEntity):
+    """Spray intensity level (Scentiment, 1-3)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Level"
+    _attr_icon = "mdi:speedometer"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 3
+    _attr_native_step = 1
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_level"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return self._device.state.level
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.set_level(int(value))

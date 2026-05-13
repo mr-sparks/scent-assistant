@@ -41,6 +41,11 @@ class DiffuserState:
     phase: str = "unknown"             # "off", "idle", "spraying", "paused"
     work_seconds: int = 0
     pause_seconds: int = 0
+    # Scentiment-only
+    level: int | None = None           # spray intensity 1-3
+    battery: int | None = None         # battery percent
+    rgb_on: bool | None = None         # RGB LED on/off
+    rgb_color: tuple[int, int, int] | None = None  # (r, g, b) 0-255
     start_hour: int = 0
     start_minute: int = 0
     end_hour: int = 23
@@ -371,17 +376,33 @@ class ScentimentProtocol(BleProtocol):
     write_char_uuid = SCENTIMENT_CHAR_WRITE_UUID
     notify_char_uuid = SCENTIMENT_CHAR_NOTIFY_UUID
 
-    @staticmethod
-    def _encode(action: str, payload: dict) -> bytes:
-        return json.dumps({"action": action, "payload": payload}, separators=(",", ":")).encode("utf-8")
+    # The device requires every command to be terminated with these two bytes.
+    _TERMINATOR = b"-|"
+
+    @classmethod
+    def _encode(cls, action: str, payload: dict | None = None) -> bytes:
+        obj: dict = {"action": action}
+        if payload is not None:
+            obj["payload"] = payload
+        return json.dumps(obj, separators=(",", ":")).encode("utf-8") + cls._TERMINATOR
 
     def build_power(self, on: bool) -> bytes:
         return self._encode("TURN_ON", {"on": 1 if on else 0})
 
     def build_set_level(self, level: int) -> bytes:
-        return self._encode("SET LEVEL", {"intensity": int(level)})
+        return self._encode("SET_LEVEL", {"intensity": int(level)})
+
+    def build_set_rgb_color(self, r: int, g: int, b: int) -> bytes:
+        return self._encode("SET_RGB_LEVEL", {"red": int(r), "green": int(g), "blue": int(b)})
+
+    def build_set_rgb_led(self, on: bool) -> bytes:
+        return self._encode("SET_RGB_LED", {"on": 1 if on else 0})
+
+    def build_ping(self) -> bytes:
+        return self._encode("PING")
 
     def build_query(self) -> bytes:
+        # The device pushes state via notifications; no explicit query needed.
         return b""
 
     def parse_notification(self, data: bytes) -> dict:
@@ -390,7 +411,12 @@ class ScentimentProtocol(BleProtocol):
         except Exception:
             return {}
 
+        # Strip the trailing "-|" terminator if the device echoes it back.
+        if text.endswith("-|"):
+            text = text[:-2].strip()
+
         result: dict = {}
+
         if text.startswith("{"):
             try:
                 parsed = json.loads(text)
@@ -400,6 +426,28 @@ class ScentimentProtocol(BleProtocol):
                 _LOGGER.debug("Scentiment: unparseable JSON notification: %r", text)
             return result
 
+        # Comma-separated status: "S:1,L:3,C:1,Bat:100"
+        if "," in text and ":" in text:
+            for part in text.split(","):
+                key, _, value = part.partition(":")
+                key = key.strip().lower()
+                value = value.strip()
+                if not value:
+                    continue
+                try:
+                    n = int(value)
+                except ValueError:
+                    continue
+                if key == "s":
+                    result["power"] = n > 0
+                    result["phase"] = "spraying" if n > 0 else "off"
+                elif key == "l":
+                    result["level"] = n
+                elif key == "bat":
+                    result["battery"] = n
+            return result
+
+        # Single key:value notification
         if ":" in text:
             key, _, value = text.partition(":")
             key = key.strip().lower()
@@ -408,8 +456,15 @@ class ScentimentProtocol(BleProtocol):
                 try:
                     lvl = int(value)
                     result["level"] = lvl
-                    result["power"] = lvl > 0
-                    result["phase"] = "spraying" if lvl > 0 else "off"
+                    if lvl > 0:
+                        result["phase"] = "spraying"
+                except ValueError:
+                    pass
+            elif key == "enable":
+                try:
+                    en = int(value)
+                    result["power"] = en > 0
+                    result["phase"] = "spraying" if en > 0 else "off"
                 except ValueError:
                     pass
             else:

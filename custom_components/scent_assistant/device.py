@@ -24,6 +24,7 @@ from .protocol_ble import (
     ScheduleSlot,
     ScheduleSetup,
     AromaLinkBleProtocol,
+    ScentimentProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -254,6 +255,18 @@ class ScentDiffuserDevice:
             self._state.end_hour = updates["end_hour"]
             self._state.end_minute = updates.get("end_minute", 59)
             changed = True
+        if "level" in updates:
+            self._state.level = updates["level"]
+            changed = True
+        if "battery" in updates:
+            self._state.battery = updates["battery"]
+            changed = True
+        if "rgb_on" in updates:
+            self._state.rgb_on = updates["rgb_on"]
+            changed = True
+        if "rgb_color" in updates:
+            self._state.rgb_color = updates["rgb_color"]
+            changed = True
 
         if changed:
             self._notify_state_changed()
@@ -295,6 +308,39 @@ class ScentDiffuserDevice:
                 self._state.fan = on
                 self._notify_state_changed()
                 return True
+        return False
+
+    async def set_level(self, level: int) -> bool:
+        """Set Scentiment spray intensity (1-3)."""
+        if not isinstance(self._protocol, ScentimentProtocol) or not self._ble_address:
+            return False
+        cmd = self._protocol.build_set_level(level)
+        if await self._ble_execute(cmd):
+            self._state.level = level
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_rgb_color(self, r: int, g: int, b: int) -> bool:
+        """Set Scentiment RGB LED color."""
+        if not isinstance(self._protocol, ScentimentProtocol) or not self._ble_address:
+            return False
+        cmd = self._protocol.build_set_rgb_color(r, g, b)
+        if await self._ble_execute(cmd):
+            self._state.rgb_color = (r, g, b)
+            self._notify_state_changed()
+            return True
+        return False
+
+    async def set_rgb_led(self, on: bool) -> bool:
+        """Turn Scentiment RGB LED on or off."""
+        if not isinstance(self._protocol, ScentimentProtocol) or not self._ble_address:
+            return False
+        cmd = self._protocol.build_set_rgb_led(on)
+        if await self._ble_execute(cmd):
+            self._state.rgb_on = on
+            self._notify_state_changed()
+            return True
         return False
 
     async def set_work_duration(self, seconds: int) -> bool:

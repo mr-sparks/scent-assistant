@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, DeviceType
 from .device import ScentDiffuserDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,10 +27,14 @@ async def async_setup_entry(
     """Set up sensor entities."""
     device: ScentDiffuserDevice = hass.data[DOMAIN][entry.entry_id]
 
-    async_add_entities([
+    entities: list[SensorEntity] = [
         DiffuserStatusSensor(device, entry),
         DiffuserConnectionSensor(device, entry),
-    ])
+    ]
+    if device.device_type == DeviceType.SCENTIMENT:
+        entities.append(DiffuserBatterySensor(device, entry))
+
+    async_add_entities(entities)
 
 
 class DiffuserStatusSensor(SensorEntity):
@@ -55,6 +64,8 @@ class DiffuserStatusSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         state = self._device.state
+        if self._device.device_type == DeviceType.SCENTIMENT:
+            return {"level": state.level}
         return {
             "work_seconds": state.work_seconds,
             "pause_seconds": state.pause_seconds,
@@ -65,6 +76,37 @@ class DiffuserStatusSensor(SensorEntity):
     @property
     def available(self) -> bool:
         return self._device.available
+
+
+class DiffuserBatterySensor(SensorEntity):
+    """Battery level (Scentiment only)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Battery"
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_battery"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        return self._device.state.battery
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and self._device.state.battery is not None
 
 
 class DiffuserConnectionSensor(SensorEntity):

@@ -9,7 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, DeviceType
 from .device import ScentDiffuserDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,6 +22,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up time entities."""
     device: ScentDiffuserDevice = hass.data[DOMAIN][entry.entry_id]
+    if device.device_type == DeviceType.SCENTIMENT:
+        return
 
     async_add_entities([
         DiffuserStartTime(device, entry),
