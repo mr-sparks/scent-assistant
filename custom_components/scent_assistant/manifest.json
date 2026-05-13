@@ -4,7 +4,11 @@
   "bluetooth": [
     { "local_name": "Scent *" },
     { "local_name": "BT-ivy*" },
-    { "local_name": "Scentiment*" }
+    { "local_name": "Scentiment*" },
+    { "local_name": "SA_*" },
+    { "manufacturer_id": 22851 },
+    { "manufacturer_id": 17932 },
+    { "manufacturer_id": 61441 }
   ],
   "codeowners": ["@mr-sparks"],
   "config_flow": true,
@@ -13,5 +17,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/mr-sparks/scent-assistant/issues",
   "requirements": ["bleak>=0.21.0"],
-  "version": "1.1.0"
+  "version": "1.2.0-beta.1"
 }

@@ -18,10 +18,11 @@ from .const import (
     CONF_CLOUD_DEVICE_ID,
     CONF_CLOUD_USER_ID,
     CONF_CONNECTION_MODE,
+    CONF_GW_PASSWORD,
     DEFAULT_SCAN_TIMEOUT,
     DeviceType,
 )
-from .protocol_ble import detect_device_type
+from .protocol_ble import detect_device_type, extract_scent_marketing_metadata
 from .protocol_cloud import AromaLinkCloudClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +40,42 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._selected_ble_address: str | None = None
         self._selected_ble_name: str | None = None
         self._selected_device_type: str | None = None
+        self._selected_sm_metadata: dict | None = None
+        self._selected_gw_password: str | None = None
+
+    def _create_ble_entry(self) -> config_entries.ConfigFlowResult:
+        """Build the BLE-mode config entry. Shared by all BLE setup paths."""
+        entry_data: dict[str, Any] = {
+            CONF_BLE_ADDRESS: self._selected_ble_address,
+            CONF_BLE_NAME: self._selected_ble_name,
+            CONF_DEVICE_TYPE: self._selected_device_type,
+            CONF_CONNECTION_MODE: "ble",
+        }
+        if self._selected_sm_metadata:
+            entry_data["sm_metadata"] = self._selected_sm_metadata
+        if self._selected_gw_password:
+            entry_data[CONF_GW_PASSWORD] = self._selected_gw_password
+        return self.async_create_entry(
+            title=self._selected_ble_name or "Scent Diffuser",
+            data=entry_data,
+        )
+
+    async def async_step_gw_password(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Optional password prompt for Scent Marketing GW devices."""
+        if user_input is not None:
+            pwd = (user_input.get(CONF_GW_PASSWORD) or "").strip()
+            # The firmware accepts up to 4 ASCII chars. We trim silently.
+            self._selected_gw_password = pwd[:4] if pwd else None
+            return self._create_ble_entry()
+        return self.async_show_form(
+            step_id="gw_password",
+            data_schema=vol.Schema({
+                vol.Optional(CONF_GW_PASSWORD, default=""): str,
+            }),
+            description_placeholders={"device": self._selected_ble_name or ""},
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -67,21 +104,22 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._selected_ble_address = address
                 self._selected_ble_name = device_info.get("name", "")
                 self._selected_device_type = device_info.get("device_type", "aroma_link")
+                self._selected_sm_metadata = device_info.get("sm_metadata")
 
                 # Check if already configured
                 await self.async_set_unique_id(address)
                 self._abort_if_unique_id_configured()
 
-                # Create entry directly - no extra steps needed for BLE
-                return self.async_create_entry(
-                    title=self._selected_ble_name or "Scent Diffuser",
-                    data={
-                        CONF_BLE_ADDRESS: self._selected_ble_address,
-                        CONF_BLE_NAME: self._selected_ble_name,
-                        CONF_DEVICE_TYPE: self._selected_device_type,
-                        CONF_CONNECTION_MODE: "ble",
-                    },
-                )
+                # Scent Marketing GW devices may be password-protected.
+                # We can't tell at scan time, so offer the user a chance
+                # to supply one. AK devices have no such mechanism.
+                if self._selected_device_type in (
+                    DeviceType.SCENT_MARKETING_GW,
+                    DeviceType.SCENT_MARKETING_GW_XOR,
+                ):
+                    return await self.async_step_gw_password()
+
+                return self._create_ble_entry()
             # If address is missing, user clicked Submit on an empty error
             # form – fall through to re-scan.
 
@@ -91,18 +129,31 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             devices = await BleakScanner.discover(timeout=DEFAULT_SCAN_TIMEOUT, return_adv=True)
             for device, adv_data in devices.values():
                 name = device.name or adv_data.local_name or ""
-                if not name:
+                dtype = detect_device_type(name, adv_data)
+
+                # A Scent Marketing device may advertise without a useful
+                # local name (the app routes purely on manufacturer-data),
+                # so we accept it even when `name` is empty.
+                if not name and dtype is None:
                     continue
+                if not name:
+                    name = f"Scent Marketing {device.address[-8:]}"
 
-                dtype = detect_device_type(name)
+                sm_meta = extract_scent_marketing_metadata(adv_data) if dtype and dtype.value.startswith("scent_marketing") else None
+                if sm_meta:
+                    _LOGGER.info(
+                        "Discovered Scent Marketing device: addr=%s name=%s family=%s mfr_id=0x%04X pid=%s flag=%s raw=%s",
+                        device.address, name, dtype.value,
+                        sm_meta["mfr_id"] or 0, sm_meta["pid"], sm_meta["wifi_flag"],
+                        sm_meta["raw_hex"],
+                    )
 
-                # Show all named devices - different brands may have
-                # different BLE names. Auto-detected ones are marked.
                 self._discovered_devices[device.address] = {
                     "name": name,
                     "device_type": dtype or DeviceType.AROMA_LINK,
                     "rssi": adv_data.rssi,
                     "auto_detected": dtype is not None,
+                    "sm_metadata": sm_meta,
                 }
         except Exception as err:
             _LOGGER.error("BLE scan failed: %s", err)
