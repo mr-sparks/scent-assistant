@@ -30,6 +30,13 @@
         "data": {
           "cloud_device_id": "Device"
         }
+      },
+      "gw_password": {
+        "title": "Scent Marketing — Device Password (optional)",
+        "description": "If your Scent Marketing GW device requires a 4-character password (set previously in the manufacturer's app), enter it here. Leave blank if the device is unprotected.",
+        "data": {
+          "gw_password": "Device password (4 ASCII characters, optional)"
+        }
       }
     },
     "error": {

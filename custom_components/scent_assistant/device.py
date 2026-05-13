@@ -25,6 +25,9 @@ from .protocol_ble import (
     ScheduleSetup,
     AromaLinkBleProtocol,
     ScentimentProtocol,
+    ScentMarketingAkProtocol,
+    ScentMarketingGwProtocol,
+    ScentMarketingGwXorProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -46,7 +49,18 @@ class ScentDiffuserDevice:
         device_type: DeviceType | None = None,
         cloud_client: AromaLinkCloudClient | None = None,
         cloud_device_id: str | None = None,
+        sm_metadata: dict | None = None,
+        gw_password: str | None = None,
     ) -> None:
+        # Detection metadata from the config flow — populated only for
+        # Scent Marketing family devices.
+        self._sm_metadata = sm_metadata or {}
+        # Optional 4-char ASCII password for Scent Marketing GW devices.
+        # Sent proactively after every BLE connect.
+        self._gw_password = gw_password or None
+        # Trace ring-buffer for the diagnostics download.
+        self._recent_notifications: list[str] = []
+        self._recent_commands: list[str] = []
         # BLE
         self._ble_address = ble_address
         self._ble_name = ble_name or ""
@@ -60,12 +74,18 @@ class ScentDiffuserDevice:
         if device_type:
             self._device_type = device_type
         elif ble_name:
+            # No advertisement object available at this point — fall back to
+            # name-only detection (config flow performs the richer
+            # advertisement-aware detection up front and persists the result).
             self._device_type = detect_device_type(ble_name) or DeviceType.AROMA_LINK
         else:
             self._device_type = DeviceType.AROMA_LINK
 
-        # Protocol handler
-        self._protocol: BleProtocol = get_protocol(self._device_type)
+        # Protocol handler. GW-XOR needs the MAC for its keystream; GW
+        # devices with PID 98 use the Tuya-DP hex parser.
+        mac = (ble_address or "").replace(":", "")
+        pid = self._sm_metadata.get("pid") if self._sm_metadata else None
+        self._protocol: BleProtocol = get_protocol(self._device_type, mac=mac, pid=pid)
 
         # Cloud
         self._cloud: AromaLinkCloudClient | None = cloud_client
@@ -90,6 +110,53 @@ class ScentDiffuserDevice:
     @property
     def device_type(self) -> DeviceType:
         return self._device_type
+
+    @property
+    def sm_metadata(self) -> dict:
+        """Scent Marketing detection metadata (empty for other families)."""
+        return self._sm_metadata
+
+    @property
+    def recent_notifications(self) -> list[str]:
+        return list(self._recent_notifications)
+
+    @property
+    def recent_commands(self) -> list[str]:
+        return list(self._recent_commands)
+
+    @property
+    def model_name(self) -> str:
+        """Human-readable model name for HA's device-info "model" field.
+
+        For Scent Marketing devices this surfaces the detected family
+        directly on the device page, so a reporter can verify our
+        detection at a glance without digging through logs.
+        """
+        mapping = {
+            DeviceType.TUYA_BLE: "ShinePick / Tuya BLE",
+            DeviceType.AROMA_LINK: "Aroma-Link",
+            DeviceType.SCENTIMENT: "Scentiment Air 2",
+            DeviceType.SCENT_MARKETING_AK: "Scent Marketing (AK)",
+            DeviceType.SCENT_MARKETING_GW: "Scent Marketing (GW)",
+            DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
+        }
+        base = mapping.get(self._device_type, self._device_type.value)
+        # Append the PID when known — different OEMs share the same family
+        # but have distinct PIDs, useful for triage.
+        pid = self._sm_metadata.get("pid")
+        if pid is not None:
+            return f"{base} — PID {pid}"
+        return base
+
+    @property
+    def device_info(self) -> dict:
+        """Shared HA device_info block, consumed by every entity."""
+        return {
+            "identifiers": {("scent_assistant", self.unique_id)},
+            "name": self.name,
+            "manufacturer": "Scent Diffuser",
+            "model": self.model_name,
+        }
 
     @property
     def state(self) -> DiffuserState:
@@ -176,6 +243,18 @@ class ScentDiffuserDevice:
                         _LOGGER.info("BLE connected: %s", self._ble_name)
                     self._ble_has_synced_time = True
 
+                # GW family password handshake. We send unconditionally —
+                # the firmware ignores a password write on unprotected
+                # devices, and there's no reliable pre-connect way to tell
+                # which mode the device is in.
+                if self._gw_password and isinstance(
+                    self._protocol, ScentMarketingGwProtocol
+                ):
+                    try:
+                        await self._ble_send(self._protocol.build_password(self._gw_password))
+                    except Exception as err:
+                        _LOGGER.debug("Scent Marketing GW: password send failed: %s", err)
+
                 self._schedule_disconnect()
                 return True
 
@@ -204,17 +283,29 @@ class ScentDiffuserDevice:
             self._ble_connected = False
 
     async def _ble_send(self, data: bytes) -> bool:
-        """Send bytes via BLE (assumes already connected)."""
+        """Send a command via BLE.
+
+        Protocols may return more than one on-wire chunk per command — the
+        Scent Marketing GW family for instance needs (nonce, seq)-prefixed
+        18-byte chunks. We delegate the split decision to the protocol and
+        write each chunk sequentially.
+        """
         if not self._ble_client or not self._ble_client.is_connected:
             return False
-        try:
-            await self._ble_client.write_gatt_char(
-                self._protocol.write_char_uuid, data, response=True
-            )
-            return True
-        except (BleakError, asyncio.TimeoutError, OSError) as err:
-            _LOGGER.warning("BLE write failed: %s", err)
-            return False
+        chunks = self._protocol.wire_chunks(data) if data else []
+        if chunks:
+            self._recent_commands.append(data.hex())
+            if len(self._recent_commands) > 10:
+                del self._recent_commands[0]
+        for chunk in chunks:
+            try:
+                await self._ble_client.write_gatt_char(
+                    self._protocol.write_char_uuid, chunk, response=True
+                )
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.warning("BLE write failed: %s", err)
+                return False
+        return True
 
     async def _ble_execute(self, data: bytes) -> bool:
         """Connect, send command, schedule disconnect."""
@@ -227,7 +318,12 @@ class ScentDiffuserDevice:
 
     def _on_ble_notification(self, sender: int, data: bytearray) -> None:
         """Handle incoming BLE notification."""
-        updates = self._protocol.parse_notification(bytes(data))
+        raw = bytes(data)
+        # Keep a short ring-buffer of raw frames for the diagnostics export.
+        self._recent_notifications.append(raw.hex())
+        if len(self._recent_notifications) > 20:
+            del self._recent_notifications[0]
+        updates = self._protocol.parse_notification(raw)
         if not updates:
             return
 
@@ -267,6 +363,25 @@ class ScentDiffuserDevice:
         if "rgb_color" in updates:
             self._state.rgb_color = updates["rgb_color"]
             changed = True
+        # Scent Marketing GW family — new state fields
+        if "lock" in updates:
+            self._state.lock = updates["lock"]
+            changed = True
+        if "oil_remaining" in updates:
+            self._state.oil_remaining = updates["oil_remaining"]
+            changed = True
+        if "light_on" in updates:
+            self._state.light_on = updates["light_on"]
+            changed = True
+        if "device_name" in updates:
+            self._state.device_name = updates["device_name"]
+            changed = True
+        if "password_required" in updates:
+            self._state.password_required = updates["password_required"]
+            changed = True
+        if "firmware_version" in updates:
+            self._state.firmware_version = updates["firmware_version"]
+            changed = True
 
         if changed:
             self._notify_state_changed()
@@ -298,16 +413,46 @@ class ScentDiffuserDevice:
         return False
 
     async def set_fan(self, on: bool) -> bool:
-        """Turn fan on or off (Aroma-Link only, BLE only)."""
-        if not self.supports_fan or not self._ble_address:
+        """Turn fan on or off (Aroma-Link + Scent Marketing AK)."""
+        if not self._ble_address:
             return False
-
-        if isinstance(self._protocol, AromaLinkBleProtocol):
-            cmd = self._protocol.build_fan(on)
+        proto = self._protocol
+        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol)):
+            cmd = proto.build_fan(on)
             if await self._ble_execute(cmd):
                 self._state.fan = on
                 self._notify_state_changed()
                 return True
+        return False
+
+    async def set_lock(self, on: bool) -> bool:
+        """Toggle child-lock (Scent Marketing AK + GW + GW-XOR)."""
+        if not self._ble_address:
+            return False
+        proto = self._protocol
+        if isinstance(proto, (ScentMarketingAkProtocol, ScentMarketingGwProtocol)):
+            cmd = proto.build_lock(on)
+            if await self._ble_execute(cmd):
+                self._state.lock = on
+                self._notify_state_changed()
+                return True
+        return False
+
+    async def set_lamp(self, on: bool) -> bool:
+        """Toggle auxiliary lamp (Scent Marketing AK lamp-bit, GW DP-11 light)."""
+        if not self._ble_address:
+            return False
+        proto = self._protocol
+        if isinstance(proto, ScentMarketingAkProtocol):
+            cmd = proto.build_lamp(on)
+        elif isinstance(proto, ScentMarketingGwProtocol):
+            cmd = proto.build_light(on)
+        else:
+            return False
+        if await self._ble_execute(cmd):
+            self._state.light_on = on
+            self._notify_state_changed()
+            return True
         return False
 
     async def set_level(self, level: int) -> bool:
@@ -399,6 +544,18 @@ class ScentDiffuserDevice:
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
                 cmd = self._protocol.build_schedule(weekday_mask, [slot])
+            elif isinstance(self._protocol, ScentMarketingGwProtocol):
+                slot = ScheduleSlot(
+                    start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
+                    enabled=enabled, work_seconds=work, pause_seconds=pause,
+                )
+                cmd = self._protocol.build_schedule([slot], weekday_mask=weekday_mask)
+            elif isinstance(self._protocol, ScentMarketingAkProtocol):
+                slot = ScheduleSlot(
+                    start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
+                    enabled=enabled, work_seconds=work, pause_seconds=pause,
+                )
+                cmd = self._protocol.build_schedule_v2(slot)
 
             if cmd and await self._ble_execute(cmd):
                 self._notify_state_changed()
