@@ -232,6 +232,24 @@ class ScentDiffuserDevice:
                 except Exception:
                     _LOGGER.debug("Could not subscribe to notifications")
 
+                # Scent Marketing AK family — PIN 8888 login must precede
+                # every other write, otherwise the device drops them
+                # silently. The response also tells us whether to use the
+                # V2 or V3 command set; we wait briefly for it before
+                # sending follow-ups so `_v3_mode` is set in time.
+                if isinstance(self._protocol, ScentMarketingAkProtocol):
+                    self._protocol.reset_login_state()
+                    try:
+                        await self._ble_send(self._protocol.build_login_primary())
+                        # Give the device time to respond — the
+                        # notification handler will set _v3_mode.
+                        await asyncio.sleep(0.5)
+                        if self._protocol.is_v3:
+                            await self._ble_send(self._protocol.build_login_secondary_v3())
+                            await asyncio.sleep(0.3)
+                    except Exception as err:
+                        _LOGGER.debug("Scent Marketing AK: login failed: %s", err)
+
                 # Time sync on first connection of this session (skipped for
                 # protocols that don't support it).
                 if not self._ble_has_synced_time:
@@ -555,7 +573,7 @@ class ScentDiffuserDevice:
                     start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
-                cmd = self._protocol.build_schedule_v2(slot)
+                cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
 
             if cmd and await self._ble_execute(cmd):
                 self._notify_state_changed()

@@ -17,6 +17,12 @@ from .const import (
     SM_AK_CMD_SCHEDULE_V2, SM_AK_CMD_SCHEDULE_V3,
     SM_AK_CTRL_BIT_ONOFF, SM_AK_CTRL_BIT_FAN, SM_AK_CTRL_BIT_DEMO,
     SM_AK_CTRL_BIT_RESERVED, SM_AK_CTRL_BIT_LAMP, SM_AK_CTRL_BIT_LOCK,
+    SM_AK_LOGIN_PRIMARY, SM_AK_LOGIN_SECONDARY_V3,
+    SM_AK_OPCODE_LOGIN_RESPONSE, SM_AK_V3_COMMIT,
+    SM_AK_V3_FAN_ON, SM_AK_V3_FAN_OFF,
+    SM_AK_V3_SLOT_WEEKEND, SM_AK_V3_SLOT_WEEKDAY,
+    SM_AK_V3_SCHEDULE_TRAILER,
+    SM_AK_DAY_MASK_WEEKDAYS, SM_AK_DAY_MASK_WEEKEND, SM_AK_DAY_MASK_DAILY,
     SM_GW_SERVICE_UUID, SM_GW_NOTIFY_UUID, SM_GW_WRITE_UUID,
     SM_MFR_ID_AK, SM_MFR_ID_GW, SM_MFR_ID_GW_ALT,
     SM_GW_FLAG_WIFI, SM_GW_FLAG_CELLULAR,
@@ -567,6 +573,38 @@ class ScentMarketingAkProtocol(BleProtocol):
             SM_AK_CTRL_BIT_LAMP: False,
             SM_AK_CTRL_BIT_LOCK: False,
         }
+        # Set by `parse_notification` from the device's reply to the primary
+        # login frame. None = login not yet completed; True/False selects the
+        # V3 vs V2 command set (different fan & schedule encodings).
+        self._v3_mode: bool | None = None
+
+    # ------------------------------------------------------------------
+    # Login handshake (must complete before any other write)
+    # ------------------------------------------------------------------
+
+    @property
+    def is_v3(self) -> bool:
+        """True once the device has identified itself as a V3 model."""
+        return self._v3_mode is True
+
+    @property
+    def login_completed(self) -> bool:
+        """True once we've parsed any 0x8F login response."""
+        return self._v3_mode is not None
+
+    def reset_login_state(self) -> None:
+        """Called by the device manager before each fresh BLE connect."""
+        self._v3_mode = None
+
+    def build_login_primary(self) -> bytes:
+        """0x8F + ASCII '8888' — the default app PIN, required before any
+        other write."""
+        return SM_AK_LOGIN_PRIMARY
+
+    def build_login_secondary_v3(self) -> bytes:
+        """0x8F + ASCII '8888OK01' — the V3-only follow-up login. Only send
+        this after the primary response identified the device as V3."""
+        return SM_AK_LOGIN_SECONDARY_V3
 
     # ------------------------------------------------------------------
     # Control-state helpers
@@ -602,6 +640,11 @@ class ScentMarketingAkProtocol(BleProtocol):
         return self._build_control(SM_AK_CTRL_BIT_LAMP, on)
 
     def build_fan(self, on: bool) -> bytes:
+        # V3 devices don't use the 0x2D control bitmask for fan — they
+        # have a dedicated 0x2A short frame. V2 devices keep using the
+        # bitmask path.
+        if self.is_v3:
+            return SM_AK_V3_FAN_ON if on else SM_AK_V3_FAN_OFF
         return self._build_control(SM_AK_CTRL_BIT_FAN, on)
 
     def supports_fan(self) -> bool:
@@ -620,8 +663,16 @@ class ScentMarketingAkProtocol(BleProtocol):
     def build_heartbeat(self) -> bytes:
         return SM_AK_HEARTBEAT_BYTES
 
-    def build_time_sync(self, now: datetime | None = None) -> bytes:
-        """Port of `BtDataModel.writeTime()` — opcode + YY MM DD HH MM SS WD."""
+    def build_time_sync(self, now: datetime | None = None) -> bytes | None:
+        """V2-style time sync, port of `BtDataModel.writeTime()`.
+
+        The V3 firmware uses a different 0x21-prefixed format that we
+        haven't decoded yet from the available captures; for V3 devices we
+        return None so the device manager skips auto-sync. The Time Sync
+        button still works as a connection-refresh trigger.
+        """
+        if self.is_v3:
+            return None
         if now is None:
             now = datetime.now()
         return bytes([
@@ -644,27 +695,121 @@ class ScentMarketingAkProtocol(BleProtocol):
             battery_pct & 0xFF,
         ])
 
-    def build_schedule_v2(self, slot: ScheduleSlot, index: int = 1) -> bytes:
-        """Port of `DeviceTimeModel.writeData()` v2.0 schedule write."""
-        flag_bits = (1 << 4) if slot.enabled else 0  # bit 4 = timeOnOff
-        flag_bits |= (index & 0x0F)
-        repeat = 0  # repeat mask is computed from ScheduleSlot.weekday in HA
-        out = bytearray(15)
+    def build_schedule(
+        self,
+        slot: ScheduleSlot,
+        weekday_mask: int = SM_AK_DAY_MASK_DAILY,
+        index: int = 1,
+        intensity: int = 6,
+    ) -> bytes:
+        """Build a schedule write in the dialect this device speaks.
+
+        V2 vs V3 selection follows the login-response. V2 is the simple
+        16-byte 0x03 frame; V3 is the longer 18-byte 0x2A frame with a
+        slot tied to weekday/weekend in the official app.
+        """
+        if self.is_v3:
+            return self._build_schedule_v3(slot, weekday_mask, intensity)
+        return self._build_schedule_v2(slot, weekday_mask, index, intensity)
+
+    @staticmethod
+    def _build_schedule_v2(
+        slot: ScheduleSlot,
+        weekday_mask: int,
+        index: int,
+        intensity: int,
+    ) -> bytes:
+        """V2 schedule frame (16 bytes), matching @Mins95's captures:
+
+            03 SS HH MM HH MM DD LL 00 00 00 00 00 00 00 00
+
+        where SS = index low-nibble + 0x10 if enabled, DD = day mask,
+        LL = intensity level. Trailing bytes are zero-padded.
+        """
+        status = (index & 0x0F)
+        if slot.enabled:
+            status |= 0x10
+        out = bytearray(16)
         out[0] = SM_AK_CMD_SCHEDULE_V2
-        out[1] = flag_bits & 0xFF
+        out[1] = status & 0xFF
         out[2] = slot.start_hour & 0xFF
         out[3] = slot.start_minute & 0xFF
         out[4] = slot.end_hour & 0xFF
         out[5] = slot.end_minute & 0xFF
-        out[6] = repeat & 0x7F
-        # Custom-grade mode is encoded as grade=0; we map work/pause via
-        # the extended (19-byte) layout below.
-        out[7] = 0
-        custom = bytearray([
-            (slot.work_seconds >> 8) & 0xFF, slot.work_seconds & 0xFF,
-            (slot.pause_seconds >> 8) & 0xFF, slot.pause_seconds & 0xFF,
+        out[6] = weekday_mask & 0xFF
+        out[7] = max(0, min(10, int(intensity))) & 0xFF
+        return bytes(out)
+
+    @staticmethod
+    def _build_schedule_v3(
+        slot: ScheduleSlot,
+        weekday_mask: int,
+        intensity: int,
+    ) -> bytes:
+        """V3 schedule frame (18 bytes), matching @Mins95's captures:
+
+            2A 01 02 01 00 SS EE HH MM HH MM DD 00 LL 00 0F 01 2C
+
+        SS = slot ID (04=weekend, 05=weekday in the official app),
+        EE = 01 enabled / 03 disabled. Trailer bytes are captured verbatim.
+        """
+        # Pick the slot that matches the typical weekend/weekday day-mask
+        # pattern; default to the weekend slot for custom masks, since
+        # we've only seen DD=0x41 used with it.
+        if (weekday_mask & 0x7F) == SM_AK_DAY_MASK_WEEKDAYS:
+            slot_id = SM_AK_V3_SLOT_WEEKDAY
+        else:
+            slot_id = SM_AK_V3_SLOT_WEEKEND
+        state = 0x01 if slot.enabled else 0x03
+        head = bytes([
+            SM_AK_CMD_SCHEDULE_V3, 0x01, 0x02, 0x01,
+            0x00, slot_id,
+            state,
+            slot.start_hour & 0xFF,
+            slot.start_minute & 0xFF,
+            slot.end_hour & 0xFF,
+            slot.end_minute & 0xFF,
+            weekday_mask & 0xFF,
+            0x00,
+            max(0, min(20, int(intensity))) & 0xFF,
         ])
-        return bytes(out) + bytes(custom)
+        return head + SM_AK_V3_SCHEDULE_TRAILER
+
+    # Backwards-compatible alias kept for external callers that still
+    # invoke `build_schedule_v2` directly. New code should use
+    # `build_schedule` which dispatches to the correct version.
+    def build_schedule_v2(self, slot: ScheduleSlot, index: int = 1) -> bytes:
+        return self.build_schedule(slot, index=index)
+
+    # ------------------------------------------------------------------
+    # On-wire framing
+    # ------------------------------------------------------------------
+
+    def wire_chunks(self, frame: bytes) -> list[bytes]:
+        """Append the V3 'commit' frame after state-changing writes.
+
+        On V3 devices, the official app follows certain writes with a
+        separate `E0AA55` frame; without it, the device acknowledges the
+        command at the GATT layer but doesn't actually apply it. Per the
+        captures from @Mins95 the commit is sent after power-on, fan, and
+        schedule writes — but not after power-off.
+        """
+        if not frame or not self.is_v3:
+            return [frame]
+
+        op = frame[0] & 0xFF
+        needs_commit = False
+        if op == SM_AK_CMD_CONTROL_STATE and len(frame) >= 2:
+            # Only commit on writes that turn ONOFF *on*. Mirrors the
+            # captured pattern: 2D1B (power-on) → commit, 2D1A (off) → no
+            # commit.
+            needs_commit = bool(frame[1] & (1 << SM_AK_CTRL_BIT_ONOFF))
+        elif op == SM_AK_CMD_SCHEDULE_V3:
+            needs_commit = True
+
+        if needs_commit:
+            return [frame, SM_AK_V3_COMMIT]
+        return [frame]
 
     # ------------------------------------------------------------------
     # Notification parsing
@@ -680,6 +825,16 @@ class ScentMarketingAkProtocol(BleProtocol):
             return {}
         result: dict = {}
         op = data[0] & 0xFF
+
+        if op == SM_AK_OPCODE_LOGIN_RESPONSE and len(data) >= 7:
+            # Reply format: 0x8F + "OK_VX.0" where X is 2 or 3. Pin the
+            # device's command-set version for subsequent build_* calls.
+            payload = bytes(data[1:])
+            if b"V3" in payload:
+                self._v3_mode = True
+            elif b"V2" in payload:
+                self._v3_mode = False
+            return result
 
         if op == 0x4D and len(data) >= 2:  # control state
             mask = data[1] & 0xFF

@@ -58,6 +58,50 @@ SM_AK_CTRL_BIT_RESERVED = 3   # always 1 in the Android source
 SM_AK_CTRL_BIT_LAMP = 4
 SM_AK_CTRL_BIT_LOCK = 5
 
+# AK login & V3-mode handshake (reverse-engineered by @Mins95 from real BLE
+# captures of two SA_-named devices). The device ignores every other write
+# until it has seen the primary login frame; without it the integration
+# appears to work (writes succeed at the GATT level) but the device drops
+# the payload silently.
+#
+# Primary login = opcode 0x8F + ASCII "8888" (the default app PIN). The
+# device replies with 0x8F + "OK_V2.0" or 0x8F + "OK_V3.0", which selects
+# the command set.
+SM_AK_LOGIN_PRIMARY = bytes.fromhex("8F38383838")
+# V3 devices accept a secondary login frame after the primary; only after
+# that do they respond to the V3 power/fan/schedule opcodes. V2 devices
+# ignore this frame.
+SM_AK_LOGIN_SECONDARY_V3 = bytes.fromhex("8F383838384F4B3031")
+SM_AK_OPCODE_LOGIN_RESPONSE = 0x8F
+
+# V3 devices require this 3-byte "commit" suffix as a *separate* frame after
+# most state-changing writes (power-on, fan toggle, schedule write). Same
+# bytes as the legacy AK heartbeat — different role.
+SM_AK_V3_COMMIT = bytes([0xE0, 0xAA, 0x55])
+
+# V3 fan-control frames (note: 0x2A prefix, not the 0x2D control bitmask).
+SM_AK_V3_FAN_ON = bytes.fromhex("2A01020300")
+SM_AK_V3_FAN_OFF = bytes.fromhex("2A01020100")
+
+# V3 schedule layout has only two slots, fixed by purpose in the official
+# app's UI (Weekend / Weekday). The slot index is captured verbatim — we
+# don't know if the device's firmware accepts other indices.
+SM_AK_V3_SLOT_WEEKEND = 0x04
+SM_AK_V3_SLOT_WEEKDAY = 0x05
+# Trailer bytes appended to every V3 schedule write. Purpose unknown
+# (possibly fade-in / fade-out durations); captured verbatim from the app.
+SM_AK_V3_SCHEDULE_TRAILER = bytes.fromhex("000F012C")
+
+# Day-mask bit layout for AK schedule writes, derived from @Mins95's
+# observations: 0x7F = every day, 0x3E = Mon-Fri, 0x41 = Sat+Sun. That
+# gives bit 0 = Sun, bit 1 = Mon, ..., bit 6 = Sat.
+SM_AK_DAY_MASK_SUN = 0x01
+SM_AK_DAY_MASK_MON = 0x02
+SM_AK_DAY_MASK_SAT = 0x40
+SM_AK_DAY_MASK_WEEKDAYS = 0x3E  # Mon-Fri
+SM_AK_DAY_MASK_WEEKEND = 0x41   # Sat+Sun
+SM_AK_DAY_MASK_DAILY = 0x7F
+
 # Scent Marketing app — GW family (EE01 service, framed DP protocol)
 SM_GW_SERVICE_UUID = "0000ee01-0000-1000-8000-00805f9b34fb"
 SM_GW_NOTIFY_UUID = "0000ee02-0000-1000-8000-00805f9b34fb"
