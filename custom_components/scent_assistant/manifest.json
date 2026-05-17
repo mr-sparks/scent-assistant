@@ -3,6 +3,7 @@
   "name": "Scent Assistant",
   "bluetooth": [
     { "local_name": "Scent *" },
+    { "local_name": "DAP.A5*" },
     { "local_name": "BT-ivy*" },
     { "local_name": "Scentiment*" },
     { "local_name": "SA_*" },
