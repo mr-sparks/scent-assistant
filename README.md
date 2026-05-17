@@ -43,7 +43,8 @@
 | Aroma-Link WiFi+BLE Diffusers | Aroma-Link | BLE + Cloud | Full support including fan control via BLE |
 | JCloud Scent Diffusers | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
 | Cavir Smart Scent Air Machine | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
-| AromaPlan Diffusers | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
+| AromaPlan Diffusers | AromaPlan | BLE + Cloud | Same as Aroma-Link, different branding |
+| DAP Smart Scent Air Machine (Model 11, A5) | AromaPlan | BLE | Broadcasts as `DAP.A5.Bluetooth`; uses Aroma-Link protocol |
 | Crearoma Diffusers | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
 | ShinePick QT-I300 | Aroma Buddy | BLE | Tuya BLE protocol |
 | Scentiment Diffuser Air 2 | Scentiment | BLE | JSON-over-BLE protocol; intensity, RGB LED, battery |

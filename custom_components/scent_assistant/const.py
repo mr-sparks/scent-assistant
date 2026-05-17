@@ -118,7 +118,9 @@ SM_GW_ALT_WRITE_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
 # ---------------------------------------------------------------------------
 
 BLE_NAME_PATTERNS = {
-    DeviceType.AROMA_LINK: ["Scent "],
+    # "Scent " — Aroma-Link / JCloud / Cavir / Crearoma (Dewoo OEM, Aroma-Link app)
+    # "DAP.A5" — DAP Smart Scent Air Machine (Dewoo OEM, AromaPlan app)
+    DeviceType.AROMA_LINK: ["Scent ", "DAP.A5"],
     DeviceType.TUYA_BLE: ["BT-ivy"],
     DeviceType.SCENTIMENT: ["Scentiment"],
 }
