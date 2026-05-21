@@ -56,6 +56,8 @@ class WorkDurationNumber(NumberEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
@@ -91,6 +93,8 @@ class PauseDurationNumber(NumberEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property

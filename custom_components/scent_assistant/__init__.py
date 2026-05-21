@@ -89,6 +89,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Create device manager
     device = ScentDiffuserDevice(
+        hass=hass,
         ble_address=ble_address if connection_mode == "ble" else None,
         ble_name=ble_name,
         device_type=device_type,

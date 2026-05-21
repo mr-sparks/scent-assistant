@@ -13,10 +13,10 @@
   ],
   "codeowners": ["@mr-sparks"],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": ["bluetooth"],
   "documentation": "https://github.com/mr-sparks/scent-assistant",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/mr-sparks/scent-assistant/issues",
-  "requirements": ["bleak>=0.21.0"],
-  "version": "1.2.0-beta.5"
+  "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.0.0"],
+  "version": "1.2.0-beta.6"
 }

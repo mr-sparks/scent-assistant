@@ -11,6 +11,10 @@ import logging
 from datetime import datetime
 
 from bleak import BleakClient, BleakScanner, BleakError
+from bleak_retry_connector import establish_connection
+
+from homeassistant.components import bluetooth
+from homeassistant.core import HomeAssistant
 
 from .const import (
     DeviceType,
@@ -44,6 +48,7 @@ class ScentDiffuserDevice:
 
     def __init__(
         self,
+        hass: HomeAssistant | None = None,
         ble_address: str | None = None,
         ble_name: str | None = None,
         device_type: DeviceType | None = None,
@@ -52,6 +57,10 @@ class ScentDiffuserDevice:
         sm_metadata: dict | None = None,
         gw_password: str | None = None,
     ) -> None:
+        # HomeAssistant reference, used to fetch a cached BLEDevice via
+        # the core bluetooth integration before opening a connection.
+        # Optional so the manager can still be unit-tested without HA.
+        self._hass = hass
         # Detection metadata from the config flow — populated only for
         # Scent Marketing family devices.
         self._sm_metadata = sm_metadata or {}
@@ -217,11 +226,27 @@ class ScentDiffuserDevice:
 
             try:
                 _LOGGER.debug("BLE connecting to %s", self._ble_name)
-                self._ble_client = BleakClient(
-                    self._ble_address,
-                    timeout=DEFAULT_CONNECT_TIMEOUT,
+                # Prefer the BLEDevice cached by HA's bluetooth
+                # integration (it carries the right adapter / proxy
+                # routing info); fall back to a plain MAC string if the
+                # device hasn't been observed recently.
+                target = self._ble_address
+                if self._hass is not None:
+                    cached = bluetooth.async_ble_device_from_address(
+                        self._hass, self._ble_address, connectable=True,
+                    )
+                    if cached is not None:
+                        target = cached
+                # Use bleak_retry_connector for robust connection
+                # establishment (handles transient failures with
+                # exponential backoff and is required by HA's bluetooth
+                # stack to interoperate with bluetooth-proxy / ESPHome).
+                self._ble_client = await establish_connection(
+                    BleakClient,
+                    target,
+                    self._ble_name or self._ble_address,
+                    max_attempts=3,
                 )
-                await self._ble_client.connect()
                 self._ble_connected = True
 
                 # Subscribe to notifications for responses. Without these

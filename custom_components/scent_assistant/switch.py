@@ -60,6 +60,8 @@ class DiffuserPowerSwitch(SwitchEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
@@ -91,6 +93,8 @@ class DiffuserLockSwitch(SwitchEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
@@ -122,6 +126,8 @@ class DiffuserLampSwitch(SwitchEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
@@ -154,6 +160,8 @@ class DiffuserFanSwitch(SwitchEntity):
         device.register_state_callback(self._on_state_update)
 
     def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
         self.async_write_ha_state()
 
     @property
