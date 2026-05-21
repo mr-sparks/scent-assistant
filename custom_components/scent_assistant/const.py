@@ -49,6 +49,39 @@ SM_AK_CMD_CONTROL_STATE = 0x2D        # writeTotalControl(): 0x2D + bitmask
 SM_AK_CMD_SCHEDULE_V2 = 0x03          # DeviceTimeModel v2.0 schedule write
 SM_AK_CMD_SCHEDULE_V3 = 0x2A          # DeviceTimeModel v3.0 schedule write (CMD_GET_FIRMWARE_VERSION_RESEX)
 
+# AK read opcodes — observed in @Mins95's V2/V3 captures of the official
+# Scent Marketing app. The app issues these on every connect to rebuild
+# its UI state from the device. Used here for state read-back on HA
+# restart so entities reflect what the diffuser actually has stored.
+#
+# V2 read commands (single-byte opcode, slot in low nibble for schedule):
+SM_AK_CMD_READ_SCHEDULE_V2 = 0x83     # 8301..8305 → 83 SS HH MM HH MM DD LL ...
+SM_AK_CMD_READ_DEVICE_TYPE = 0x89     # 89 → 89 + type byte
+SM_AK_CMD_READ_DEVICE_NAME = 0x81     # 81 → 81 + len + utf8 name
+SM_AK_CMD_READ_DEVICE_LABEL = 0x85    # 85 → 85 + label byte
+SM_AK_CMD_READ_FIRMWARE = 0x86        # 86 → 86 + "Vx.xx" PCB firmware
+SM_AK_CMD_READ_EQUIPMENT = 0x88       # 88 → 88 + "Vx.x" equipment version
+
+# V3 read commands (introduced after the V3 secondary login). The device
+# pushes responses async, sometimes multiple per query:
+SM_AK_CMD_V3_READ_NAME = 0xC6         # C6 → 42 + utf8 name (multi-push variant)
+SM_AK_CMD_V3_READ_SCHEDULES = 0xC5    # C5 → multiple 4A 01 02 03 04 SS ... pushes
+SM_AK_CMD_V3_READ_SLOT = 0xCA         # CA 01 SS → individual slot 4A response
+SM_AK_CMD_V3_READ_LABEL = 0xC7        # C7 → 48 + 16-byte label (e.g. "Evasion" padded)
+SM_AK_CMD_V3_READ_OIL = 0xC8          # C8 → 4B + 5 bytes (battery/oil layout TBD)
+SM_AK_CMD_V3_READ_FIRMWARE = 0xCB     # CB → 44 + PCB version + Equipment version (32 bytes)
+SM_AK_CMD_V3_READ_CONTROL = 0xC4      # C4 → 4D 01 <mask>  (power/fan/lamp/lock bitmask)
+SM_AK_CMD_V3_READ_MODEL = 0xD0        # D0 → 45 + utf8 model code (e.g. "A305M")
+
+# Response opcodes (parsed by `parse_notification`):
+SM_AK_RESP_SCHEDULE_V2 = 0x83         # mirrors the V2 read opcode
+SM_AK_RESP_SCHEDULE_V3 = 0x4A         # mirrors the V3 schedule write opcode (0x2A) flipped
+SM_AK_RESP_DEVICE_NAME_V3 = 0x42      # response to C6
+SM_AK_RESP_LABEL_V3 = 0x48            # response to C7
+SM_AK_RESP_MODEL_V3 = 0x45            # response to D0
+SM_AK_RESP_FIRMWARE_V3 = 0x44         # response to CB (same opcode as our existing V2 parser)
+SM_AK_RESP_CONTROL = 0x4D             # control bitmask push/read (V2: 4D mask, V3: 4D 01 mask)
+
 # AK control-state bitmask layout (LSB = onOff). Mirrors writeTotalControl()
 # which builds a binary string "lock|lamp|1|demo|fan|onOff" → int(s, 2).
 SM_AK_CTRL_BIT_ONOFF = 0

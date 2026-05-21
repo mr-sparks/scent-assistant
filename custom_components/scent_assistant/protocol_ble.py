@@ -15,6 +15,15 @@ from .const import (
     SM_AK_CMD_TIME_SYNC, SM_AK_CMD_DEVICE_NAME, SM_AK_CMD_DEVICE_LABEL,
     SM_AK_CMD_OIL_NAME, SM_AK_CMD_OIL_AMOUNT, SM_AK_CMD_CONTROL_STATE,
     SM_AK_CMD_SCHEDULE_V2, SM_AK_CMD_SCHEDULE_V3,
+    SM_AK_CMD_READ_SCHEDULE_V2, SM_AK_CMD_READ_DEVICE_TYPE,
+    SM_AK_CMD_READ_DEVICE_NAME, SM_AK_CMD_READ_DEVICE_LABEL,
+    SM_AK_CMD_READ_FIRMWARE, SM_AK_CMD_READ_EQUIPMENT,
+    SM_AK_CMD_V3_READ_NAME, SM_AK_CMD_V3_READ_SCHEDULES,
+    SM_AK_CMD_V3_READ_SLOT, SM_AK_CMD_V3_READ_LABEL,
+    SM_AK_CMD_V3_READ_OIL, SM_AK_CMD_V3_READ_FIRMWARE,
+    SM_AK_CMD_V3_READ_CONTROL, SM_AK_CMD_V3_READ_MODEL,
+    SM_AK_RESP_SCHEDULE_V3, SM_AK_RESP_DEVICE_NAME_V3,
+    SM_AK_RESP_LABEL_V3, SM_AK_RESP_MODEL_V3,
     SM_AK_CTRL_BIT_ONOFF, SM_AK_CTRL_BIT_FAN, SM_AK_CTRL_BIT_DEMO,
     SM_AK_CTRL_BIT_RESERVED, SM_AK_CTRL_BIT_LAMP, SM_AK_CTRL_BIT_LOCK,
     SM_AK_LOGIN_PRIMARY, SM_AK_LOGIN_SECONDARY_V3,
@@ -96,6 +105,22 @@ class DiffuserState:
     # V3 firmware accepts 0-20; we clamp on send and let the AK protocol
     # use this value as the LL field when (re)building schedule frames.
     intensity: int | None = None
+    # Day-of-week mask for the active schedule slot. Bit layout matches
+    # the AK schedule frame: bit 0 = Sun, bit 1 = Mon, ..., bit 6 = Sat.
+    # Read back from the device on connect (V2: 8301-8305, V3: C5/4A);
+    # used as the DD field when rebuilding schedule frames so an
+    # intensity-only tweak doesn't lose the user's day pattern.
+    weekday_mask: int | None = None
+    # Slot index of the currently active schedule on the device (only
+    # meaningful for V2 where multiple slots may exist; V3 effectively
+    # has slots 04/05 keyed to weekend/weekday).
+    schedule_slot: int | None = None
+    # V3-only "scene label" the user assigned via the official app
+    # (e.g. "Evasion"). Surfaced in the device info on read-back.
+    device_label: str | None = None
+    # V3-only model code (e.g. "A305M"). Useful for triage when
+    # different hardware variants reveal protocol quirks.
+    model_code: str | None = None
 
 
 @dataclass
@@ -790,6 +815,49 @@ class ScentMarketingAkProtocol(BleProtocol):
         return self.build_schedule(slot, index=index)
 
     # ------------------------------------------------------------------
+    # State read-back queries
+    #
+    # Mirrors what the official Scent Marketing app does on every BLE
+    # connect (per @Mins95's V2 + V3 captures), so the integration can
+    # populate HA entities from the device's actual stored state after
+    # an HA restart instead of starting from a blank optimistic guess.
+    # ------------------------------------------------------------------
+
+    def build_read_schedule_queries(self) -> list[bytes]:
+        """Frames to send after login to read the device's schedule state.
+
+        V2: poll slots 1..5 individually with `83 SS`. V3: a single `C5`
+        triggers the device to push one `4A...` per slot asynchronously.
+        """
+        if self.is_v3:
+            return [bytes([SM_AK_CMD_V3_READ_SCHEDULES])]
+        return [bytes([SM_AK_CMD_READ_SCHEDULE_V2, i]) for i in range(1, 6)]
+
+    def build_read_state_queries(self) -> list[bytes]:
+        """Frames to read non-schedule device state (power/fan, label,
+        firmware, model). Different opcodes per protocol version.
+
+        These are useful but non-essential — schedule state is the
+        priority for state restoration on restart. The returned frames
+        can be fired without blocking; responses are parsed
+        asynchronously by `parse_notification`.
+        """
+        if self.is_v3:
+            return [
+                bytes([SM_AK_CMD_V3_READ_NAME]),
+                bytes([SM_AK_CMD_V3_READ_LABEL]),
+                bytes([SM_AK_CMD_V3_READ_FIRMWARE]),
+                bytes([SM_AK_CMD_V3_READ_CONTROL]),
+                bytes([SM_AK_CMD_V3_READ_MODEL]),
+            ]
+        return [
+            bytes([SM_AK_CMD_READ_DEVICE_NAME]),
+            bytes([SM_AK_CMD_READ_DEVICE_LABEL]),
+            bytes([SM_AK_CMD_READ_FIRMWARE]),
+            bytes([SM_AK_CMD_READ_EQUIPMENT]),
+        ]
+
+    # ------------------------------------------------------------------
     # On-wire framing
     # ------------------------------------------------------------------
 
@@ -845,7 +913,11 @@ class ScentMarketingAkProtocol(BleProtocol):
             return result
 
         if op == 0x4D and len(data) >= 2:  # control state
-            mask = data[1] & 0xFF
+            # V2: `4D <mask>` (2 bytes). V3: `4D 01 <mask>` (3 bytes,
+            # the 0x01 being a leading count/mode byte per @Mins95's V3
+            # init capture where the app issues `C4` and receives
+            # `4D 01 FF`).
+            mask = data[2] & 0xFF if len(data) >= 3 else data[1] & 0xFF
             self._ctrl_bits[SM_AK_CTRL_BIT_ONOFF] = bool(mask & (1 << SM_AK_CTRL_BIT_ONOFF))
             self._ctrl_bits[SM_AK_CTRL_BIT_FAN] = bool(mask & (1 << SM_AK_CTRL_BIT_FAN))
             self._ctrl_bits[SM_AK_CTRL_BIT_DEMO] = bool(mask & (1 << SM_AK_CTRL_BIT_DEMO))
@@ -867,8 +939,79 @@ class ScentMarketingAkProtocol(BleProtocol):
                 if total > 0:
                     result["oil_remaining"] = max(0, min(100, int(100 * remainder / total)))
 
-        elif op == 0x42 and len(data) >= 2:  # device name (BLE v3 push)
-            result["device_name"] = data[1:].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        elif op == 0x83 and len(data) >= 8:
+            # V2 schedule slot read-back. Layout matches the write but
+            # echoes whatever the device has stored:
+            #     83 SS HH MM HH MM DD LL [extra...]
+            # SS lower nibble = slot index, 0x10 bit = enabled. Trailing
+            # bytes carry work/pause and other slot config that we
+            # currently don't surface as separate state.
+            if data[1] & 0x10:
+                # Only absorb the slot the device says is enabled.
+                self._absorb_schedule(
+                    slot_index=data[1] & 0x0F,
+                    start_hour=data[2], start_minute=data[3],
+                    end_hour=data[4], end_minute=data[5],
+                    weekday_mask=data[6],
+                    intensity=data[7],
+                    result=result,
+                )
+
+        elif op == SM_AK_RESP_SCHEDULE_V3 and len(data) >= 14:
+            # V3 schedule slot read-back, response to C5 / CA01XX:
+            #     4A 01 02 03 04 SS EE HH MM HH MM DD 00 LL 00 0F 01 2C
+            # The EE byte's semantics differ between write (0x01=on,
+            # 0x03=off) and read — @Mins95's salon_v3 capture shows the
+            # active slot 04 reporting EE=03 even though the program
+            # was enabled. So instead of trusting EE on read-back we
+            # rely on the structural check inside `_absorb_schedule`:
+            # a slot with all-zero times AND zero day mask is empty
+            # junk and gets skipped; anything else is treated as the
+            # active configuration.
+            self._absorb_schedule(
+                slot_index=data[5],
+                start_hour=data[7], start_minute=data[8],
+                end_hour=data[9], end_minute=data[10],
+                weekday_mask=data[11],
+                intensity=data[13],
+                result=result,
+            )
+
+        elif op == SM_AK_RESP_DEVICE_NAME_V3 and len(data) >= 2:
+            # V3 reply to C6: `42 <utf8 name bytes…>`. Name is variable
+            # length, no explicit length prefix.
+            try:
+                name = bytes(data[1:]).decode("utf-8", errors="replace").rstrip("\x00").strip()
+                if name:
+                    result["device_name"] = name
+            except Exception:
+                pass
+
+        elif op == 0x81 and len(data) >= 3:
+            # V2 reply to 0x81: `81 <len> <utf8 name>`.
+            length = data[1] & 0xFF
+            name_bytes = bytes(data[2:2 + length])
+            try:
+                name = name_bytes.decode("utf-8", errors="replace").rstrip("\x00").strip()
+                if name:
+                    result["device_name"] = name
+            except Exception:
+                pass
+
+        elif op == SM_AK_RESP_LABEL_V3 and len(data) >= 2:
+            # V3 reply to C7: `48 <16 utf8 bytes, zero-padded>`. We
+            # surface it as the device_name fallback when no name has
+            # come through yet — it's the user-visible "scene name" in
+            # the official app (e.g. "Evasion").
+            label = bytes(data[1:]).rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+            if label:
+                result.setdefault("device_label", label)
+
+        elif op == SM_AK_RESP_MODEL_V3 and len(data) >= 2:
+            # V3 reply to D0: `45 <utf8 model code>` (e.g. "A305M").
+            model = bytes(data[1:]).rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+            if model:
+                result["model_code"] = model
 
         elif op == 0x44 and len(data) >= 17:  # PCB + Equipment firmware version
             pcb = data[1:17].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
@@ -878,12 +1021,53 @@ class ScentMarketingAkProtocol(BleProtocol):
         elif op == 0x82 and len(data) >= 2:  # PCB version (BLE v2)
             result["firmware_version"] = data[1:].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
 
-        elif op == 0x88 and len(data) >= 2:  # equipment version
-            version = data[1:].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        elif op == 0x86 and len(data) >= 2:
+            # V2 reply to 0x86: `86 <utf8 firmware version>` (e.g. "V2.00").
+            version = bytes(data[1:]).rstrip(b"\x00").decode("utf-8", errors="replace").strip()
             if version:
                 result["firmware_version"] = version
 
+        elif op == 0x88 and len(data) >= 2:  # equipment version
+            version = data[1:].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+            if version:
+                # Don't clobber a richer V2/V3 firmware string if one was
+                # already parsed from 0x44 / 0x86; only fill in if empty.
+                result.setdefault("firmware_version", version)
+
         return result
+
+    def _absorb_schedule(
+        self,
+        slot_index: int,
+        start_hour: int,
+        start_minute: int,
+        end_hour: int,
+        end_minute: int,
+        weekday_mask: int,
+        intensity: int,
+        result: dict,
+    ) -> None:
+        """Populate `result` with schedule fields from a parsed slot.
+
+        Skip slots that are clearly empty (all-zero times AND zero day
+        mask) — the V3 reads in particular return five slots per query
+        and most will be uninitialised junk with a wide range of values
+        in the intensity / trailer bytes. We only want to surface the
+        first slot that actually carries a real schedule.
+        """
+        if start_hour == 0 and start_minute == 0 and end_hour == 0 and end_minute == 0 and weekday_mask == 0:
+            return
+        result["start_hour"] = start_hour & 0xFF
+        result["start_minute"] = start_minute & 0xFF
+        result["end_hour"] = end_hour & 0xFF
+        result["end_minute"] = end_minute & 0xFF
+        result["weekday_mask"] = weekday_mask & 0xFF
+        result["schedule_slot"] = slot_index & 0xFF
+        # Intensity clamp to firmware ceiling (defensive — should already
+        # be in range from the device, but read-back bytes can have junk
+        # values in uninitialised slots).
+        ceiling = 20 if self.is_v3 else 10
+        result["intensity"] = max(0, min(ceiling, intensity & 0xFF))
 
 
 class ScentMarketingGwProtocol(BleProtocol):

@@ -242,7 +242,11 @@ class ScentDiffuserDevice:
                 # every other write, otherwise the device drops them
                 # silently. The response also tells us whether to use the
                 # V2 or V3 command set; we wait briefly for it before
-                # sending follow-ups so `_v3_mode` is set in time.
+                # sending follow-ups so `_v3_mode` is set in time. Once
+                # login completes, mirror the official app and read back
+                # schedule / power / firmware state so HA entities
+                # reflect what the device actually has stored rather
+                # than starting from a blank optimistic guess.
                 if isinstance(self._protocol, ScentMarketingAkProtocol):
                     self._protocol.reset_login_state()
                     try:
@@ -253,8 +257,16 @@ class ScentDiffuserDevice:
                         if self._protocol.is_v3:
                             await self._ble_send(self._protocol.build_login_secondary_v3())
                             await asyncio.sleep(0.3)
+                        # State read-back: fire queries; responses are
+                        # parsed asynchronously by parse_notification.
+                        for frame in self._protocol.build_read_schedule_queries():
+                            await self._ble_send(frame)
+                            await asyncio.sleep(0.15)
+                        for frame in self._protocol.build_read_state_queries():
+                            await self._ble_send(frame)
+                            await asyncio.sleep(0.15)
                     except Exception as err:
-                        _LOGGER.debug("Scent Marketing AK: login failed: %s", err)
+                        _LOGGER.debug("Scent Marketing AK: login/readback failed: %s", err)
 
                 # Time sync on first connection of this session (skipped for
                 # protocols that don't support it).
@@ -405,6 +417,22 @@ class ScentDiffuserDevice:
             changed = True
         if "firmware_version" in updates:
             self._state.firmware_version = updates["firmware_version"]
+            changed = True
+        # Scent Marketing AK — read-back fields
+        if "intensity" in updates:
+            self._state.intensity = updates["intensity"]
+            changed = True
+        if "weekday_mask" in updates:
+            self._state.weekday_mask = updates["weekday_mask"]
+            changed = True
+        if "schedule_slot" in updates:
+            self._state.schedule_slot = updates["schedule_slot"]
+            changed = True
+        if "device_label" in updates:
+            self._state.device_label = updates["device_label"]
+            changed = True
+        if "model_code" in updates:
+            self._state.model_code = updates["model_code"]
             changed = True
 
         if changed:
