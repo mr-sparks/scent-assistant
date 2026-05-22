@@ -964,6 +964,12 @@ class ScentMarketingAkProtocol(BleProtocol):
                     intensity=data[7],
                     result=result,
                 )
+                # V2 firmware has no dedicated power-state read opcode —
+                # the only readable signal that the device is "on" is
+                # the enabled-slot bit. Mirror it into `state.power` so
+                # the HA Power switch reflects reality after restart.
+                result["power"] = True
+                result["phase"] = "idle"
 
         elif op == SM_AK_RESP_SCHEDULE_V3 and len(data) >= 14:
             # V3 schedule slot read-back, response to C5 / CA01XX:
