@@ -18,7 +18,7 @@
 
 <p align="center">
   A <a href="https://www.home-assistant.io/">Home Assistant</a> custom integration for controlling scent and aroma diffusers via Bluetooth or WiFi.<br>
-  Supports devices using the <b>Aroma-Link</b>, <b>Aroma Buddy</b> and <b>Scentiment</b> apps.
+  Supports devices using the <b>Aroma-Link</b>, <b>Aroma Buddy</b>, <b>Scent Marketing</b> and <b>Scentiment</b> apps.
 </p>
 
 ---
@@ -48,6 +48,8 @@
 | Crearoma Diffusers | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
 | ShinePick QT-I300 | Aroma Buddy | BLE | Tuya BLE protocol |
 | Scentiment Diffuser Air 2 | Scentiment | BLE | JSON-over-BLE protocol; intensity, RGB LED, battery |
+| Scent Marketing diffusers (SA_* series) | Scent Marketing | BLE | V2 + V3 variants; Power, Fan, Program switch, intensity, schedule read-back |
+| Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
 
 ### Likely Compatible
 
@@ -139,6 +141,17 @@ The set of entities depends on which device family is connected.
 | Level | Number | Spray intensity (1–3) |
 | LED | Light | RGB color picker + on/off |
 | Battery | Sensor | Battery percentage |
+
+### Scent Marketing AK family
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Fan | Switch | Fan on/off (V3 devices) |
+| Program | Switch | Schedule / program enabled (V3 devices — independent of Power) |
+| Lamp | Switch | Auxiliary LED lamp |
+| Child Lock | Switch | Lock physical buttons |
+| Intensity | Number | Spray intensity (0–10 on V2, 0–20 on V3) |
+| Start Time / End Time | Time | Daily schedule window |
 
 ---
 
@@ -275,6 +288,7 @@ This integration was built by reverse engineering the BLE protocols of both devi
 |----------|--------|----------|----------|
 | Aroma-Link | `A5 AA AC ... C5 CC CA` | XOR | Power, fan, per-day scheduling (5 slots), time sync |
 | Tuya BLE (Aroma Buddy) | `55 AA ...` | Sum mod 256 | Power, scheduling (5 setups), time sync |
+| Scent Marketing AK | `8F` login (PIN 8888) + `2A`/`4A` schedule | None (length-framed) | Power, Fan, Program, schedule read-back; V2 + V3 variants |
 
 ---
 
