@@ -217,6 +217,11 @@ AL_SUB_TIME_SYNC = 0x17
 AL_SUB_DEVICE_NAME = 0x01
 AL_SUB_DEVICE_INFO = 0x0D
 AL_SUB_QUERY_SCHEDULES = 0x15
+# Read-register sub-command for the liquid/oil level. The device answers a
+# `52 1E` query with `52 1E <percent>` (e.g. 0x50 = 80%). Decoded from
+# @ndoty's Aromadd U5 Pro HCI snoop (#18), where the app read 0x1E and got
+# 0x50 while its UI showed 80%.
+AL_SUB_OIL_LEVEL = 0x1E
 
 AL_FAN_ON_VALUE = 0x10
 AL_FAN_OFF_VALUE = 0x00

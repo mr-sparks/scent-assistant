@@ -323,7 +323,17 @@ class ScentDiffuserDevice:
                         # Give the device time to respond — the
                         # notification handler will set _v3_mode.
                         await asyncio.sleep(0.5)
-                        if self._protocol.is_v3:
+                        # V3 devices need a secondary login. Some answer the
+                        # primary on its own (so is_v3 is already known
+                        # here); others — e.g. christiandion's Flair Tower
+                        # (#8) — stay silent until they receive the
+                        # secondary. Gating the secondary on is_v3 then
+                        # deadlocks those: no secondary → no login response
+                        # → no state read-back → device looks uncontrollable.
+                        # So send the secondary whenever the device is
+                        # known-V3 OR hasn't answered at all yet; only skip
+                        # it once a device has positively identified as V2.
+                        if self._protocol.is_v3 or not self._protocol.login_completed:
                             await self._ble_send(self._protocol.build_login_secondary_v3())
                             await asyncio.sleep(0.3)
                         # Time sync must precede the read-back queries
@@ -837,6 +847,13 @@ class ScentDiffuserDevice:
                 try:
                     await self._ble_send(self._protocol.build_query())
                     await asyncio.sleep(1.0)
+                    # Some protocols expose extra read-registers that the
+                    # device only reports on demand (e.g. Aroma-Link's oil
+                    # level). Query them too when the protocol offers one.
+                    oil_query = getattr(self._protocol, "build_oil_query", None)
+                    if oil_query is not None:
+                        await self._ble_send(oil_query())
+                        await asyncio.sleep(0.3)
                 except (BleakError, asyncio.TimeoutError, OSError) as err:
                     _LOGGER.debug("BLE refresh query failed on %s: %s", self._ble_name, err)
                     self._ble_last_failure_ts = asyncio.get_event_loop().time()

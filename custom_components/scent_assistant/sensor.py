@@ -45,6 +45,12 @@ async def async_setup_entry(
         entities.append(DiffuserBatterySensor(device, entry))
         entities.append(DiffuserOilSensor(device, entry))
 
+    # Aroma-Link reports a liquid level via read-register 0x1E. The sensor
+    # stays unavailable until a value arrives, so it's safe to register for
+    # the whole family even though only some models answer the query.
+    if device.device_type == DeviceType.AROMA_LINK:
+        entities.append(DiffuserOilSensor(device, entry))
+
     if device.device_type in SCENT_MARKETING_TYPES:
         entities.append(DiffuserDetectionDiagnostic(device, entry))
 
@@ -120,7 +126,7 @@ class DiffuserBatterySensor(SensorEntity):
 
 
 class DiffuserOilSensor(SensorEntity):
-    """Remaining fragrance oil percentage (Scent Marketing GW family)."""
+    """Remaining fragrance oil percentage (Scent Marketing GW + Aroma-Link)."""
 
     _attr_has_entity_name = True
     _attr_name = "Oil remaining"

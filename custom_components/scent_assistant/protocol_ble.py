@@ -54,7 +54,7 @@ from .const import (
     AL_HEADER, AL_TRAILER,
     AL_CMD_QUERY, AL_CMD_STATUS, AL_CMD_WRITE,
     AL_SUB_POWER, AL_SUB_FAN, AL_SUB_SCHEDULE, AL_SUB_TIME_SYNC,
-    AL_SUB_QUERY_SCHEDULES,
+    AL_SUB_QUERY_SCHEDULES, AL_SUB_OIL_LEVEL,
     AL_FAN_ON_VALUE, AL_FAN_OFF_VALUE,
     AL_SLOT_ENABLED, AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
@@ -356,6 +356,15 @@ class AromaLinkBleProtocol(BleProtocol):
     def build_query(self) -> bytes:
         return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_QUERY_SCHEDULES]))
 
+    def build_oil_query(self) -> bytes:
+        """Read the liquid/oil level register (`52 1E`).
+
+        The device only reports the level on demand, so this is sent
+        alongside the schedule query on every refresh. The reply is
+        parsed below into `oil_remaining`.
+        """
+        return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_OIL_LEVEL]))
+
     def build_time_sync(self, now: datetime | None = None) -> bytes:
         if now is None:
             now = datetime.now()
@@ -441,6 +450,12 @@ class AromaLinkBleProtocol(BleProtocol):
                 result["start_minute"] = payload[8]
                 result["end_hour"] = payload[9]
                 result["end_minute"] = payload[10]
+
+        elif cmd == AL_CMD_QUERY and sub == AL_SUB_OIL_LEVEL and len(payload) >= 3:
+            # Read-register reply for the liquid level: `52 1E <percent>`.
+            # @ndoty's capture showed 0x50 (80) matching the app's 80%, so
+            # the byte is a straight 0–100 percentage.
+            result["oil_remaining"] = max(0, min(100, payload[2]))
 
         elif cmd == AL_CMD_WRITE and len(payload) >= 3:
             # ACK responses (57 XX "ACK")
@@ -1047,9 +1062,15 @@ class ScentMarketingAkProtocol(BleProtocol):
             # device treats as not-actually-running. Require both bytes
             # to align so HA's switch state reflects reality.
             active_slot = data[4] != 0
-            ee_enabled = data[6] == 0x03
-            if data[6] in (0x01, 0x03):
-                result["schedule_enabled"] = active_slot and ee_enabled
+            # EE carries the enabled flag in bit1 (0x02). @Mins95's V3 uses
+            # 0x03 (enabled) / 0x01 (disabled); christiandion's Flair Tower
+            # variant (#8) uses 0x07 / 0x05 — same bit1 meaning, just with
+            # an extra bit2 set. Testing the bit instead of the exact byte
+            # reads both variants correctly. (The bit1 meaning on the Flair
+            # is inferred from its app's write frames and still wants a live
+            # enabled-vs-disabled capture to confirm.)
+            ee_enabled = bool(data[6] & 0x02)
+            result["schedule_enabled"] = active_slot and ee_enabled
 
         elif op == SM_AK_RESP_DEVICE_NAME_V3 and len(data) >= 2:
             # V3 reply to C6: `42 <utf8 name bytes…>`. Name is variable

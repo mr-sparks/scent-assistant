@@ -38,10 +38,12 @@ async def async_setup_entry(
     if device.device_type in SCENT_MARKETING_TYPES and not is_cloud:
         entities.append(DiffuserLockSwitch(device, entry))
         if device.device_type == DeviceType.SCENT_MARKETING_AK:
-            # The AK control bitmask carries lamp + fan bits we can drive
-            # without any extra protocol work.
+            # The AK control bitmask carries a lamp bit we can drive
+            # without any extra protocol work. (The fan switch is already
+            # added above via `device.supports_fan`, which is True for AK —
+            # appending it here too would register a second entity with the
+            # same `_fan` unique_id and HA would reject the duplicate.)
             entities.append(DiffuserLampSwitch(device, entry))
-            entities.append(DiffuserFanSwitch(device, entry))
             # V3 AK devices have a separate program-enabled toggle that
             # is distinct from Power. We register the entity for every
             # AK device but make it unavailable on V2 (where it would
