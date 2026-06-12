@@ -137,8 +137,8 @@ The set of entities depends on which device family is connected.
 | Oil remaining | Sensor | Liquid level percentage (Aroma-Link models that report it) |
 | Diffuse Now | Button | One-shot diffusion: on, then auto-off after Momentary Duration (Aroma-Link) |
 | Momentary Duration | Number | Run time for Diffuse Now in seconds (Aroma-Link) |
-| Diffusion time remaining | Sensor | Seconds left in the current spray phase (Aroma-Link, BLE only) |
-| Pause time remaining | Sensor | Seconds left in the current pause phase (Aroma-Link, BLE only) |
+| Diffusion time remaining | Sensor | Seconds left in the current spray phase (Aroma-Link, BLE + Cloud) |
+| Pause time remaining | Sensor | Seconds left in the current pause phase (Aroma-Link, BLE + Cloud) |
 | Battery | Sensor | Battery percentage (Aroma-Link models with a battery) |
 
 ### Scentiment Diffuser Air 2

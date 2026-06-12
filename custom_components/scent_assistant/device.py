@@ -912,6 +912,18 @@ class ScentDiffuserDevice:
                     self._state.power = status["power"]
                 if "phase" in status:
                     self._state.phase = status["phase"]
+                # The cloud work-status payload carries the same live
+                # countdown the BLE 52 0A frame does (plus oil/battery
+                # on devices that report them) — feed it into the same
+                # state fields so the sensors work in cloud mode too.
+                if status.get("work_remain") is not None:
+                    self._state.work_remaining = int(status["work_remain"])
+                if status.get("pause_remain") is not None:
+                    self._state.pause_remaining = int(status["pause_remain"])
+                if status.get("oil_remaining") is not None:
+                    self._state.oil_remaining = status["oil_remaining"]
+                if status.get("battery") is not None:
+                    self._state.battery = status["battery"]
                 self._notify_state_changed()
 
     async def sync_time(self) -> bool:

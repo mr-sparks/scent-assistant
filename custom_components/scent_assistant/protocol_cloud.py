@@ -491,9 +491,29 @@ class AromaLinkCloudClient:
         if power:
             phase = "spraying" if work_status == 1 else "paused" if work_status == 2 else "idle"
 
-        return {
+        result = {
             "power": power,
             "phase": phase,
             "work_remain": info.get("workRemainTime"),
             "pause_remain": info.get("pauseRemainTime"),
         }
+
+        # Oil level: the cloud reports `remainOil`, but its unit depends
+        # on the device. Per the official app's updateRemainOil() it is
+        # only a percentage when ojiShowType == 1; weight-sensor devices
+        # report grams there instead, and multi-bottle models use
+        # `otherRemainOil`. Only surface the unambiguous percent case.
+        if info.get("ojiShowType") == 1 and info.get("remainOil") is not None:
+            try:
+                result["oil_remaining"] = max(0, min(100, int(info["remainOil"])))
+            except (TypeError, ValueError):
+                pass
+
+        # Battery is only meaningful when the device declares one.
+        if info.get("hasBattery") == 1 and info.get("battery") is not None:
+            try:
+                result["battery"] = max(0, min(100, int(info["battery"])))
+            except (TypeError, ValueError):
+                pass
+
+        return result
