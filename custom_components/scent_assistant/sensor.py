@@ -9,7 +9,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, EntityCategory
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -45,11 +45,15 @@ async def async_setup_entry(
         entities.append(DiffuserBatterySensor(device, entry))
         entities.append(DiffuserOilSensor(device, entry))
 
-    # Aroma-Link reports a liquid level via read-register 0x1E. The sensor
-    # stays unavailable until a value arrives, so it's safe to register for
-    # the whole family even though only some models answer the query.
+    # Aroma-Link reports a liquid level via read-register 0x1E and live
+    # work/pause countdowns + battery via 0x0A. All of these sensors stay
+    # unavailable until a value arrives, so it's safe to register them for
+    # the whole family even though only some models answer the queries.
     if device.device_type == DeviceType.AROMA_LINK:
         entities.append(DiffuserOilSensor(device, entry))
+        entities.append(DiffuserWorkRemainSensor(device, entry))
+        entities.append(DiffuserPauseRemainSensor(device, entry))
+        entities.append(DiffuserBatterySensor(device, entry))
 
     if device.device_type in SCENT_MARKETING_TYPES:
         entities.append(DiffuserDetectionDiagnostic(device, entry))
@@ -152,6 +156,71 @@ class DiffuserOilSensor(SensorEntity):
     @property
     def available(self) -> bool:
         return self._device.available and self._device.state.oil_remaining is not None
+
+
+class DiffuserWorkRemainSensor(SensorEntity):
+    """Remaining seconds of the current spray phase (Aroma-Link 52 0A).
+
+    While the device is idle the firmware reports the configured work
+    duration instead of a live countdown. The value only refreshes when
+    HA polls the device, so treat it as a snapshot, not a ticking timer.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Diffusion time remaining"
+    _attr_icon = "mdi:timer-sand"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_work_remaining"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        return self._device.state.work_remaining
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and self._device.state.work_remaining is not None
+
+
+class DiffuserPauseRemainSensor(SensorEntity):
+    """Remaining seconds of the current pause phase (Aroma-Link 52 0A)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Pause time remaining"
+    _attr_icon = "mdi:timer-pause-outline"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_pause_remaining"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        return self._device.state.pause_remaining
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and self._device.state.pause_remaining is not None
 
 
 class DiffuserDetectionDiagnostic(SensorEntity):

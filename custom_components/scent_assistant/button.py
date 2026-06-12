@@ -24,9 +24,43 @@ async def async_setup_entry(
     if device.device_type == DeviceType.SCENTIMENT:
         return
 
-    async_add_entities([
-        TimeSyncButton(device, entry),
-    ])
+    entities: list[ButtonEntity] = [TimeSyncButton(device, entry)]
+    # Momentary diffusion is power-on + delayed power-off, which only
+    # makes sense on families where power is a plain on/off (Aroma-Link).
+    if device.device_type == DeviceType.AROMA_LINK:
+        entities.append(MomentaryDiffuseButton(device, entry))
+    async_add_entities(entities)
+
+
+class MomentaryDiffuseButton(ButtonEntity):
+    """One-shot diffusion: power on, auto-off after a set duration.
+
+    The Aroma-Link protocol has no native momentary command (checked
+    against the decompiled official app), so the device manager emulates
+    it. The run time comes from the Momentary Duration number entity.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Diffuse Now"
+    _attr_icon = "mdi:spray"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_momentary"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_press(self) -> None:
+        """Start a momentary diffusion run."""
+        if not await self._device.momentary_diffuse():
+            _LOGGER.warning(
+                "Momentary diffusion failed to start on %s", self._device.name
+            )
 
 
 class TimeSyncButton(ButtonEntity):

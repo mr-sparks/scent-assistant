@@ -5,6 +5,7 @@ import logging
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -32,6 +33,8 @@ async def async_setup_entry(
     ]
     if device.device_type == DeviceType.SCENT_MARKETING_AK:
         entities.append(ScentMarketingIntensityNumber(device, entry))
+    if device.device_type == DeviceType.AROMA_LINK:
+        entities.append(MomentaryDurationNumber(device, entry))
     async_add_entities(entities)
 
 
@@ -107,6 +110,45 @@ class PauseDurationNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._device.set_pause_duration(int(value))
+
+
+class MomentaryDurationNumber(NumberEntity):
+    """Run time for the Diffuse Now button (Aroma-Link).
+
+    Held on the device manager only — resets to the default after an HA
+    restart. Configuration entity, so it lands in the device's
+    "Configuration" section rather than next to the live controls.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Momentary Duration"
+    _attr_icon = "mdi:timer-cog"
+    _attr_native_unit_of_measurement = "s"
+    _attr_native_min_value = 5
+    _attr_native_max_value = 600
+    _attr_native_step = 5
+    _attr_mode = NumberMode.BOX
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_momentary_duration"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+
+    @property
+    def native_value(self) -> float:
+        return self._device.momentary_seconds
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._device.momentary_seconds = int(value)
+        if self.hass is not None:
+            self.async_write_ha_state()
 
 
 class ScentMarketingIntensityNumber(NumberEntity):

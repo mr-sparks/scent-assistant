@@ -48,6 +48,10 @@ BLE_FAILURE_COOLDOWN_SECONDS = 3.0
 # layers its own retries on top of ours, so keeping this low avoids
 # 6-8 rapid connect attempts that can wedge some firmwares.
 BLE_CONNECT_MAX_ATTEMPTS = 2
+# Default run time for the momentary "Diffuse Now" button. Adjustable
+# per device via the Momentary Duration number entity (not persisted
+# across HA restarts).
+DEFAULT_MOMENTARY_SECONDS = 30
 
 
 class ScentDiffuserDevice:
@@ -117,6 +121,11 @@ class ScentDiffuserDevice:
         # State
         self._state = DiffuserState()
         self._state_callbacks: list[callable] = []
+
+        # Momentary diffusion ("Diffuse Now" button): power on, then
+        # auto-off after this many seconds via a background task.
+        self.momentary_seconds: int = DEFAULT_MOMENTARY_SECONDS
+        self._momentary_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -548,6 +557,12 @@ class ScentDiffuserDevice:
         if "oil_remaining" in updates:
             self._state.oil_remaining = updates["oil_remaining"]
             changed = True
+        if "work_remaining" in updates:
+            self._state.work_remaining = updates["work_remaining"]
+            changed = True
+        if "pause_remaining" in updates:
+            self._state.pause_remaining = updates["pause_remaining"]
+            changed = True
         if "light_on" in updates:
             self._state.light_on = updates["light_on"]
             changed = True
@@ -608,6 +623,31 @@ class ScentDiffuserDevice:
             return success
 
         return False
+
+    async def momentary_diffuse(self) -> bool:
+        """Run the diffuser for `momentary_seconds`, then switch it off.
+
+        There is no native one-shot command in the Aroma-Link protocol
+        (verified against the decompiled official app), so this is
+        power-on followed by a delayed power-off task. Pressing again
+        while a run is active restarts the countdown.
+        """
+        if self._momentary_task and not self._momentary_task.done():
+            self._momentary_task.cancel()
+        if not await self.set_power(True):
+            return False
+        self._momentary_task = asyncio.ensure_future(
+            self._momentary_off_later(self.momentary_seconds)
+        )
+        return True
+
+    async def _momentary_off_later(self, delay: int) -> None:
+        await asyncio.sleep(delay)
+        if not await self.set_power(False):
+            _LOGGER.warning(
+                "Momentary diffusion on %s: auto power-off failed — "
+                "the diffuser may still be running", self.name,
+            )
 
     async def set_fan(self, on: bool) -> bool:
         """Turn fan on or off (Aroma-Link + Scent Marketing AK)."""
@@ -854,6 +894,10 @@ class ScentDiffuserDevice:
                     if oil_query is not None:
                         await self._ble_send(oil_query())
                         await asyncio.sleep(0.3)
+                    work_query = getattr(self._protocol, "build_all_work_query", None)
+                    if work_query is not None:
+                        await self._ble_send(work_query())
+                        await asyncio.sleep(0.3)
                 except (BleakError, asyncio.TimeoutError, OSError) as err:
                     _LOGGER.debug("BLE refresh query failed on %s: %s", self._ble_name, err)
                     self._ble_last_failure_ts = asyncio.get_event_loop().time()
@@ -887,6 +931,8 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        if self._momentary_task and not self._momentary_task.done():
+            self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
             self._ble_disconnect_task.cancel()
         if self._ble_client:

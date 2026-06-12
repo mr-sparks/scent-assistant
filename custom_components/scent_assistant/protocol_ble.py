@@ -54,7 +54,7 @@ from .const import (
     AL_HEADER, AL_TRAILER,
     AL_CMD_QUERY, AL_CMD_STATUS, AL_CMD_WRITE,
     AL_SUB_POWER, AL_SUB_FAN, AL_SUB_SCHEDULE, AL_SUB_TIME_SYNC,
-    AL_SUB_QUERY_SCHEDULES, AL_SUB_OIL_LEVEL,
+    AL_SUB_QUERY_SCHEDULES, AL_SUB_OIL_LEVEL, AL_SUB_ALL_WORK_INFO,
     AL_FAN_ON_VALUE, AL_FAN_OFF_VALUE,
     AL_SLOT_ENABLED, AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
@@ -93,6 +93,11 @@ class DiffuserState:
     start_minute: int = 0
     end_hour: int = 23
     end_minute: int = 59
+    # Aroma-Link "all work info" (52 0A) — live countdown of the current
+    # spray / pause phase in seconds. While idle the firmware reports the
+    # configured durations instead of a countdown.
+    work_remaining: int | None = None
+    pause_remaining: int | None = None
     # Scent Marketing GW-only
     lock: bool | None = None           # child-lock state
     oil_remaining: int | None = None   # percent 0-100
@@ -365,6 +370,15 @@ class AromaLinkBleProtocol(BleProtocol):
         """
         return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_OIL_LEVEL]))
 
+    def build_all_work_query(self) -> bytes:
+        """Read the "all work info" register (`52 0A`).
+
+        Port of the app's READ_ALL_WORK_INFO. The response carries the
+        remaining work / pause seconds plus battery and capability
+        flags — see the parser branch below.
+        """
+        return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_ALL_WORK_INFO]))
+
     def build_time_sync(self, now: datetime | None = None) -> bytes:
         if now is None:
             now = datetime.now()
@@ -424,6 +438,34 @@ class AromaLinkBleProtocol(BleProtocol):
 
         cmd = payload[0]
         sub = payload[1]
+
+        # "All work info" (0x0A) — arrives both as a reply to our 52 0A
+        # query and as an unsolicited 53 0A push. Layout per the app's
+        # handlerAllWorkStatus(); payload[2] is the app's offset i+6:
+        #   [2..3] year  [4] month [5] day [6] hh [7] mm [8] ss [9] weekday
+        #   [10] fan/lamp nibbles  [11] on/off  [12] work status
+        #   [13..14] work remaining (s, u16)  [15..16] pause remaining (s)
+        #   [17..18] start HH MM  [19..20] end HH MM  [21] air pump
+        #   [22..27] MAC  [28..29] raw oil weight  [30] battery
+        #   [31] has-battery flag  [32..] more capability flags
+        # We deliberately skip power/fan/lamp here: the official app gets
+        # those from the dedicated 53 08 / 53 03 frames too, and the
+        # nibble encoding at [10] conflicts with the 0x10 fan value seen
+        # on the 53 03 path — not worth the risk without a live device.
+        if sub == AL_SUB_ALL_WORK_INFO and cmd in (AL_CMD_STATUS, AL_CMD_QUERY):
+            if len(payload) >= 17:
+                result["work_remaining"] = (payload[13] << 8) | payload[14]
+                result["pause_remaining"] = (payload[15] << 8) | payload[16]
+            if len(payload) >= 21:
+                result["start_hour"] = payload[17]
+                result["start_minute"] = payload[18]
+                result["end_hour"] = payload[19]
+                result["end_minute"] = payload[20]
+            # Battery is only meaningful when the has-battery capability
+            # flag is set (mains-only devices report 0 there).
+            if len(payload) >= 32 and payload[31] == 1:
+                result["battery"] = max(0, min(100, payload[30]))
+            return result
 
         if cmd == AL_CMD_STATUS:
             if sub == AL_SUB_POWER and len(payload) >= 3:

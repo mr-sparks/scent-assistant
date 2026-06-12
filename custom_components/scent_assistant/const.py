@@ -222,6 +222,13 @@ AL_SUB_QUERY_SCHEDULES = 0x15
 # @ndoty's Aromadd U5 Pro HCI snoop (#18), where the app read 0x1E and got
 # 0x50 while its UI showed 80%.
 AL_SUB_OIL_LEVEL = 0x1E
+# "All work info" register (READ_ALL_WORK_INFO in the decompiled app).
+# The response carries device time, fan/lamp/power, work status, the
+# remaining seconds of the current work and pause phases, the schedule
+# window, MAC, raw oil weight, battery, and capability flags — parsed by
+# the app's handlerAllWorkStatus(). The device may also push it
+# unsolicited as `53 0A` (seen in @ndoty's capture after time sync).
+AL_SUB_ALL_WORK_INFO = 0x0A
 
 AL_FAN_ON_VALUE = 0x10
 AL_FAN_OFF_VALUE = 0x00
