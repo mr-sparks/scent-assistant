@@ -65,6 +65,7 @@ from .const import (
     AROMELY_REG_SESSION, AROMELY_REG_POWER, AROMELY_REG_NAME,
     AROMELY_REG_LABEL, AROMELY_REG_SCHED1,
     BLE_NAME_PATTERNS,
+    AL_NAME_CODES,
     TUYA_HEADER, TUYA_VERSION,
     TUYA_CMD_DP_WRITE, TUYA_CMD_DP_REPORT, TUYA_CMD_QUERY, TUYA_CMD_TIME_SYNC,
     TUYA_DP_TYPE_BOOL, TUYA_DP_TYPE_RAW,
@@ -2472,12 +2473,17 @@ def detect_device_type(
     """Detect device type from advertisement.
 
     Detection priority:
-      1. Manufacturer-specific data for Scent Marketing families (most
+      1. Aroma-Link name code A0..A8 in "<name>.<code>.<suffix>".
+      2. Manufacturer-specific data for Scent Marketing families (most
          reliable — the Android app uses this exclusively).
-      2. Advertised service / manufacturer data for Aromely Aro Max
+      3. Advertised service / manufacturer data for Aromely Aro Max
          (its local name is a per-unit serial).
-      3. BLE local-name prefix patterns for the other families.
+      4. BLE local-name prefix patterns for the other families.
     """
+    parts = ble_name.split(".") if ble_name else []
+    if len(parts) > 1 and parts[1] in AL_NAME_CODES:
+        return DeviceType.AROMA_LINK
+
     sm_type = _detect_scent_marketing(advertisement_data)
     if sm_type is not None:
         return sm_type

@@ -269,6 +269,9 @@ BLE_NAME_PATTERNS = {
     DeviceType.SCENT_TECH: ["Scent-"],
 }
 
+# Aroma-Link name code: the second dot part of "<name>.<code>.<suffix>".
+AL_NAME_CODES = {"A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"}
+
 # Scent Marketing devices are identified primarily by manufacturer-specific
 # data in their advertisement, not by name. These constants are used by the
 # detection logic when an AdvertisementData object is available.

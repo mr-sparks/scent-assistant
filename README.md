@@ -46,6 +46,8 @@
 | AromaPlan Diffusers | AromaPlan | BLE + Cloud | Same as Aroma-Link, different branding |
 | DAP Smart Scent Air Machine (Model 11, A5) | AromaPlan | BLE | Broadcasts as `DAP.A5.Bluetooth`; uses Aroma-Link protocol |
 | Aromadd U5 Pro | Aromadd | BLE | Same as Aroma-Link, different branding; reports oil level |
+| Aromadd U5 | Aromadd | BLE | Same as Aroma-Link, different branding; broadcasts as `<name>.A5.WIFI`, where `<name>` is set in the app; built-in fan, no oil sensor |
+| Aromadd Rad-2 | Aromadd | BLE | Same as Aroma-Link, different branding; broadcasts as `<name>.A5.WIFI`, where `<name>` is set in the app; reports oil level |
 | Crearoma Diffusers | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
 | ShinePick QT-I300 | Aroma Buddy | BLE | Tuya BLE protocol |
 | Scentiment Diffuser Air 2 | Scentiment | BLE | JSON-over-BLE protocol; intensity, RGB LED, battery |
@@ -56,6 +58,8 @@
 ### Likely Compatible
 
 Most waterless cold-air nebulizing scent/aroma diffusers that use the **Aroma-Link** or **Aroma Buddy** apps should work. These are sold under various brand names on Amazon and AliExpress.
+
+Diffusers whose Bluetooth name has the form `<name>.<code>.<suffix>`, with a code from `A0` to `A8` (for example `Kitchen.A5.WIFI`), are discovered automatically when they advertise the Aroma-Link VER data, and are marked ✓ in the Bluetooth scan otherwise.
 
 **New, awaiting confirmation:** diffusers that advertise as `Scent-…` and use the **ScentLab** or **Scent Tech** app (YooAI OEM — e.g. Magnifiscent ZenPlug / Grasse Aroma GAH-04P, `Scent-B501F`, unbranded `Scent-BG101W`). Power, all five schedules and time sync are implemented from protocol work by the community; if you own one, a quick test report helps a lot.
 
