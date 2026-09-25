@@ -73,7 +73,9 @@ class WorkDurationNumber(NumberEntity):
         self.async_write_ha_state()
 
     @property
-    def native_value(self) -> float:
+    def native_value(self) -> float | None:
+        if not self._device.schedule_durations_read:
+            return None
         return self._device.state.work_seconds or 10
 
     @property
@@ -110,7 +112,9 @@ class PauseDurationNumber(NumberEntity):
         self.async_write_ha_state()
 
     @property
-    def native_value(self) -> float:
+    def native_value(self) -> float | None:
+        if not self._device.schedule_durations_read:
+            return None
         return self._device.state.pause_seconds or 120
 
     @property

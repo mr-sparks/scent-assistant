@@ -327,7 +327,7 @@ AL_SUB_SCHEDULE = 0x16
 AL_SUB_TIME_SYNC = 0x17
 AL_SUB_DEVICE_NAME = 0x01
 AL_SUB_DEVICE_INFO = 0x0D
-AL_SUB_QUERY_SCHEDULES = 0x15   # READ_WEEK_WORK_TIME — ~320-byte reply, unused (see build_query)
+AL_SUB_QUERY_SCHEDULES = 0x15   # READ_WEEK_WORK_TIME: 7 days (Mon..Sun) x 5 x 9-byte slots
 AL_SUB_WORK_INFO = 0x09         # READ_WORK_INFO / LISTEN_WORKING_MSG: phase + *remaining* times
 AL_SUB_WORK_FREQUENCY = 0x06    # READ_WORK_FREQUENCY <weekday>: 5 slots × (work u16, pause u16, flags)
 # Reassembly cap for multi-notification frames. The longest reply the app
@@ -351,6 +351,8 @@ AL_FAN_OFF_VALUE = 0x00
 
 AL_SLOT_ENABLED = 0x11
 AL_SLOT_DISABLED = 0x10
+# deviceCode of many-pump units: their slot flag byte is a pump bitmap.
+AL_MANY_PUMP_DEVICE_CODES = (0x2502, 0x2503)
 
 # Status report phases
 AL_PHASE_IDLE = 0x00

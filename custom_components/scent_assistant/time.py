@@ -62,6 +62,8 @@ class DiffuserStartTime(TimeEntity):
 
     @property
     def native_value(self) -> time | None:
+        if not self._device.schedule_window_read:
+            return None
         return time(self._device.state.start_hour, self._device.state.start_minute)
 
     @property
@@ -70,8 +72,12 @@ class DiffuserStartTime(TimeEntity):
 
     async def async_set_value(self, value: time) -> None:
         """Set the start time and write schedule to device."""
-        self._device.state.start_hour = value.hour
-        self._device.state.start_minute = value.minute
+        if not (self._device.schedule_window_read and self._device.schedule_durations_read):
+            _LOGGER.warning(
+                "Schedule write skipped on %s: schedule not read from device yet",
+                self._device.name,
+            )
+            return
         await self._device.set_schedule(
             weekday_mask=0x7F,  # all days
             start_hour=value.hour,
@@ -105,6 +111,8 @@ class DiffuserEndTime(TimeEntity):
 
     @property
     def native_value(self) -> time | None:
+        if not self._device.schedule_window_read:
+            return None
         return time(self._device.state.end_hour, self._device.state.end_minute)
 
     @property
@@ -113,8 +121,12 @@ class DiffuserEndTime(TimeEntity):
 
     async def async_set_value(self, value: time) -> None:
         """Set the end time and write schedule to device."""
-        self._device.state.end_hour = value.hour
-        self._device.state.end_minute = value.minute
+        if not (self._device.schedule_window_read and self._device.schedule_durations_read):
+            _LOGGER.warning(
+                "Schedule write skipped on %s: schedule not read from device yet",
+                self._device.name,
+            )
+            return
         await self._device.set_schedule(
             weekday_mask=0x7F,  # all days
             start_hour=self._device.state.start_hour,

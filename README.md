@@ -193,6 +193,7 @@ Set a complete spray schedule for specific days. Useful for automations.
 ```yaml
 service: scent_assistant.set_schedule
 data:
+  entity_id: switch.scent_diffuser_power
   days:
     - mon
     - wed
@@ -205,12 +206,17 @@ data:
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
+| `entity_id` | No | every diffuser | Any entity of the diffuser to set |
 | `days` | Yes | - | List of days: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun`, or `all` |
-| `start_time` | No | `00:00` | Start time (HH:MM) |
-| `end_time` | No | `23:59` | End time (HH:MM) |
-| `work_seconds` | No | `10` | Spray duration (5-600 seconds) |
-| `pause_seconds` | No | `120` | Pause between sprays (5-3600 seconds) |
-| `enabled` | No | `true` | Enable or disable the schedule slot |
+| `start_time` | No | device value (Aroma-Link), else `00:00` | Start time (HH:MM) |
+| `end_time` | No | device value (Aroma-Link), else `23:59` | End time (HH:MM) |
+| `work_seconds` | No | device value (Aroma-Link), else `10` | Spray duration (5-600 seconds) |
+| `pause_seconds` | No | device value (Aroma-Link), else `120` | Pause between sprays (5-3600 seconds) |
+| `enabled` | No | device value (Aroma-Link), else `true` | Enable or disable the schedule slot |
+
+An Aroma-Link diffuser is skipped when an omitted field has not been read from it yet, or when the start time is after the end time.
+
+Scent Tech / ScentLab and Scentiment diffusers are skipped; Scent Tech uses its Schedule N entities.
 
 ---
 

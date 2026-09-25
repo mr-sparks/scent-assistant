@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 import homeassistant.helpers.config_validation as cv
+import homeassistant.helpers.entity_registry as er
 
 from .const import (
     DOMAIN,
@@ -53,17 +54,28 @@ SET_SCHEDULE_SCHEMA = vol.Schema({
         cv.ensure_list,
         [vol.In(["mon", "tue", "wed", "thu", "fri", "sat", "sun", "all"])],
     ),
-    vol.Optional("start_time", default="00:00"): cv.string,
-    vol.Optional("end_time", default="23:59"): cv.string,
-    vol.Optional("work_seconds", default=10): vol.All(
+    vol.Optional("start_time"): cv.time,
+    vol.Optional("end_time"): cv.time,
+    vol.Optional("work_seconds"): vol.All(
         vol.Coerce(int), vol.Range(min=5, max=600),
     ),
-    vol.Optional("pause_seconds", default=120): vol.All(
+    vol.Optional("pause_seconds"): vol.All(
         vol.Coerce(int), vol.Range(min=5, max=3600),
     ),
-    vol.Optional("enabled", default=True): cv.boolean,
+    vol.Optional("enabled"): cv.boolean,
     vol.Optional("entity_id"): cv.string,
 })
+
+# Omitted set_schedule fields on Tuya, Scent Marketing and Aromely.
+SET_SCHEDULE_DEFAULTS = {
+    "start_time": (0, 0),
+    "end_time": (23, 59),
+    "work_seconds": 10,
+    "pause_seconds": 120,
+    "enabled": True,
+}
+
+SET_SCHEDULE_UNSUPPORTED = {DeviceType.SCENT_TECH, DeviceType.SCENTIMENT}
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -150,12 +162,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def handle_set_schedule(call: ServiceCall) -> None:
             """Handle the set_schedule service call."""
             days_list = call.data["days"]
-            start_time = call.data["start_time"]
-            end_time = call.data["end_time"]
-            work_seconds = call.data["work_seconds"]
-            pause_seconds = call.data["pause_seconds"]
-            enabled = call.data["enabled"]
             entity_id = call.data.get("entity_id")
+            given = dict(call.data)
+            for key in ("start_time", "end_time"):
+                if key in given:
+                    given[key] = (given[key].hour, given[key].minute)
 
             # Build weekday mask
             weekday_mask = 0
@@ -165,31 +176,77 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     break
                 weekday_mask |= DAY_NAME_TO_BIT.get(day, 0)
 
-            # Parse times
-            start_h, start_m = (int(x) for x in start_time.split(":"))
-            end_h, end_m = (int(x) for x in end_time.split(":"))
-
             # Find target device(s)
+            entry_id = entity_id
+            entity = er.async_get(hass).async_get(entity_id) if entity_id else None
+            if entity is not None:
+                entry_id = entity.config_entry_id
             targets = []
             for eid, dev in hass.data[DOMAIN].items():
                 if isinstance(dev, ScentDiffuserDevice):
-                    if entity_id is None or eid == entity_id:
+                    if entity_id is None or eid == entry_id:
                         targets.append(dev)
 
             if not targets:
                 _LOGGER.error("No devices found for set_schedule service")
                 return
+            writable = [
+                dev for dev in targets
+                if dev.device_type not in SET_SCHEDULE_UNSUPPORTED
+            ]
+            if entity_id is None and len(writable) > 1:
+                _LOGGER.warning(
+                    "No entity_id in set_schedule call, writing %d diffusers",
+                    len(writable),
+                )
 
             for dev in targets:
+                if dev.device_type in SET_SCHEDULE_UNSUPPORTED:
+                    _LOGGER.warning(
+                        "Schedule write skipped on %s: set_schedule not supported on this device",
+                        dev.name,
+                    )
+                    continue
+                if dev.device_type != DeviceType.AROMA_LINK:
+                    data = {**SET_SCHEDULE_DEFAULTS, **given}
+                elif (
+                    not dev.schedule_window_read
+                    and not {"start_time", "end_time"} <= given.keys()
+                ) or (
+                    not dev.schedule_durations_read
+                    and not {"work_seconds", "pause_seconds", "enabled"} <= given.keys()
+                ):
+                    _LOGGER.warning(
+                        "Schedule write skipped on %s: schedule not read from device yet",
+                        dev.name,
+                    )
+                    continue
+                else:
+                    s = dev.state
+                    data = {
+                        "start_time": (s.start_hour, s.start_minute),
+                        "end_time": (s.end_hour, s.end_minute),
+                        "work_seconds": s.work_seconds,
+                        "pause_seconds": s.pause_seconds,
+                        # None keeps the unit's own enabled bit.
+                        "enabled": None,
+                        **given,
+                    }
+                    if data["start_time"] > data["end_time"]:
+                        _LOGGER.warning(
+                            "Schedule write skipped on %s: start time is after end time",
+                            dev.name,
+                        )
+                        continue
                 await dev.set_schedule(
                     weekday_mask=weekday_mask,
-                    start_hour=start_h,
-                    start_minute=start_m,
-                    end_hour=end_h,
-                    end_minute=end_m,
-                    work_seconds=work_seconds,
-                    pause_seconds=pause_seconds,
-                    enabled=enabled,
+                    start_hour=data["start_time"][0],
+                    start_minute=data["start_time"][1],
+                    end_hour=data["end_time"][0],
+                    end_minute=data["end_time"][1],
+                    work_seconds=data["work_seconds"],
+                    pause_seconds=data["pause_seconds"],
+                    enabled=data["enabled"],
                 )
 
         hass.services.async_register(

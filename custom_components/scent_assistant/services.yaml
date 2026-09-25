@@ -2,6 +2,14 @@ set_schedule:
   name: Set Schedule
   description: Set the spray schedule for a scent diffuser. Configure which days, time range, and spray/pause durations.
   fields:
+    entity_id:
+      name: Diffuser
+      description: "Any entity of the diffuser to set; omit to set every diffuser"
+      required: false
+      example: "switch.scent_diffuser_power"
+      selector:
+        entity:
+          integration: scent_assistant
     days:
       name: Days
       description: "List of weekdays: mon, tue, wed, thu, fri, sat, sun, or all"
@@ -31,7 +39,6 @@ set_schedule:
       name: Start Time
       description: "Time to start spraying (HH:MM)"
       required: false
-      default: "00:00"
       example: "08:00"
       selector:
         time:
@@ -39,7 +46,6 @@ set_schedule:
       name: End Time
       description: "Time to stop spraying (HH:MM)"
       required: false
-      default: "23:59"
       example: "20:00"
       selector:
         time:
@@ -47,7 +53,6 @@ set_schedule:
       name: Work Duration (seconds)
       description: "How long each spray lasts in seconds"
       required: false
-      default: 10
       example: 15
       selector:
         number:
@@ -58,7 +63,6 @@ set_schedule:
       name: Pause Duration (seconds)
       description: "Pause between sprays in seconds"
       required: false
-      default: 120
       example: 60
       selector:
         number:
@@ -69,6 +73,5 @@ set_schedule:
       name: Enabled
       description: "Enable or disable this schedule slot"
       required: false
-      default: true
       selector:
         boolean:
