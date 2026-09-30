@@ -513,7 +513,14 @@ class ScentDiffuserDevice:
                 self._schedule_disconnect()
                 return True
 
-            except (BleakError, asyncio.TimeoutError, OSError) as err:
+            except (BleakError, asyncio.TimeoutError, OSError, AttributeError) as err:
+                # AttributeError: when the device hasn't been observed by
+                # HA's bluetooth stack, the plain-MAC-string fallback target
+                # makes bleak_retry_connector's get_connected_devices() crash
+                # on BlueZ ("'str' object has no attribute 'details'").
+                # Treat it as an ordinary connect failure so callers get
+                # False (and the failure cooldown) instead of the exception
+                # propagating into the calling automation.
                 _LOGGER.warning("BLE connect failed for %s: %s", self._ble_name, err)
                 await self._teardown_ble_client()
                 self._ble_last_failure_ts = loop.time()
