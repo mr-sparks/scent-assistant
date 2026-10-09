@@ -209,6 +209,16 @@ SM_AK_V3_COMMIT = bytes([0xE0, 0xAA, 0x55])
 SM_AK_V3_FAN_ON = bytes.fromhex("2A01020300")
 SM_AK_V3_FAN_OFF = bytes.fromhex("2A01020100")
 
+# "CY" V3 variant: login reply `8F CY_V3.0 …` instead of `OK_V3.0`. Seen on
+# christiandion's Flair Tower (#8) and the 3-pump A309 (#22). Its app sends
+# no read queries (the device pushes its whole state after the time sync)
+# and no commit frame, writes EE 07/05 instead of 03/01 and sends fan-off
+# as `2A 01 02 02 00`.
+SM_AK_LOGIN_TAG_CY = b"CY_"
+SM_AK_V3_CY_FAN_OFF = bytes.fromhex("2A01020200")
+# Its unasked state push (~25 frames) took 1.5 s in both A309 captures.
+SM_AK_CY_PUSH_SETTLE_SECONDS = 2.0
+
 # V3 schedule layout has only two slots, fixed by purpose in the official
 # app's UI (Weekend / Weekday). The slot index is captured verbatim — we
 # don't know if the device's firmware accepts other indices.

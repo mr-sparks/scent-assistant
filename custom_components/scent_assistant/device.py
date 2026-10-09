@@ -22,6 +22,7 @@ from .const import (
     DeviceType,
     BLE_INITIAL_REFRESH_RETRY_SECONDS,
     BLE_INITIAL_SILENT_READS_MAX,
+    SM_AK_CY_PUSH_SETTLE_SECONDS,
     CLOUD_SCHEDULE_REFRESH_EVERY,
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_WORK_DURATION,
@@ -296,6 +297,14 @@ class ScentDiffuserDevice:
         return False
 
     @property
+    def ak_cy_variant(self) -> bool | None:
+        """True for an AK device that logged in as "CY_V3.0" (diagnostics)."""
+        proto = self._protocol
+        if isinstance(proto, ScentMarketingAkProtocol):
+            return proto.is_cy_variant
+        return None
+
+    @property
     def schedule_window_read(self) -> bool:
         """False while a BLE Aroma-Link unit has not reported its window."""
         if self._ble_address and isinstance(self._protocol, AromaLinkBleProtocol):
@@ -433,6 +442,7 @@ class ScentDiffuserDevice:
                     max_attempts=BLE_CONNECT_MAX_ATTEMPTS,
                 )
                 self._ble_connected = True
+                await self._check_gatt_services()
                 if isinstance(self._protocol, AromaLinkBleProtocol):
                     self._protocol.reset_rx()
 
@@ -496,6 +506,11 @@ class ScentDiffuserDevice:
                             await self._ble_send(ak_time)
                             await asyncio.sleep(0.2)
                             self._ble_has_synced_time = True
+                        # The CY variant answers the time sync with its
+                        # whole state and gets no queries; let that push
+                        # land before the caller's command goes out.
+                        if self._protocol.is_cy_variant:
+                            await asyncio.sleep(SM_AK_CY_PUSH_SETTLE_SECONDS)
                         # State read-back: fire queries; responses are
                         # parsed asynchronously by parse_notification.
                         for frame in self._protocol.build_read_schedule_queries():
@@ -605,6 +620,38 @@ class ScentDiffuserDevice:
                 await self._teardown_ble_client()
                 self._ble_last_failure_ts = loop.time()
                 return False
+
+    async def _check_gatt_services(self) -> None:
+        """Drop a cached GATT table that lacks our characteristics.
+
+        establish_connection reuses the services cached by BlueZ or the
+        ESPHome proxy, and both caches survive an HA restart. A table
+        that came back incomplete once is then served on every connect:
+        ndoty's U5 Pro (#18) reported "fff1/fff2 not found" on every
+        refresh for four hours, then recovered by itself. Clearing the
+        cache makes the next connect discover the services again.
+        """
+        services = self._ble_client.services
+        uuids = {self._protocol.write_char_uuid, self._protocol.notify_char_uuid}
+        missing = [u for u in uuids if services.get_characteristic(u) is None]
+        if not missing:
+            return
+        clear_cache = getattr(self._ble_client, "clear_cache", None)
+        cleared = False
+        if clear_cache is not None:
+            try:
+                cleared = await clear_cache()
+            except Exception as err:
+                _LOGGER.debug("BLE clear_cache on %s failed: %s", self._ble_name, err)
+        msg = "services lack %s (%s)" % (
+            ", ".join(sorted(missing)),
+            "GATT cache cleared" if cleared else "GATT cache could not be cleared",
+        )
+        # Without the write characteristic nothing can work; a missing
+        # notify one is still reported by start_notify and writes go on.
+        if self._protocol.write_char_uuid in missing:
+            raise BleakError(msg)
+        _LOGGER.warning("%s: %s", self._ble_name, msg)
 
     def _ha_ble_device(self):
         """Return HA's connectable BLEDevice for this diffuser, or None."""
@@ -1482,11 +1529,14 @@ class ScentDiffuserDevice:
         return self._silent_state_reads
 
     def claim_initial_refresh_retry(self) -> bool:
-        """Decide whether an advertisement should retry the initial read.
+        """Decide whether an advertisement or the timer should retry the initial read.
 
         Synchronous so the bluetooth callback can call it per
         advertisement without piling up tasks: it stamps the attempt
         before returning True, and refuses while a connection is in use.
+        It also refuses whenever the connect would be skipped anyway
+        (failure cooldown, device not routable), so such a call doesn't
+        use up the retry window (Mins95, #8).
         """
         if (
             not self.needs_initial_refresh
@@ -1495,6 +1545,12 @@ class ScentDiffuserDevice:
         ):
             return False
         now = asyncio.get_event_loop().time()
+        if 0 < now - self._ble_last_failure_ts < BLE_FAILURE_COOLDOWN_SECONDS:
+            return False
+        if self._hass is not None and not bluetooth.async_scanner_devices_by_address(
+            self._hass, self._ble_address, connectable=True
+        ):
+            return False
         if (
             self._initial_retry_ts is not None
             and now - self._initial_retry_ts < BLE_INITIAL_REFRESH_RETRY_SECONDS
@@ -1516,8 +1572,10 @@ class ScentDiffuserDevice:
             if await self._ble_connect():
                 try:
                     clock_before = self._state.device_clock
-                    await self._ble_send(self._protocol.build_query())
-                    await asyncio.sleep(1.0)
+                    query = self._protocol.build_query()
+                    if query:
+                        await self._ble_send(query)
+                        await asyncio.sleep(1.0)
                     # Some protocols expose extra read-registers that the
                     # device only reports on demand (e.g. Aroma-Link's oil
                     # level). Query them too when the protocol offers one.

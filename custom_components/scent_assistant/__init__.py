@@ -25,6 +25,7 @@ from .const import (
     CONF_CONNECTION_MODE,
     CONF_MOMENTARY_SECONDS,
     BLE_REFRESH_INTERVAL_SECONDS,
+    BLE_INITIAL_REFRESH_RETRY_SECONDS,
     CLOUD_POLL_INTERVAL_SECONDS,
     WEEKDAY_MON, WEEKDAY_TUE, WEEKDAY_WED, WEEKDAY_THU,
     WEEKDAY_FRI, WEEKDAY_SAT, WEEKDAY_SUN,
@@ -130,17 +131,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # The setup-time read stays inline (platforms decide e.g. the fan
     # switch from it, #34), but a device HA couldn't reach then would
     # otherwise show "unknown" until the first command. Retry the read
-    # once its advertisements arrive, and stop listening after it lands.
+    # when its advertisements arrive, and stop listening after it lands.
+    # HA only calls back on *changed* advertisement data, so a device
+    # whose advertisement never changes gets one replayed callback at
+    # registration; the timer keeps retrying after that one (Mins95, #8).
     if device.needs_initial_refresh:
-        unsub_adv = None
+        unsubs = []
 
         @callback
-        def _on_advertisement(service_info, change) -> None:
-            nonlocal unsub_adv
+        def _stop_retry() -> None:
+            while unsubs:
+                unsubs.pop()()
+
+        @callback
+        def _try_initial_refresh(*_args) -> None:
             if not device.needs_initial_refresh:
-                if unsub_adv is not None:
-                    unsub_adv()
-                    unsub_adv = None
+                _stop_retry()
                 return
             if device.claim_initial_refresh_retry():
                 entry.async_create_background_task(
@@ -149,19 +155,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     f"{DOMAIN} initial state {ble_address}",
                 )
 
-        unsub_adv = bluetooth.async_register_callback(
+        unsubs.append(async_track_time_interval(
             hass,
-            _on_advertisement,
+            _try_initial_refresh,
+            timedelta(seconds=BLE_INITIAL_REFRESH_RETRY_SECONDS),
+        ))
+        unsubs.append(bluetooth.async_register_callback(
+            hass,
+            _try_initial_refresh,
             {"address": ble_address, "connectable": True},
             bluetooth.BluetoothScanningMode.PASSIVE,
-        )
-
-        @callback
-        def _stop_adv_listener() -> None:
-            if unsub_adv is not None:
-                unsub_adv()
-
-        entry.async_on_unload(_stop_adv_listener)
+        ))
+        entry.async_on_unload(_stop_retry)
 
     # Cloud-mode devices have no push channel for autonomous state changes
     # (BLE devices push notifications when connected). Poll the cloud

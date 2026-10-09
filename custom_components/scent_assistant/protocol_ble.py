@@ -30,7 +30,7 @@ from .const import (
     SM_AK_CTRL_BIT_RESERVED, SM_AK_CTRL_BIT_LAMP, SM_AK_CTRL_BIT_LOCK,
     SM_AK_LOGIN_PRIMARY, SM_AK_LOGIN_SECONDARY_V3,
     SM_AK_OPCODE_LOGIN_RESPONSE, SM_AK_V3_COMMIT,
-    SM_AK_V3_FAN_ON, SM_AK_V3_FAN_OFF,
+    SM_AK_V3_FAN_ON, SM_AK_V3_FAN_OFF, SM_AK_V3_CY_FAN_OFF, SM_AK_LOGIN_TAG_CY,
     SM_AK_V3_SLOT_WEEKEND, SM_AK_V3_SLOT_WEEKDAY,
     SM_AK_DAY_MASK_WEEKDAYS, SM_AK_DAY_MASK_WEEKEND, SM_AK_DAY_MASK_DAILY,
     SM_GW_SERVICE_UUID, SM_GW_NOTIFY_UUID, SM_GW_WRITE_UUID,
@@ -1065,6 +1065,9 @@ class ScentMarketingAkProtocol(BleProtocol):
         # login frame. None = login not yet completed; True/False selects the
         # V3 vs V2 command set (different fan & schedule encodings).
         self._v3_mode: bool | None = None
+        # Set from the login reply's "CY_" tag (see SM_AK_LOGIN_TAG_CY).
+        # Kept across connects: it describes the firmware, not a session.
+        self._cy_variant = False
 
     # ------------------------------------------------------------------
     # Login handshake (must complete before any other write)
@@ -1074,6 +1077,11 @@ class ScentMarketingAkProtocol(BleProtocol):
     def is_v3(self) -> bool:
         """True once the device has identified itself as a V3 model."""
         return self._v3_mode is True
+
+    @property
+    def is_cy_variant(self) -> bool:
+        """True for the "CY_V3.0" firmware that pushes its state unasked."""
+        return self._cy_variant
 
     @property
     def login_completed(self) -> bool:
@@ -1117,6 +1125,10 @@ class ScentMarketingAkProtocol(BleProtocol):
         for bit in (SM_AK_CTRL_BIT_ONOFF, SM_AK_CTRL_BIT_FAN,
                     SM_AK_CTRL_BIT_DEMO, SM_AK_CTRL_BIT_LAMP,
                     SM_AK_CTRL_BIT_LOCK):
+            # The CY app sends `2D 09` while the fan runs: its fan lives
+            # only in the 2A frame (A309 capture, #22).
+            if bit == SM_AK_CTRL_BIT_FAN and self._cy_variant:
+                continue
             if self._ctrl_bits.get(bit):
                 mask |= 1 << bit
         return bytes([SM_AK_CMD_CONTROL_STATE, mask & 0xFF])
@@ -1140,7 +1152,9 @@ class ScentMarketingAkProtocol(BleProtocol):
             # carries the correct fan byte at offset 3 instead of
             # defaulting back to 0x01 and switching the fan off.
             self._ctrl_bits[SM_AK_CTRL_BIT_FAN] = on
-            return SM_AK_V3_FAN_ON if on else SM_AK_V3_FAN_OFF
+            if on:
+                return SM_AK_V3_FAN_ON
+            return SM_AK_V3_CY_FAN_OFF if self._cy_variant else SM_AK_V3_FAN_OFF
         return self._build_control(SM_AK_CTRL_BIT_FAN, on)
 
     def supports_fan(self) -> bool:
@@ -1154,6 +1168,9 @@ class ScentMarketingAkProtocol(BleProtocol):
     # ------------------------------------------------------------------
 
     def build_query(self) -> bytes:
+        # Empty for the CY variant: a query only makes it beep.
+        if self._cy_variant:
+            return b""
         return bytes([SM_AK_CMD_QUERY_INFO])
 
     def build_heartbeat(self) -> bytes:
@@ -1166,8 +1183,11 @@ class ScentMarketingAkProtocol(BleProtocol):
         the decompiled Android app. @Mins95 confirmed this works on V2
         devices.
 
-        V3: `0x21 0x03 + YY MM DD HH MM SS` — decoded from @Mins95's
-        salon_v3 capture (`21031A05140F351C` → 2026-05-20 15:53:28).
+        V3: `0x21 WD + YY MM DD HH MM SS`, WD 0=Sun .. 6=Sat like V2.
+        Mins95's salon_v3 capture sent `21 03` on a Wednesday
+        (`21031A05140F351C` → 2026-05-20 15:53:28), the A309 app capture
+        in #22 `21 00` on a Sunday (2026-07-05 11:53:59); a fixed 03
+        told every V3 device it was Wednesday.
         Empirically required *before* the V3 read opcodes (C5/C6/C7/...)
         produce responses, otherwise the device silently ignores them.
         """
@@ -1175,7 +1195,7 @@ class ScentMarketingAkProtocol(BleProtocol):
             now = datetime.now()
         if self.is_v3:
             return bytes([
-                0x21, 0x03,
+                0x21, now.isoweekday() % 7,
                 now.year % 100, now.month, now.day,
                 now.hour, now.minute, now.second,
             ])
@@ -1222,6 +1242,7 @@ class ScentMarketingAkProtocol(BleProtocol):
                 slot, weekday_mask, intensity,
                 fan=self._ctrl_bits.get(SM_AK_CTRL_BIT_FAN, False),
                 custom_mode=custom_mode,
+                cy_variant=self._cy_variant,
             )
         return self._build_schedule_v2(slot, weekday_mask, index, intensity)
 
@@ -1260,6 +1281,7 @@ class ScentMarketingAkProtocol(BleProtocol):
         intensity: int,
         fan: bool = False,
         custom_mode: bool = True,
+        cy_variant: bool = False,
     ) -> bytes:
         """V3 schedule frame (18 bytes), matching @Mins95's captures:
 
@@ -1295,7 +1317,13 @@ class ScentMarketingAkProtocol(BleProtocol):
             slot_id = SM_AK_V3_SLOT_WEEKDAY
         else:
             slot_id = SM_AK_V3_SLOT_WEEKEND
-        state = 0x03 if slot.enabled else 0x01
+        # The CY variant's app writes EE 07/05 (#8, #22). Its fan-off is
+        # 02 only in the short fan frame; christiandion's schedule writes
+        # carry 01 there like everyone else's.
+        if cy_variant:
+            state = 0x07 if slot.enabled else 0x05
+        else:
+            state = 0x03 if slot.enabled else 0x01
         fan_byte = 0x03 if fan else 0x01
         # Offset 12 is the Custom/Level mode selector: 0x01 = Custom
         # (device honours the work/pause trailer), 0x00 = Level (device
@@ -1346,7 +1374,11 @@ class ScentMarketingAkProtocol(BleProtocol):
 
         V2: poll slots 1..5 individually with `83 SS`. V3: a single `C5`
         triggers the device to push one `4A...` per slot asynchronously.
+        None for the CY variant, which pushes its state unasked and beeps
+        at every query (christiandion, #8; its app sends none, #22).
         """
+        if self._cy_variant:
+            return []
         if self.is_v3:
             return [bytes([SM_AK_CMD_V3_READ_SCHEDULES])]
         return [bytes([SM_AK_CMD_READ_SCHEDULE_V2, i]) for i in range(1, 6)]
@@ -1358,8 +1390,11 @@ class ScentMarketingAkProtocol(BleProtocol):
         These are useful but non-essential — schedule state is the
         priority for state restoration on restart. The returned frames
         can be fired without blocking; responses are parsed
-        asynchronously by `parse_notification`.
+        asynchronously by `parse_notification`. None for the CY variant
+        (see `build_read_schedule_queries`).
         """
+        if self._cy_variant:
+            return []
         if self.is_v3:
             return [
                 bytes([SM_AK_CMD_V3_READ_NAME]),
@@ -1389,9 +1424,10 @@ class ScentMarketingAkProtocol(BleProtocol):
         with C3 at the tail of the state queries (after the oil reads) his
         A305M sent C3 but never returned the 47 table; sent right after the
         schedule read (once the 4A/43 push has drained) it comes back and
-        parses. Empty for V2 / pre-login (no grade table there).
+        parses. Empty for V2 / pre-login (no grade table there) and for the
+        CY variant, which pushes its 47 table unasked.
         """
-        if self.is_v3:
+        if self.is_v3 and not self._cy_variant:
             return bytes([SM_AK_CMD_V3_READ_GRADE_TABLE])
         return b""
 
@@ -1408,7 +1444,8 @@ class ScentMarketingAkProtocol(BleProtocol):
         captures from @Mins95 the commit is sent after power-on, fan, and
         schedule writes — but not after power-off.
         """
-        if not frame or not self.is_v3:
+        if not frame or not self.is_v3 or self._cy_variant:
+            # The CY app never sends the commit frame (#8, #22).
             return [frame]
 
         op = frame[0] & 0xFF
@@ -1444,6 +1481,7 @@ class ScentMarketingAkProtocol(BleProtocol):
             # Reply format: 0x8F + "OK_VX.0" where X is 2 or 3. Pin the
             # device's command-set version for subsequent build_* calls.
             payload = bytes(data[1:])
+            self._cy_variant = payload.startswith(SM_AK_LOGIN_TAG_CY)
             if b"V3" in payload:
                 self._v3_mode = True
             elif b"V2" in payload:
@@ -1466,8 +1504,10 @@ class ScentMarketingAkProtocol(BleProtocol):
             result["power"] = self._ctrl_bits[SM_AK_CTRL_BIT_ONOFF]
             result["phase"] = "idle" if result["power"] else "off"
             result["lock"] = self._ctrl_bits[SM_AK_CTRL_BIT_LOCK]
-            if not is_v3_frame:
-                # Legacy V2 path — bitmask is the source of truth.
+            if not is_v3_frame and not self.is_v3:
+                # Legacy V2 path — bitmask is the source of truth. The CY
+                # V3 variant also pushes 2 bytes (`4D 08`), but its fan
+                # bit stays 0 with the fan running (A309, #22).
                 self._ctrl_bits[SM_AK_CTRL_BIT_FAN] = bool(mask & (1 << SM_AK_CTRL_BIT_FAN))
                 self._ctrl_bits[SM_AK_CTRL_BIT_DEMO] = bool(mask & (1 << SM_AK_CTRL_BIT_DEMO))
                 self._ctrl_bits[SM_AK_CTRL_BIT_LAMP] = bool(mask & (1 << SM_AK_CTRL_BIT_LAMP))
@@ -1611,7 +1651,7 @@ class ScentMarketingAkProtocol(BleProtocol):
             if not slot_empty:
                 # V3 fan state is authoritative on read-back; it overrides
                 # the 4D bitmask (V3's 4D 01 FF reports all bits set).
-                if data[3] in (0x01, 0x03):
+                if data[3] in (0x01, 0x02, 0x03):  # 02 = CY fan off
                     fan_now = data[3] == 0x03
                     result["fan"] = fan_now
                     self._ctrl_bits[SM_AK_CTRL_BIT_FAN] = fan_now
