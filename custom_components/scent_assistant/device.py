@@ -64,6 +64,8 @@ SCENT_TECH_REPLY_TIMEOUT = 4.0
 
 # Disconnect BLE after this many seconds of inactivity
 BLE_IDLE_DISCONNECT_SECONDS = 10
+# Stay connected: seconds between 52 0A reads over the held link.
+BLE_STATUS_READ_SECONDS = 1
 # Cooldown after a failed connect / write before we try again, so a
 # stuck device gets a chance to recover instead of being hammered.
 BLE_FAILURE_COOLDOWN_SECONDS = 3.0
@@ -209,6 +211,9 @@ class ScentDiffuserDevice:
         self._ble_full_refresh_ts: float | None = None
         # The last full read ended with no state read since setup.
         self._ble_full_refresh_unanswered = False
+        # Stay connected: no idle disconnect, status reads in _status_task.
+        self._stay_connected = False
+        self._status_task: asyncio.Task | None = None
 
         # Scent Tech timer writes are read-modify-write on one record, so
         # they must not interleave; the events let a write wait for the
@@ -515,7 +520,10 @@ class ScentDiffuserDevice:
     # ------------------------------------------------------------------
 
     async def _ble_connect(self) -> bool:
-        """Connect to BLE if not already connected. Auto-disconnects after idle."""
+        """Connect to BLE if not already connected.
+
+        The link idles out unless Stay connected holds it.
+        """
         if not self._ble_address:
             return False
 
@@ -882,9 +890,12 @@ class ScentDiffuserDevice:
         return f" (last advertisement {age:.0f} s ago via {info.source}, RSSI {info.rssi} dBm)"
 
     def _schedule_disconnect(self) -> None:
-        """Schedule BLE disconnect after idle period."""
+        """Schedule the idle disconnect; Stay connected keeps the link."""
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
             self._ble_disconnect_task.cancel()
+        # A link without notifications never reports state, so it idles out.
+        if self._stay_connected and self._ble_notify_subscribed:
+            return
         self._ble_disconnect_task = asyncio.ensure_future(self._delayed_disconnect())
 
     async def _delayed_disconnect(self) -> None:
@@ -2005,6 +2016,41 @@ class ScentDiffuserDevice:
             if self._periodic_refresh_ts == started:
                 self._periodic_refresh_ts = None
 
+    def set_stay_connected(self, on: bool) -> None:
+        """Hold the BLE link open with status reads, or drop it when idle."""
+        if on == self._stay_connected:
+            return
+        self._stay_connected = on
+        if self._status_task and not self._status_task.done():
+            self._status_task.cancel()
+        self._status_task = asyncio.ensure_future(self._status_reads()) if on else None
+        # A connect in progress applies this when it ends; a teardown in
+        # progress must not be cancelled.
+        if self._ble_lock.locked():
+            return
+        if self._ble_connected and self._ble_client and self._ble_client.is_connected:
+            self._schedule_disconnect()
+
+    async def _status_reads(self) -> None:
+        """Send 52 0A over the held link; never connect."""
+        while True:
+            await asyncio.sleep(BLE_STATUS_READ_SECONDS)
+            client = self._ble_client
+            if (
+                self._periodic_refresh_ts is not None
+                or self._ble_lock.locked()
+                or not self._ble_notify_subscribed
+                or not (self._ble_connected and client and client.is_connected)
+            ):
+                continue
+            try:
+                await self._ble_send(self._protocol.build_query())
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.debug("BLE status read failed on %s: %s", self._ble_name, err)
+                self._ble_last_failure_ts = asyncio.get_event_loop().time()
+                async with self._ble_lock:
+                    await self._teardown_ble_client(reason="status-failure")
+
     @property
     def needs_initial_refresh(self) -> bool:
         """True for a BLE device whose state hasn't been read since setup."""
@@ -2299,6 +2345,10 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        # A connect still running after unload must not hold the link.
+        self._stay_connected = False
+        if self._status_task and not self._status_task.done():
+            self._status_task.cancel()
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
