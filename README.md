@@ -119,6 +119,15 @@ Control your diffuser via the Aroma-Link cloud service. No Bluetooth required.
 
 > **Note:** Requires an Aroma-Link account and internet connection. Fan control is only available via Bluetooth.
 
+### Refresh interval (Aroma-Link, Bluetooth)
+
+Home Assistant reads an Aroma-Link diffuser added over Bluetooth every 300 seconds. To change this, select **Configure** on its entry under **Settings > Devices & Services > Scent Assistant** and set **Refresh interval** (60-3600 seconds).
+
+- Each read is one Bluetooth connect, held for about 10 seconds. During that time the phone app cannot connect and the Bluetooth adapter or ESPHome proxy has one of its connection slots (3 by default on a proxy) in use. Reads below 300 seconds connect the same way.
+- Below 300 seconds, reads pause for 60 seconds after a Bluetooth connect or write fails.
+- Each read can add recorder rows for the remaining-time sensors and, on units that report it, Oil remaining, so short intervals add more rows.
+- Cloud entries are polled every 60 seconds and have no option.
+
 ---
 
 ## &#x1F3AE; Entities

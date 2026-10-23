@@ -31,6 +31,7 @@ from .const import (
     BLE_INITIAL_SILENT_READS_MAX,
     SM_AK_CY_PUSH_SETTLE_SECONDS,
     CLOUD_SCHEDULE_REFRESH_EVERY,
+    BLE_REFRESH_INTERVAL_SECONDS,
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_WORK_DURATION,
     DEFAULT_PAUSE_DURATION,
@@ -67,6 +68,8 @@ BLE_IDLE_DISCONNECT_SECONDS = 10
 BLE_FAILURE_COOLDOWN_SECONDS = 3.0
 # A timed refresh running longer than this stops holding off the next tick.
 BLE_REFRESH_BUSY_MAX_SECONDS = 120
+# Below the default interval, timed refreshes wait this long after a failure.
+BLE_REFRESH_FAILURE_BACKOFF_SECONDS = 60
 # Aroma-Link 0A clock drift from local time that triggers a 57 17 on refresh.
 AL_CLOCK_DRIFT_SECONDS = 120
 # Refreshes that send the 52 15 week read before a unit that never
@@ -200,6 +203,7 @@ class ScentDiffuserDevice:
 
         # Loop time the timed refresh in flight started, or None.
         self._periodic_refresh_ts: float | None = None
+        self.refresh_interval: int = BLE_REFRESH_INTERVAL_SECONDS
 
         # Scent Tech timer writes are read-modify-write on one record, so
         # they must not interleave; the events let a write wait for the
@@ -1794,6 +1798,10 @@ class ScentDiffuserDevice:
         started = asyncio.get_event_loop().time()
         busy_since = self._periodic_refresh_ts
         if busy_since is not None and started - busy_since < BLE_REFRESH_BUSY_MAX_SECONDS:
+            return
+        short_interval = self.refresh_interval < BLE_REFRESH_INTERVAL_SECONDS
+        since_failure = started - self._ble_last_failure_ts
+        if short_interval and since_failure < BLE_REFRESH_FAILURE_BACKOFF_SECONDS:
             return
         self._periodic_refresh_ts = started
         try:
