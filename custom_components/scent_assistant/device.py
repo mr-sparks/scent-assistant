@@ -204,6 +204,10 @@ class ScentDiffuserDevice:
         # Loop time the timed refresh in flight started, or None.
         self._periodic_refresh_ts: float | None = None
         self.refresh_interval: int = BLE_REFRESH_INTERVAL_SECONDS
+        # Loop time the last full read started, or None.
+        self._ble_full_refresh_ts: float | None = None
+        # The last full read ended with no state read since setup.
+        self._ble_full_refresh_unanswered = False
 
         # Scent Tech timer writes are read-modify-write on one record, so
         # they must not interleave; the events let a write wait for the
@@ -1805,7 +1809,7 @@ class ScentDiffuserDevice:
             return
         self._periodic_refresh_ts = started
         try:
-            await self.refresh_state()
+            await self.refresh_state(timed=True)
         except Exception as err:
             _LOGGER.debug("Periodic BLE refresh failed on %s: %s", self._ble_name, err)
         finally:
@@ -1861,16 +1865,33 @@ class ScentDiffuserDevice:
         except Exception as err:
             _LOGGER.debug("Initial BLE state retry failed on %s: %s", self._ble_name, err)
 
-    async def refresh_state(self) -> None:
+    async def refresh_state(self, *, timed: bool = False) -> None:
         """Refresh device state."""
         if self._ble_address:
+            started = asyncio.get_event_loop().time()
+            last_full = self._ble_full_refresh_ts
+            # Below the default interval, timed refreshes send only 52 0A
+            # between full reads, which run no less often than at the default.
+            full = (
+                not timed
+                or self.refresh_interval >= BLE_REFRESH_INTERVAL_SECONDS
+                or last_full is None
+                or self._ble_last_failure_ts > last_full
+                or started - last_full > BLE_REFRESH_INTERVAL_SECONDS - self.refresh_interval
+                or (self._ble_full_refresh_unanswered and self._ble_state_read)
+            )
             if await self._ble_connect():
                 try:
                     clock_before = self._state.device_clock
                     query = self._protocol.build_query()
                     if query:
                         await self._ble_send(query)
+                        if not full:
+                            return
                         await asyncio.sleep(1.0)
+                    # Replies on a link without notifications are lost.
+                    if self._ble_notify_subscribed:
+                        self._ble_full_refresh_ts = started
                     info_query = getattr(self._protocol, "build_device_info_query", None)
                     if (
                         info_query is not None
@@ -1947,6 +1968,7 @@ class ScentDiffuserDevice:
                         await self._ble_send(self._protocol.build_time_sync())
                     if not self._ble_state_read:
                         self._silent_state_reads += 1
+                    self._ble_full_refresh_unanswered = not self._ble_state_read
                 except (BleakError, asyncio.TimeoutError, OSError) as err:
                     _LOGGER.debug("BLE refresh query failed on %s: %s", self._ble_name, err)
                     self._ble_last_failure_ts = asyncio.get_event_loop().time()

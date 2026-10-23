@@ -61,7 +61,7 @@
     "step": {
       "init": {
         "title": "Bluetooth refresh",
-        "description": "Seconds between Bluetooth reads of this diffuser (60-3600, default 300). Each read connects once and holds the connection for about 10 seconds, during which the phone app cannot connect and one connection slot on the Bluetooth adapter or proxy is in use. Reads below 300 seconds connect the same way.",
+        "description": "Seconds between Bluetooth reads of this diffuser (60-3600, default 300). Each read connects once and holds the connection for about 10 seconds, during which the phone app cannot connect and one connection slot on the Bluetooth adapter or proxy is in use. Reads below 300 seconds connect the same way and may skip Oil remaining, Work Duration and Pause Duration, which are still read at least every 300 seconds.",
         "data": {
           "refresh_interval": "Refresh interval (seconds)"
         }

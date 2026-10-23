@@ -523,7 +523,8 @@ class AromaLinkBleProtocol(BleProtocol):
         """Read the liquid/oil level register (`52 1E`).
 
         The device only reports the level on demand, so this is sent
-        alongside the status query when the 0A flags allow it. The reply is
+        alongside the status query on each full read when the 0A flags
+        allow it. The reply is
         parsed below into `oil_remaining`.
         """
         return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_OIL_LEVEL]))
