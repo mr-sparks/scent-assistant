@@ -65,6 +65,8 @@ BLE_IDLE_DISCONNECT_SECONDS = 10
 # Cooldown after a failed connect / write before we try again, so a
 # stuck device gets a chance to recover instead of being hammered.
 BLE_FAILURE_COOLDOWN_SECONDS = 3.0
+# A timed refresh running longer than this stops holding off the next tick.
+BLE_REFRESH_BUSY_MAX_SECONDS = 120
 # Aroma-Link 0A clock drift from local time that triggers a 57 17 on refresh.
 AL_CLOCK_DRIFT_SECONDS = 120
 # Refreshes that send the 52 15 week read before a unit that never
@@ -195,6 +197,9 @@ class ScentDiffuserDevice:
         # auto-off after this many seconds via a background task.
         self.momentary_seconds: int = DEFAULT_MOMENTARY_SECONDS
         self._momentary_task: asyncio.Task | None = None
+
+        # Loop time the timed refresh in flight started, or None.
+        self._periodic_refresh_ts: float | None = None
 
         # Scent Tech timer writes are read-modify-write on one record, so
         # they must not interleave; the events let a write wait for the
@@ -1785,10 +1790,20 @@ class ScentDiffuserDevice:
         if self._hass is not None and not link_open and self._ha_ble_device() is None:
             _LOGGER.debug("Periodic BLE refresh skipped, %s not in range", self._ble_name)
             return
+        # Waiting ticks would all send at once when a slow connect ends.
+        started = asyncio.get_event_loop().time()
+        busy_since = self._periodic_refresh_ts
+        if busy_since is not None and started - busy_since < BLE_REFRESH_BUSY_MAX_SECONDS:
+            return
+        self._periodic_refresh_ts = started
         try:
             await self.refresh_state()
         except Exception as err:
             _LOGGER.debug("Periodic BLE refresh failed on %s: %s", self._ble_name, err)
+        finally:
+            # Keep a newer refresh's start time if this one went stale.
+            if self._periodic_refresh_ts == started:
+                self._periodic_refresh_ts = None
 
     @property
     def needs_initial_refresh(self) -> bool:
