@@ -56,5 +56,17 @@
       "not_supported": "This Bluetooth device is not a supported diffuser",
       "unsupported_gatt": "{name} does not match any diffuser family this integration supports. If it is a diffuser, please open an issue at {issues_url} with the manufacturer, the app it uses, and this Bluetooth layout:\n\n```\n{gatt}\n```"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Bluetooth refresh",
+        "description": "Seconds between Bluetooth reads of this diffuser (60-3600, default 300). Without Stay connected, each read connects once and holds the connection for about 10 seconds, during which the phone app cannot connect and one connection slot on the Bluetooth adapter or proxy is in use. Reads below 300 seconds connect the same way and may skip Oil remaining, Work Duration and Pause Duration, which are still read at least every 300 seconds. Stay connected holds one Bluetooth connection open and reads the status every second: the phone app cannot connect and one adapter or proxy connection slot stays in use. The connection opens with the next read at the refresh interval or the next command, and reopens the same way after a drop.",
+        "data": {
+          "refresh_interval": "Refresh interval (seconds)",
+          "stay_connected": "Stay connected"
+        }
+      }
+    }
   }
 }

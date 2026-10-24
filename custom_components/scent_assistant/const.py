@@ -522,6 +522,8 @@ CLOUD_POLL_INTERVAL_SECONDS = 60
 # interval. Five minutes keeps the device's single BLE slot free for the
 # official app ~97% of the time while still tracking oil consumption.
 BLE_REFRESH_INTERVAL_SECONDS = 300
+# Lowest refresh interval accepted; a lower stored value reads as this.
+BLE_REFRESH_INTERVAL_MIN_SECONDS = 60
 # bleak_retry_connector max-attempts (device connects and the config
 # flow's GATT probe). HA's bluetooth stack already layers its own
 # retries on top of ours, so keeping this low avoids 6-8 rapid connect
@@ -566,6 +568,8 @@ CONF_CLOUD_DEVICE_ID = "cloud_device_id"
 CONF_CLOUD_USER_ID = "cloud_user_id"
 CONF_CONNECTION_MODE = "connection_mode"
 CONF_MOMENTARY_SECONDS = "momentary_seconds"
+CONF_REFRESH_INTERVAL = "refresh_interval"
+CONF_STAY_CONNECTED = "stay_connected"
 # Optional 4-char ASCII password for Scent Marketing GW devices (the
 # firmware sometimes ships locked; setting this lets the device accept
 # our control commands).

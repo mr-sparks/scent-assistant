@@ -25,6 +25,7 @@ from .const import (
     BLE_INITIAL_SILENT_READS_MAX,
     SM_AK_CY_PUSH_SETTLE_SECONDS,
     CLOUD_SCHEDULE_REFRESH_EVERY,
+    BLE_REFRESH_INTERVAL_SECONDS,
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_WORK_DURATION,
     DEFAULT_PAUSE_DURATION,
@@ -56,9 +57,15 @@ SCENT_TECH_REPLY_TIMEOUT = 4.0
 
 # Disconnect BLE after this many seconds of inactivity
 BLE_IDLE_DISCONNECT_SECONDS = 10
+# Stay connected: seconds between 52 0A reads over the held link.
+BLE_STATUS_READ_SECONDS = 1
 # Cooldown after a failed connect / write before we try again, so a
 # stuck device gets a chance to recover instead of being hammered.
 BLE_FAILURE_COOLDOWN_SECONDS = 3.0
+# A timed refresh running longer than this stops holding off the next tick.
+BLE_REFRESH_BUSY_MAX_SECONDS = 120
+# Below the default interval, timed refreshes wait this long after a failure.
+BLE_REFRESH_FAILURE_BACKOFF_SECONDS = 60
 # Aroma-Link 0A clock drift from local time that triggers a 57 17 on refresh.
 AL_CLOCK_DRIFT_SECONDS = 120
 # Refreshes that send the 52 15 week read before a unit that never
@@ -174,6 +181,17 @@ class ScentDiffuserDevice:
         # auto-off after this many seconds via a background task.
         self.momentary_seconds: int = DEFAULT_MOMENTARY_SECONDS
         self._momentary_task: asyncio.Task | None = None
+
+        # Loop time the timed refresh in flight started, or None.
+        self._periodic_refresh_ts: float | None = None
+        self.refresh_interval: int = BLE_REFRESH_INTERVAL_SECONDS
+        # Loop time the last full read started, or None.
+        self._ble_full_refresh_ts: float | None = None
+        # The last full read ended with no state read since setup.
+        self._ble_full_refresh_unanswered = False
+        # Stay connected: no idle disconnect, status reads in _status_task.
+        self._stay_connected = False
+        self._status_task: asyncio.Task | None = None
 
         # Scent Tech timer writes are read-modify-write on one record, so
         # they must not interleave; the events let a write wait for the
@@ -368,7 +386,10 @@ class ScentDiffuserDevice:
     # ------------------------------------------------------------------
 
     async def _ble_connect(self) -> bool:
-        """Connect to BLE if not already connected. Auto-disconnects after idle."""
+        """Connect to BLE if not already connected.
+
+        The link idles out unless Stay connected holds it.
+        """
         if not self._ble_address:
             return False
 
@@ -681,9 +702,12 @@ class ScentDiffuserDevice:
         return f" (last advertisement {age:.0f} s ago via {info.source}, RSSI {info.rssi} dBm)"
 
     def _schedule_disconnect(self) -> None:
-        """Schedule BLE disconnect after idle period."""
+        """Schedule the idle disconnect; Stay connected keeps the link."""
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
             self._ble_disconnect_task.cancel()
+        # A link without notifications never reports state, so it idles out.
+        if self._stay_connected and self._ble_notify_subscribed:
+            return
         self._ble_disconnect_task = asyncio.ensure_future(self._delayed_disconnect())
 
     async def _delayed_disconnect(self) -> None:
@@ -1544,10 +1568,59 @@ class ScentDiffuserDevice:
         if self._hass is not None and not link_open and self._ha_ble_device() is None:
             _LOGGER.debug("Periodic BLE refresh skipped, %s not in range", self._ble_name)
             return
+        # Waiting ticks would all send at once when a slow connect ends.
+        started = asyncio.get_event_loop().time()
+        busy_since = self._periodic_refresh_ts
+        if busy_since is not None and started - busy_since < BLE_REFRESH_BUSY_MAX_SECONDS:
+            return
+        short_interval = self.refresh_interval < BLE_REFRESH_INTERVAL_SECONDS
+        since_failure = started - self._ble_last_failure_ts
+        if short_interval and since_failure < BLE_REFRESH_FAILURE_BACKOFF_SECONDS:
+            return
+        self._periodic_refresh_ts = started
         try:
-            await self.refresh_state()
+            await self.refresh_state(timed=True)
         except Exception as err:
             _LOGGER.debug("Periodic BLE refresh failed on %s: %s", self._ble_name, err)
+        finally:
+            # Keep a newer refresh's start time if this one went stale.
+            if self._periodic_refresh_ts == started:
+                self._periodic_refresh_ts = None
+
+    def set_stay_connected(self, on: bool) -> None:
+        """Hold the BLE link open with status reads, or drop it when idle."""
+        if on == self._stay_connected:
+            return
+        self._stay_connected = on
+        if self._status_task and not self._status_task.done():
+            self._status_task.cancel()
+        self._status_task = asyncio.ensure_future(self._status_reads()) if on else None
+        # A connect in progress applies this when it ends; a teardown in
+        # progress must not be cancelled.
+        if self._ble_lock.locked():
+            return
+        if self._ble_connected and self._ble_client and self._ble_client.is_connected:
+            self._schedule_disconnect()
+
+    async def _status_reads(self) -> None:
+        """Send 52 0A over the held link; never connect."""
+        while True:
+            await asyncio.sleep(BLE_STATUS_READ_SECONDS)
+            client = self._ble_client
+            if (
+                self._periodic_refresh_ts is not None
+                or self._ble_lock.locked()
+                or not self._ble_notify_subscribed
+                or not (self._ble_connected and client and client.is_connected)
+            ):
+                continue
+            try:
+                await self._ble_send(self._protocol.build_query())
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.debug("BLE status read failed on %s: %s", self._ble_name, err)
+                self._ble_last_failure_ts = asyncio.get_event_loop().time()
+                async with self._ble_lock:
+                    await self._teardown_ble_client(reason="status-failure")
 
     @property
     def needs_initial_refresh(self) -> bool:
@@ -1597,16 +1670,33 @@ class ScentDiffuserDevice:
         except Exception as err:
             _LOGGER.debug("Initial BLE state retry failed on %s: %s", self._ble_name, err)
 
-    async def refresh_state(self) -> None:
+    async def refresh_state(self, *, timed: bool = False) -> None:
         """Refresh device state."""
         if self._ble_address:
+            started = asyncio.get_event_loop().time()
+            last_full = self._ble_full_refresh_ts
+            # Below the default interval, timed refreshes send only 52 0A
+            # between full reads, which run no less often than at the default.
+            full = (
+                not timed
+                or self.refresh_interval >= BLE_REFRESH_INTERVAL_SECONDS
+                or last_full is None
+                or self._ble_last_failure_ts > last_full
+                or started - last_full > BLE_REFRESH_INTERVAL_SECONDS - self.refresh_interval
+                or (self._ble_full_refresh_unanswered and self._ble_state_read)
+            )
             if await self._ble_connect():
                 try:
                     clock_before = self._state.device_clock
                     query = self._protocol.build_query()
                     if query:
                         await self._ble_send(query)
+                        if not full:
+                            return
                         await asyncio.sleep(1.0)
+                    # Replies on a link without notifications are lost.
+                    if self._ble_notify_subscribed:
+                        self._ble_full_refresh_ts = started
                     # Some protocols expose extra read-registers that the
                     # device only reports on demand (e.g. Aroma-Link's oil
                     # level). Query them too when the protocol offers one.
@@ -1661,6 +1751,7 @@ class ScentDiffuserDevice:
                         await self._ble_send(self._protocol.build_time_sync())
                     if not self._ble_state_read:
                         self._silent_state_reads += 1
+                    self._ble_full_refresh_unanswered = not self._ble_state_read
                 except (BleakError, asyncio.TimeoutError, OSError) as err:
                     _LOGGER.debug("BLE refresh query failed on %s: %s", self._ble_name, err)
                     self._ble_last_failure_ts = asyncio.get_event_loop().time()
@@ -1779,6 +1870,10 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        # A connect still running after unload must not hold the link.
+        self._stay_connected = False
+        if self._status_task and not self._status_task.done():
+            self._status_task.cancel()
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():

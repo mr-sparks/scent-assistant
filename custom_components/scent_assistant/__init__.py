@@ -24,7 +24,10 @@ from .const import (
     CONF_CLOUD_DEVICE_ID,
     CONF_CONNECTION_MODE,
     CONF_MOMENTARY_SECONDS,
+    CONF_REFRESH_INTERVAL,
+    CONF_STAY_CONNECTED,
     BLE_REFRESH_INTERVAL_SECONDS,
+    BLE_REFRESH_INTERVAL_MIN_SECONDS,
     BLE_INITIAL_REFRESH_RETRY_SECONDS,
     CLOUD_POLL_INTERVAL_SECONDS,
     WEEKDAY_MON, WEEKDAY_TUE, WEEKDAY_WED, WEEKDAY_THU,
@@ -80,6 +83,12 @@ SET_SCHEDULE_DEFAULTS = {
 SET_SCHEDULE_UNSUPPORTED = {DeviceType.SCENT_TECH, DeviceType.SCENTIMENT}
 
 
+def _refresh_interval(entry: ConfigEntry) -> int:
+    """Return the timed BLE refresh interval saved in the entry options."""
+    interval = entry.options.get(CONF_REFRESH_INTERVAL, BLE_REFRESH_INTERVAL_SECONDS)
+    return max(BLE_REFRESH_INTERVAL_MIN_SECONDS, int(interval))
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Scent Diffuser from a config entry."""
     hass.data.setdefault(DOMAIN, {})
@@ -119,6 +128,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device.momentary_seconds = entry.options.get(
         CONF_MOMENTARY_SECONDS, device.momentary_seconds
     )
+    if device.supports_periodic_refresh:
+        device.refresh_interval = _refresh_interval(entry)
+        device.set_stay_connected(entry.options.get(CONF_STAY_CONNECTED, False))
 
     # Initial state query (BLE: connects briefly then disconnects; Cloud: polls API)
     try:
@@ -196,8 +208,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device._unsub_ble_refresh = async_track_time_interval(
             hass,
             _periodic_ble_refresh,
-            timedelta(seconds=BLE_REFRESH_INTERVAL_SECONDS),
+            timedelta(seconds=device.refresh_interval),
         )
+
+        async def _options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+            # An update during unload must not re-arm the unloaded device.
+            if hass.data[DOMAIN].get(entry.entry_id) is not device:
+                return
+            device.set_stay_connected(entry.options.get(CONF_STAY_CONNECTED, False))
+            interval = _refresh_interval(entry)
+            if interval == device.refresh_interval:
+                return
+            device.refresh_interval = interval
+            device._unsub_ble_refresh()
+            device._unsub_ble_refresh = async_track_time_interval(
+                hass,
+                _periodic_ble_refresh,
+                timedelta(seconds=interval),
+            )
+
+        entry.async_on_unload(entry.add_update_listener(_options_updated))
+        # Applies options saved during the setup read.
+        await _options_updated(hass, entry)
 
     # Register services (once for all entries)
     if not hass.services.has_service(DOMAIN, SERVICE_SET_SCHEDULE):
