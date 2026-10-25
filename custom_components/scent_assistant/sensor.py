@@ -58,6 +58,12 @@ async def async_setup_entry(
         if device.state.has_battery is not False:
             entities.append(DiffuserBatterySensor(device, entry))
 
+    # AFT Aroma: oil % from the 0xAA device info. It is a countdown the
+    # device keeps (reset to 100 with Reset Oil Level after a refill), not
+    # a measurement (#48).
+    if device.device_type == DeviceType.AFT_AROMA:
+        entities.append(DiffuserOilSensor(device, entry))
+
     if device.device_type in SCENT_MARKETING_TYPES:
         entities.append(DiffuserDetectionDiagnostic(device, entry))
 

@@ -44,6 +44,7 @@ from .protocol_ble import (
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
     ScentTechProtocol,
+    AftAromaProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -84,6 +85,8 @@ class ScentDiffuserDevice:
         cloud_device_id: str | None = None,
         sm_metadata: dict | None = None,
         gw_password: str | None = None,
+        aft_pin: int | None = None,
+        aft_slot: int | None = None,
     ) -> None:
         # HomeAssistant reference, used to fetch a cached BLEDevice via
         # the core bluetooth integration before opening a connection.
@@ -139,7 +142,12 @@ class ScentDiffuserDevice:
         # devices with PID 98 use the Tuya-DP hex parser.
         mac = (ble_address or "").replace(":", "")
         pid = self._sm_metadata.get("pid") if self._sm_metadata else None
-        self._protocol: BleProtocol = get_protocol(self._device_type, mac=mac, pid=pid)
+        self._protocol: BleProtocol = get_protocol(
+            self._device_type, mac=mac, pid=pid, aft_pin=aft_pin, aft_slot=aft_slot,
+        )
+        # AFT Aroma: called with the managed schedule slot once it is first
+        # chosen, so __init__ can persist it in the config entry.
+        self.on_aft_slot_chosen: callable | None = None
 
         # Cloud
         self._cloud: AromaLinkCloudClient | None = cloud_client
@@ -248,6 +256,7 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
             DeviceType.AROMELY_ARO_MAX: "Aromely Aro Max",
             DeviceType.SCENT_TECH: "Scent Tech / ScentLab",
+            DeviceType.AFT_AROMA: "AFT Aroma",
         }
         base = mapping.get(self._device_type, self._device_type.value)
         # Append the PID when known — different OEMs share the same family
@@ -464,10 +473,22 @@ class ScentDiffuserDevice:
                     self._ble_notify_subscribed = True
                 except Exception as err:
                     self._ble_notify_subscribed = False
-                    _LOGGER.warning(
-                        "BLE start_notify failed on %s (%s): %s",
-                        self._ble_name, self._protocol.notify_char_uuid, err,
-                    )
+                    # AFT Aroma notifies on the write characteristic when
+                    # the dedicated one is absent (as its app does).
+                    fallback = getattr(self._protocol, "notify_char_fallback_uuid", None)
+                    if fallback:
+                        try:
+                            await self._ble_client.start_notify(
+                                fallback, self._on_ble_notification
+                            )
+                            self._ble_notify_subscribed = True
+                        except Exception as err2:
+                            err = err2
+                    if not self._ble_notify_subscribed:
+                        _LOGGER.warning(
+                            "BLE start_notify failed on %s (%s): %s",
+                            self._ble_name, self._protocol.notify_char_uuid, err,
+                        )
 
                 # Scent Marketing AK family — PIN 8888 login must precede
                 # every other write, otherwise the device drops them
@@ -570,6 +591,29 @@ class ScentDiffuserDevice:
                     except (BleakError, asyncio.TimeoutError, OSError) as err:
                         _LOGGER.warning(
                             "Aromely Aro Max handshake failed on %s: %s",
+                            self._ble_name, err,
+                        )
+                        await self._teardown_ble_client()
+                        self._ble_last_failure_ts = loop.time()
+                        return False
+
+                # AFT Aroma — every session must open with the PIN check,
+                # otherwise the firmware ignores commands. Mirror the app:
+                # PIN, clock sync, then read device info + schedule slots.
+                if isinstance(self._protocol, AftAromaProtocol):
+                    try:
+                        await self._ble_send(self._protocol.build_check_pin())
+                        await asyncio.sleep(0.6)
+                        await self._ble_send(self._protocol.build_time_sync())
+                        await asyncio.sleep(0.3)
+                        self._ble_has_synced_time = True
+                        await self._ble_send(self._protocol.build_query())
+                        await asyncio.sleep(0.3)
+                        await self._ble_send(self._protocol.build_schedule_query())
+                        await asyncio.sleep(0.3)
+                    except (BleakError, asyncio.TimeoutError, OSError) as err:
+                        _LOGGER.warning(
+                            "AFT Aroma handshake failed on %s: %s",
                             self._ble_name, err,
                         )
                         await self._teardown_ble_client()
@@ -963,6 +1007,8 @@ class ScentDiffuserDevice:
                 self._schedule_durations_read = True
             changed = True
         # Scent Tech timer table / write acknowledgement
+        if "aft_managed_slot" in updates and self.on_aft_slot_chosen is not None:
+            self.on_aft_slot_chosen(updates["aft_managed_slot"])
         if "timer_slots" in updates:
             self._state.timer_slots = updates["timer_slots"]
             self._timers_received.set()
@@ -1066,6 +1112,25 @@ class ScentDiffuserDevice:
 
         return False
 
+    async def test_spray(self) -> bool:
+        """One native test spray (AFT Aroma command 0x05)."""
+        if not self._ble_address or not isinstance(self._protocol, AftAromaProtocol):
+            return False
+        return await self._ble_execute(self._protocol.build_test_spray())
+
+    async def reset_oil(self) -> bool:
+        """Tell an AFT Aroma unit the bottle was refilled (oil level -> 100 %).
+
+        The level is a countdown the device keeps, not a measurement: it
+        stays where it was after a refill until this is sent.
+        """
+        if not self._ble_address or not isinstance(self._protocol, AftAromaProtocol):
+            return False
+        if await self._ble_execute(self._protocol.build_reset_oil()):
+            await self.refresh_state()
+            return True
+        return False
+
     async def momentary_diffuse(self) -> bool:
         """Run the diffuser, optionally switching it off after a delay.
 
@@ -1077,6 +1142,11 @@ class ScentDiffuserDevice:
         A Momentary Duration of 0 disables the delayed power-off, leaving
         the diffuser powered on so its onboard schedule can continue.
         """
+        # AFT Aroma has a native one-shot spray (0x05); power and spraying
+        # are separate states there, so power on/off may not spray at all.
+        if isinstance(self._protocol, AftAromaProtocol):
+            return await self.test_spray()
+
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         self._momentary_task = None
@@ -1107,7 +1177,7 @@ class ScentDiffuserDevice:
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol)):
+        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol, AftAromaProtocol)):
             cmd = proto.build_fan(on)
             if await self._ble_execute(cmd):
                 self._state.fan = on
@@ -1443,6 +1513,15 @@ class ScentDiffuserDevice:
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
                 cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
+            elif isinstance(self._protocol, AftAromaProtocol):
+                newly_chosen = self._protocol.managed_slot is None
+                slot = ScheduleSlot(
+                    start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
+                    enabled=enabled, work_seconds=work, pause_seconds=pause,
+                )
+                cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
+                if newly_chosen and self.on_aft_slot_chosen is not None:
+                    self.on_aft_slot_chosen(self._protocol.managed_slot)
 
             if cmd and await self._ble_execute(cmd):
                 self._notify_state_changed()
@@ -1619,6 +1698,11 @@ class ScentDiffuserDevice:
                     # only carries the *remaining* times). We write every
                     # weekday identically, so today's is representative.
                     # Device weekday numbering: 0 = Sun, 1 = Mon … 6 = Sat.
+                    # AFT Aroma reports its schedule slots on request only.
+                    schedule_query = getattr(self._protocol, "build_schedule_query", None)
+                    if schedule_query is not None:
+                        await self._ble_send(schedule_query())
+                        await asyncio.sleep(0.3)
                     freq_query = getattr(self._protocol, "build_work_frequency_query", None)
                     if freq_query is not None:
                         weekday = (datetime.now().weekday() + 1) % 7

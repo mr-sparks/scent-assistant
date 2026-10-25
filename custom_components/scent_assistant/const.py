@@ -16,6 +16,7 @@ class DeviceType(StrEnum):
     SCENT_MARKETING_GW_XOR = "scent_marketing_gw_xor"  # Scent Marketing app, GW family with XOR-encrypted JSON payload
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
     SCENT_TECH = "scent_tech"                          # YooAI OEM, ScentLab / Scent Tech apps (FFE1, 55 AA … 5A frames)
+    AFT_AROMA = "aft_aroma"                            # AFT Aroma app (AF-05S…; FFF0, FFF3 write / FFF4 notify, BC/CC frames)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +249,42 @@ SM_GW_WRITE_UUID = "0000ee03-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_SERVICE_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_NOTIFY_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_WRITE_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
+
+# ---------------------------------------------------------------------------
+# AFT Aroma (com.mingmao.aifeita / com.findn.aifeita) — AF-05S and siblings
+# ---------------------------------------------------------------------------
+# Decoded from the decompiled official Android app (BleConfig /
+# CommandManager / BleManager), confirmed on an AF-05S (#48). Same FFF0
+# service as Aroma-Link but a different layout: write FFF3, notify FFF4
+# (the app falls back to notifying on FFF3 when FFF4 is absent).
+AFT_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
+AFT_CHAR_WRITE_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"
+AFT_CHAR_NOTIFY_UUID = "0000fff4-0000-1000-8000-00805f9b34fb"
+# Advertised 16-bit service: 0x17 0xB7..0xBA in the scan record, i.e.
+# 0xB717 (app type 1, e.g. AF-05S) .. 0xBA17 (type 4). The app accepts only
+# these; the local name is user-renamable (6 bytes), so this is the key.
+AFT_ADV_SERVICE_UUIDS = (
+    "0000b717-0000-1000-8000-00805f9b34fb",
+    "0000b817-0000-1000-8000-00805f9b34fb",
+    "0000b917-0000-1000-8000-00805f9b34fb",
+    "0000ba17-0000-1000-8000-00805f9b34fb",
+)
+# Frame: <hdr> <cmd> <len> <payload...> <checksum>
+# checksum = sum of every preceding byte (header included), mod 256.
+AFT_HEADER_WRITE = 0xBC     # app -> device
+AFT_HEADER_NOTIFY = 0xCC    # device -> app
+AFT_CMD_TIME = 0x01         # yy yy MM dd HH mm ss wd(1=Mon..7=Sun)
+AFT_CMD_WORK_MODE = 0x02    # slot sH sM eH eM work/5 pause/5 daymask enabled
+AFT_CMD_FAN = 0x03
+AFT_CMD_POWER = 0x04
+AFT_CMD_TEST_SPRAY = 0x05   # one test spray ("Diffuse Now")
+AFT_CMD_RESET_OIL = 0x07    # reply payload[0] = new level (100); oil % is a countdown
+AFT_CMD_DEVICE_INFO = 0xAA  # -> oil% spraying power fan link ? sH sM eH eM work/5 pause/5
+AFT_CMD_WORK_MODE_INFO = 0xBB  # -> one 0x02 frame per schedule slot
+AFT_CMD_CHECK_PIN = 0xF1    # 3-byte big-endian PIN; reply payload[0] == 1 means OK
+AFT_DEFAULT_PIN = 9999
+AFT_SLOT_COUNT = 4          # the device holds 4 schedule slots; HA manages one
+AFT_DURATION_STEP = 5       # work/pause are sent in 5-second units (one byte)
 
 # ---------------------------------------------------------------------------
 # BLE name patterns for device detection
@@ -570,6 +607,8 @@ CONF_MOMENTARY_SECONDS = "momentary_seconds"
 # firmware sometimes ships locked; setting this lets the device accept
 # our control commands).
 CONF_GW_PASSWORD = "gw_password"
+CONF_AFT_PIN = "aft_pin"
+CONF_AFT_SLOT = "aft_slot"      # AFT schedule slot HA manages, fixed once chosen
 
 # ---------------------------------------------------------------------------
 # Defaults

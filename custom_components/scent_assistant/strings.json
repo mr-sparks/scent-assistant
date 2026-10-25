@@ -42,6 +42,13 @@
       "bluetooth_confirm": {
         "title": "Add diffuser",
         "description": "Do you want to add {name}?"
+      },
+      "aft_pin": {
+        "title": "AFT Aroma — Device PIN",
+        "description": "Enter the PIN of {device}. The factory default is 9999; use the one you set in the AFT Aroma app if you changed it.",
+        "data": {
+          "aft_pin": "PIN"
+        }
       }
     },
     "error": {
@@ -49,7 +56,8 @@
       "invalid_auth": "Invalid credentials",
       "no_devices": "No devices found",
       "unknown": "Unknown error",
-      "probe_failed": "Could not connect to the selected device to identify it. Make sure it is powered on and in range of a Bluetooth adapter or proxy that can connect (passive proxies such as Shelly cannot), then try again."
+      "probe_failed": "Could not connect to the selected device to identify it. Make sure it is powered on and in range of a Bluetooth adapter or proxy that can connect (passive proxies such as Shelly cannot), then try again.",
+      "invalid_pin": "The PIN must be digits only (up to 6)"
     },
     "abort": {
       "already_configured": "Device is already configured",

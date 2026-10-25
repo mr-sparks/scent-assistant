@@ -23,6 +23,8 @@ from .const import (
     CONF_CLOUD_PASSWORD,
     CONF_CLOUD_DEVICE_ID,
     CONF_CONNECTION_MODE,
+    CONF_AFT_PIN,
+    CONF_AFT_SLOT,
     CONF_MOMENTARY_SECONDS,
     BLE_REFRESH_INTERVAL_SECONDS,
     BLE_INITIAL_REFRESH_RETRY_SECONDS,
@@ -32,7 +34,7 @@ from .const import (
     DeviceType,
 )
 from .device import ScentDiffuserDevice
-from .protocol_ble import ScheduleSlot, ScheduleSetup
+from .protocol_ble import ScheduleSlot, ScheduleSetup, detect_device_type
 from .protocol_cloud import AromaLinkCloudClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,6 +90,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ble_name = entry.data.get(CONF_BLE_NAME, "")
     device_type = DeviceType(entry.data.get(CONF_DEVICE_TYPE, "aroma_link"))
 
+    # Entries created before AFT Aroma support were (mis)assigned the
+    # Aroma-Link profile, whose FFF1/FFF2 characteristics these units don't
+    # have (#48). If the live advertisement identifies an AFT Aroma unit,
+    # correct the stored type once; the entry keeps its id, so entities and
+    # their entity_ids are preserved.
+    if ble_address and device_type == DeviceType.AROMA_LINK:
+        info = bluetooth.async_last_service_info(hass, ble_address, connectable=False)
+        if info is not None and detect_device_type(
+            info.name or ble_name, info.advertisement
+        ) == DeviceType.AFT_AROMA:
+            _LOGGER.info(
+                "%s advertises the AFT Aroma service — switching its profile "
+                "from aroma_link to aft_aroma", entry.title,
+            )
+            device_type = DeviceType.AFT_AROMA
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_DEVICE_TYPE: device_type.value},
+            )
+
     connection_mode = entry.data.get(CONF_CONNECTION_MODE, "ble")
 
     # Set up cloud client if configured for cloud mode
@@ -113,7 +134,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cloud_device_id=cloud_device_id,
         sm_metadata=entry.data.get("sm_metadata"),
         gw_password=entry.data.get("gw_password"),
+        aft_pin=entry.data.get(CONF_AFT_PIN),
+        aft_slot=entry.data.get(CONF_AFT_SLOT),
     )
+
+    # AFT Aroma: keep the managed schedule slot fixed once chosen (#48), so
+    # turning the program off never moves HA onto another slot's timings.
+    if device_type == DeviceType.AFT_AROMA:
+        @callback
+        def _persist_aft_slot(slot: int) -> None:
+            if entry.data.get(CONF_AFT_SLOT) != slot:
+                hass.config_entries.async_update_entry(
+                    entry, data={**entry.data, CONF_AFT_SLOT: slot},
+                )
+        device.on_aft_slot_chosen = _persist_aft_slot
 
     # Restore local configuration before setting up the device and platforms.
     device.momentary_seconds = entry.options.get(

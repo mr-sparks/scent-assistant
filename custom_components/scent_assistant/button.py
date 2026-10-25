@@ -27,8 +27,11 @@ async def async_setup_entry(
     entities: list[ButtonEntity] = [TimeSyncButton(device, entry)]
     # Momentary diffusion is power-on + delayed power-off, which only
     # makes sense on families where power is a plain on/off (Aroma-Link).
-    if device.device_type == DeviceType.AROMA_LINK:
+    # AFT Aroma: Diffuse Now is the device's own test spray (0x05).
+    if device.device_type in (DeviceType.AROMA_LINK, DeviceType.AFT_AROMA):
         entities.append(MomentaryDiffuseButton(device, entry))
+    if device.device_type == DeviceType.AFT_AROMA:
+        entities.append(ResetOilButton(device, entry))
     # Scent Tech is not polled (every connect beeps), so schedules changed
     # in the official app only show up after a manual read.
     if device.device_type == DeviceType.SCENT_TECH:
@@ -65,6 +68,29 @@ class MomentaryDiffuseButton(ButtonEntity):
             _LOGGER.warning(
                 "Momentary diffusion failed to start on %s", self._device.name
             )
+
+
+class ResetOilButton(ButtonEntity):
+    """Tell an AFT Aroma unit the bottle was refilled (oil level -> 100 %)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Reset Oil Level"
+    _attr_icon = "mdi:water-sync"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_reset_oil"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+
+    @property
+    def available(self) -> bool:
+        return self._device.connection_mode == "ble"
+
+    async def async_press(self) -> None:
+        if not await self._device.reset_oil():
+            _LOGGER.warning("Oil level reset failed on %s", self._device.name)
 
 
 class TimeSyncButton(ButtonEntity):

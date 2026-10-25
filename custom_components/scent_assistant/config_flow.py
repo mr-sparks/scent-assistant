@@ -27,6 +27,8 @@ from .const import (
     CONF_CLOUD_USER_ID,
     CONF_CONNECTION_MODE,
     CONF_GW_PASSWORD,
+    CONF_AFT_PIN,
+    AFT_DEFAULT_PIN,
     DeviceType,
 )
 from .protocol_ble import (
@@ -87,6 +89,7 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._selected_device_type: str | None = None
         self._selected_sm_metadata: dict | None = None
         self._selected_gw_password: str | None = None
+        self._selected_aft_pin: int | None = None
 
     def _create_ble_entry(self) -> config_entries.ConfigFlowResult:
         """Build the BLE-mode config entry. Shared by all BLE setup paths."""
@@ -100,6 +103,8 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             entry_data["sm_metadata"] = self._selected_sm_metadata
         if self._selected_gw_password:
             entry_data[CONF_GW_PASSWORD] = self._selected_gw_password
+        if self._selected_aft_pin is not None:
+            entry_data[CONF_AFT_PIN] = self._selected_aft_pin
         return self.async_create_entry(
             title=self._selected_ble_name or "Scent Diffuser",
             data=entry_data,
@@ -119,6 +124,35 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema({
                 vol.Optional(CONF_GW_PASSWORD, default=""): str,
             }),
+            description_placeholders={"device": self._selected_ble_name or ""},
+        )
+
+    async def _async_step_credentials(self) -> config_entries.ConfigFlowResult:
+        """Ask for whatever the selected family needs before creating the
+        entry. Shared by the discovery, scan and GATT-probe paths."""
+        if self._needs_password_step():
+            return await self.async_step_gw_password()
+        if self._selected_device_type == DeviceType.AFT_AROMA:
+            return await self.async_step_aft_pin()
+        return self._create_ble_entry()
+
+    async def async_step_aft_pin(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """PIN prompt for AFT Aroma devices (factory default 9999)."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            pin = str(user_input.get(CONF_AFT_PIN, "")).strip()
+            if pin.isdigit() and len(pin) <= 6:
+                self._selected_aft_pin = int(pin)
+                return self._create_ble_entry()
+            errors[CONF_AFT_PIN] = "invalid_pin"
+        return self.async_show_form(
+            step_id="aft_pin",
+            data_schema=vol.Schema({
+                vol.Required(CONF_AFT_PIN, default=str(AFT_DEFAULT_PIN)): str,
+            }),
+            errors=errors,
             description_placeholders={"device": self._selected_ble_name or ""},
         )
 
@@ -171,9 +205,7 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         """Ask the user to confirm a discovered diffuser."""
         if user_input is not None:
-            if self._needs_password_step():
-                return await self.async_step_gw_password()
-            return self._create_ble_entry()
+            return await self._async_step_credentials()
         self._set_confirm_only()
         return self.async_show_form(
             step_id="bluetooth_confirm",
@@ -238,9 +270,7 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self._selected_device_type = dtype
 
                 if not select_errors:
-                    if self._needs_password_step():
-                        return await self.async_step_gw_password()
-                    return self._create_ble_entry()
+                    return await self._async_step_credentials()
             # If address is missing, user clicked Submit on an empty error
             # form – fall through to re-scan.
 

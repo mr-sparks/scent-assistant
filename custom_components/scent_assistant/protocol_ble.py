@@ -61,6 +61,12 @@ from .const import (
     SCENT_TECH_RESP_WRITE_TIMER, SCENT_TECH_RESP_PW_QUERY,
     SCENT_TECH_RESP_PW_SUBMIT, SCENT_TECH_ACTION_POWER,
     SCENT_TECH_TIMER_RECORD_SIZE,
+    AFT_SERVICE_UUID, AFT_CHAR_WRITE_UUID, AFT_CHAR_NOTIFY_UUID,
+    AFT_ADV_SERVICE_UUIDS, AFT_HEADER_WRITE, AFT_HEADER_NOTIFY,
+    AFT_CMD_TIME, AFT_CMD_WORK_MODE, AFT_CMD_FAN, AFT_CMD_POWER,
+    AFT_CMD_TEST_SPRAY, AFT_CMD_RESET_OIL, AFT_CMD_DEVICE_INFO,
+    AFT_CMD_WORK_MODE_INFO, AFT_CMD_CHECK_PIN, AFT_DEFAULT_PIN,
+    AFT_SLOT_COUNT, AFT_DURATION_STEP,
     AROMELY_FRAME_HEADER, AROMELY_DIR_WRITE, AROMELY_DIR_NOTIFY,
     AROMELY_TYPE_READ, AROMELY_TYPE_DATA,
     AROMELY_REG_TIME, AROMELY_REG_SCHED_WRITE, AROMELY_REG_FAN,
@@ -2582,6 +2588,185 @@ class ScentTechProtocol(BleProtocol):
 
 
 # ---------------------------------------------------------------------------
+# AFT Aroma (AF-05S and siblings) — BC/CC framed byte protocol
+# ---------------------------------------------------------------------------
+
+class AftAromaProtocol(BleProtocol):
+    """AFT Aroma app diffusers (e.g. AF-05S), #48.
+
+    Decoded from the decompiled official Android app and confirmed on an
+    AF-05S. Frames are
+
+        <hdr> <cmd> <len> <payload...> <checksum>
+
+    with hdr 0xBC (app->device) / 0xCC (device->app) and checksum = sum of
+    every preceding byte, mod 256. A session must start with a PIN check
+    (default 9999); the app then syncs the clock and reads the device
+    info (0xAA) and the schedule slots (0xBB -> one 0x02 frame per slot).
+
+    The device holds four schedule slots. HA manages one of them (Start/End
+    Time, Work/Pause Duration) and leaves the others alone. The managed slot
+    is chosen once — the first enabled slot after a full read, slot 1 when
+    none is enabled — and then stays fixed (it is persisted in the config
+    entry), so disabling the program never moves HA onto another slot's
+    timings. Work/pause go over the wire in 5-second units in one byte.
+    """
+
+    device_type = DeviceType.AFT_AROMA
+    service_uuid = AFT_SERVICE_UUID
+    write_char_uuid = AFT_CHAR_WRITE_UUID
+    notify_char_uuid = AFT_CHAR_NOTIFY_UUID
+    # The app subscribes on the write characteristic when FFF4 is absent.
+    notify_char_fallback_uuid = AFT_CHAR_WRITE_UUID
+
+    def __init__(self, pin: int | None = None, managed_slot: int | None = None) -> None:
+        self._pin = AFT_DEFAULT_PIN if pin is None else int(pin)
+        self._managed_slot = managed_slot if managed_slot in range(1, AFT_SLOT_COUNT + 1) else None
+        # Slot index -> parsed 0x02 payload, as last read from the device.
+        self._slots: dict[int, dict] = {}
+
+    @property
+    def managed_slot(self) -> int | None:
+        return self._managed_slot
+
+    def choose_managed_slot(self) -> int:
+        """Fix the managed slot if it isn't yet: first enabled, else 1."""
+        if self._managed_slot is None:
+            enabled = sorted(i for i, sl in self._slots.items() if sl["enabled"])
+            self._managed_slot = enabled[0] if enabled else 1
+        return self._managed_slot
+
+    @staticmethod
+    def _frame(cmd: int, payload: bytes) -> bytes:
+        body = bytes([AFT_HEADER_WRITE, cmd, len(payload) & 0xFF]) + payload
+        return body + bytes([sum(body) & 0xFF])
+
+    # -- handshake / reads ------------------------------------------------
+
+    def build_check_pin(self) -> bytes:
+        pin = self._pin & 0xFFFFFF
+        return self._frame(
+            AFT_CMD_CHECK_PIN,
+            bytes([(pin >> 16) & 0xFF, (pin >> 8) & 0xFF, pin & 0xFF]),
+        )
+
+    def build_time_sync(self, now: datetime | None = None) -> bytes:
+        if now is None:
+            now = datetime.now()
+        return self._frame(AFT_CMD_TIME, bytes([
+            (now.year >> 8) & 0xFF, now.year & 0xFF,
+            now.month, now.day, now.hour, now.minute, now.second,
+            now.isoweekday(),  # 1=Mon .. 7=Sun, as the app sends it
+        ]))
+
+    def build_query(self) -> bytes:
+        return self._frame(AFT_CMD_DEVICE_INFO, bytes([0x01]))
+
+    def build_schedule_query(self) -> bytes:
+        return self._frame(AFT_CMD_WORK_MODE_INFO, bytes([0x01]))
+
+    # -- controls ---------------------------------------------------------
+
+    def build_power(self, on: bool) -> bytes:
+        return self._frame(AFT_CMD_POWER, bytes([0x01 if on else 0x00]))
+
+    def build_fan(self, on: bool) -> bytes:
+        return self._frame(AFT_CMD_FAN, bytes([0x01 if on else 0x00]))
+
+    def build_test_spray(self) -> bytes:
+        return self._frame(AFT_CMD_TEST_SPRAY, bytes([0x01]))
+
+    def build_reset_oil(self) -> bytes:
+        return self._frame(AFT_CMD_RESET_OIL, bytes([0x01]))
+
+    def supports_fan(self) -> bool:
+        return True
+
+    def build_schedule(self, slot: ScheduleSlot, weekday_mask: int = 0x7F) -> bytes:
+        """Write the managed slot. Mask bit0=Mon .. bit6=Sun (same as the app).
+
+        The manual says a slot may not start at 00:00 (the machine then
+        never runs), so a 00:00 start is nudged to 00:01.
+        """
+        s_h, s_m = slot.start_hour, slot.start_minute
+        if s_h == 0 and s_m == 0:
+            s_m = 1
+        step = AFT_DURATION_STEP
+        work = max(1, min(255, round(int(slot.work_seconds) / step)))
+        pause = max(1, min(255, round(int(slot.pause_seconds) / step)))
+        return self._frame(AFT_CMD_WORK_MODE, bytes([
+            self.choose_managed_slot(),
+            s_h & 0xFF, s_m & 0xFF,
+            slot.end_hour & 0xFF, slot.end_minute & 0xFF,
+            work, pause,
+            weekday_mask & 0x7F,
+            0x01 if slot.enabled else 0x00,
+        ]))
+
+    # -- parsing ----------------------------------------------------------
+
+    def parse_notification(self, data: bytes) -> dict:
+        result: dict = {}
+        if len(data) < 5 or data[0] != AFT_HEADER_NOTIFY:
+            return result
+        if data[-1] != (sum(data[:-1]) & 0xFF):
+            _LOGGER.debug("AFT Aroma: bad checksum on %s", data.hex())
+            return result
+        cmd = data[1]
+
+        if cmd == AFT_CMD_CHECK_PIN:
+            ok = data[3] == 0x01
+            result["password_required"] = not ok
+            if not ok:
+                _LOGGER.warning(
+                    "AFT Aroma: device rejected the PIN — commands will be ignored. "
+                    "Re-add the device with the PIN set in the AFT Aroma app."
+                )
+        elif cmd == AFT_CMD_DEVICE_INFO and len(data) > 17:
+            power = data[5] == 0x01
+            result["oil_remaining"] = max(0, min(100, data[3]))
+            result["power"] = power
+            result["fan"] = data[6] == 0x01
+            window_active = any(data[9:13])
+            if not power:
+                result["phase"] = "off"
+            elif data[4] == 0x01:
+                result["phase"] = "spraying"
+            elif window_active:
+                result["phase"] = "paused"
+            else:
+                result["phase"] = "idle"
+        elif cmd == AFT_CMD_RESET_OIL and len(data) >= 5:
+            # Reply carries the new level (100 after a refill reset).
+            result["oil_remaining"] = max(0, min(100, data[3]))
+        elif cmd == AFT_CMD_WORK_MODE and len(data) >= 13:
+            self._slots[data[3]] = {
+                "start": (data[4], data[5]), "end": (data[6], data[7]),
+                "work": data[8], "pause": data[9],
+                "mask": data[10] & 0x7F, "enabled": data[11] == 0x01,
+            }
+            # Slots arrive one frame at a time; choose only once all four
+            # have been seen, so "first enabled" looks at the whole table.
+            if self._managed_slot is None:
+                if len(self._slots) < AFT_SLOT_COUNT:
+                    return result
+                result["aft_managed_slot"] = self.choose_managed_slot()
+            sl = self._slots.get(self._managed_slot)
+            if sl is None:
+                return result
+            result["start_hour"], result["start_minute"] = sl["start"]
+            result["end_hour"], result["end_minute"] = sl["end"]
+            if sl["work"]:
+                result["work_seconds"] = sl["work"] * AFT_DURATION_STEP
+            if sl["pause"]:
+                result["pause_seconds"] = sl["pause"] * AFT_DURATION_STEP
+            result["weekday_mask"] = sl["mask"]
+            result["schedule_enabled"] = sl["enabled"]
+            result["schedule_slot"] = self._managed_slot
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -2589,6 +2774,8 @@ def get_protocol(
     device_type: DeviceType,
     mac: str = "",
     pid: int | None = None,
+    aft_pin: int | None = None,
+    aft_slot: int | None = None,
 ) -> BleProtocol:
     """Get the appropriate protocol handler for a device type.
 
@@ -2612,6 +2799,8 @@ def get_protocol(
         return AromelyAroMaxProtocol()
     elif device_type == DeviceType.SCENT_TECH:
         return ScentTechProtocol()
+    elif device_type == DeviceType.AFT_AROMA:
+        return AftAromaProtocol(pin=aft_pin, managed_slot=aft_slot)
     raise ValueError(f"Unknown device type: {device_type}")
 
 
@@ -2705,6 +2894,9 @@ def detect_device_type(
     if sm_type is not None:
         return sm_type
 
+    if _detect_aft_aroma(advertisement_data):
+        return DeviceType.AFT_AROMA
+
     if _detect_aromely(advertisement_data):
         return DeviceType.AROMELY_ARO_MAX
 
@@ -2720,6 +2912,18 @@ def detect_device_type(
             if lowered.startswith(pattern.lower()):
                 return dtype
     return None
+
+
+def _detect_aft_aroma(advertisement_data) -> bool:
+    """Match an AFT Aroma unit by its advertised 0xB717..0xBA17 service.
+
+    The local name is user-renamable (6 bytes), so the service UUID is the
+    only reliable key — exactly what the official app filters on.
+    """
+    if advertisement_data is None:
+        return False
+    uuids = getattr(advertisement_data, "service_uuids", None) or []
+    return any(str(u).lower() in AFT_ADV_SERVICE_UUIDS for u in uuids)
 
 
 def _detect_aromely(advertisement_data) -> bool:
@@ -2771,4 +2975,8 @@ def classify_gatt(characteristics: dict[str, set[str]]) -> DeviceType | None:
         return DeviceType.SCENT_MARKETING_GW
     if has(SCENTIMENT_CHAR_NOTIFY_UUID, {"notify"}) and has(SCENTIMENT_CHAR_WRITE_UUID, _WRITABLE):
         return DeviceType.SCENTIMENT
+    # AFT Aroma: FFF4 notify + FFF3 write (Aroma-Link's FFF1/FFF2 absent,
+    # so it was matched above first if both layouts were present).
+    if has(AFT_CHAR_NOTIFY_UUID, {"notify"}) and has(AFT_CHAR_WRITE_UUID, _WRITABLE):
+        return DeviceType.AFT_AROMA
     return None

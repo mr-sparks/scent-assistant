@@ -55,6 +55,7 @@
 | Scent Marketing diffusers (SA_* series) | Scent Marketing | BLE | V2 + V3 variants; Power, Fan, Program switch, intensity, schedule read-back |
 | Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
 | Aromely Aro Max | Aromely | BLE | Power, Fan, daily schedule (work/pause), HVAC scent diffuser |
+| AFT Aroma diffusers (e.g. AF-05S) | AFT Aroma | BLE | Power, Fan, schedule (one of the four device slots), Diffuse Now (test spray), oil level countdown with reset; device PIN asked at setup (default 9999) |
 
 ### Likely Compatible
 
