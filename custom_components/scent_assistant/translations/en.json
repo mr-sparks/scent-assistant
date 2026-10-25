@@ -42,6 +42,15 @@
       "bluetooth_confirm": {
         "title": "Add diffuser",
         "description": "Do you want to add {name}?"
+      },
+      "aiot_bind": {
+        "title": "Aroma IOT — bind {name} to Home Assistant",
+        "description": "Home Assistant can only control this unit after logging in, and a unit that was never paired accepts a login only once it has been bound to a set of credentials.\n\n**Warning:** binding {name} to Home Assistant locks out the Aroma IOT app — the app can no longer log in, and no way to reset the binding is known. Only tick the box if you will not use the app with this unit.\n\nIf this unit was bound to Home Assistant before, leave the box unticked and enter its ID and code instead (they are in the integration's diagnostics download).",
+        "data": {
+          "bind": "Bind this unit to Home Assistant (locks out the Aroma IOT app)",
+          "aiot_nid": "Existing ID (optional)",
+          "aiot_code": "Existing code (optional)"
+        }
       }
     },
     "error": {
@@ -49,10 +58,13 @@
       "invalid_auth": "Invalid credentials",
       "no_devices": "No devices found",
       "unknown": "Unknown error",
-      "probe_failed": "Could not connect to the selected device to identify it. Make sure it is powered on and in range of a Bluetooth adapter or proxy that can connect (passive proxies such as Shelly cannot), then try again."
+      "probe_failed": "Could not connect to the selected device to identify it. Make sure it is powered on and in range of a Bluetooth adapter or proxy that can connect (passive proxies such as Shelly cannot), then try again.",
+      "aiot_bind_required": "This unit isn't bound to Home Assistant yet. Tick the box to bind it, or enter the ID and code it was bound with.",
+      "aiot_invalid_credentials": "The unit refused this ID and code. The ID is digits only; both are in the diagnostics download of the entry that bound it."
     },
     "abort": {
       "already_configured": "Device is already configured",
+      "aiot_already_bound": "{name} is already bound to other credentials (for example the Aroma IOT app), so Home Assistant can't log in. Unbind it in the app first, or re-add it with the ID and code it was bound with.",
       "not_supported": "This Bluetooth device is not a supported diffuser",
       "unsupported_gatt": "{name} does not match any diffuser family this integration supports. If it is a diffuser, please open an issue at {issues_url} with the manufacturer, the app it uses, and this Bluetooth layout:\n\n```\n{gatt}\n```"
     }

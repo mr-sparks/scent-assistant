@@ -44,6 +44,7 @@ from .protocol_ble import (
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
     ScentTechProtocol,
+    AromaIotProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -84,6 +85,8 @@ class ScentDiffuserDevice:
         cloud_device_id: str | None = None,
         sm_metadata: dict | None = None,
         gw_password: str | None = None,
+        aiot_nid: str | None = None,
+        aiot_code: str | None = None,
     ) -> None:
         # HomeAssistant reference, used to fetch a cached BLEDevice via
         # the core bluetooth integration before opening a connection.
@@ -139,7 +142,9 @@ class ScentDiffuserDevice:
         # devices with PID 98 use the Tuya-DP hex parser.
         mac = (ble_address or "").replace(":", "")
         pid = self._sm_metadata.get("pid") if self._sm_metadata else None
-        self._protocol: BleProtocol = get_protocol(self._device_type, mac=mac, pid=pid)
+        self._protocol: BleProtocol = get_protocol(
+            self._device_type, mac=mac, pid=pid, aiot_nid=aiot_nid, aiot_code=aiot_code,
+        )
 
         # Cloud
         self._cloud: AromaLinkCloudClient | None = cloud_client
@@ -248,6 +253,7 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
             DeviceType.AROMELY_ARO_MAX: "Aromely Aro Max",
             DeviceType.SCENT_TECH: "Scent Tech / ScentLab",
+            DeviceType.AROMA_IOT: "Aroma IOT",
         }
         base = mapping.get(self._device_type, self._device_type.value)
         # Append the PID when known — different OEMs share the same family
@@ -585,6 +591,18 @@ class ScentDiffuserDevice:
                         for frame in self._protocol.build_session_frames(self._gw_password):
                             await self._ble_send(frame)
                             await asyncio.sleep(0.5 if frame[3] in (0x09, 0x51) else 0.25)
+                        # Aroma IOT acks commands sent before its login
+                        # completes but ignores them, so wait for it.
+                        if hasattr(self._protocol, "session_ready"):
+                            for _ in range(40):
+                                if self._protocol.session_ready:
+                                    break
+                                await asyncio.sleep(0.2)
+                            else:
+                                _LOGGER.warning(
+                                    "%s: no login within 8 s — commands will be ignored",
+                                    self._ble_name,
+                                )
                     except (BleakError, asyncio.TimeoutError, OSError) as err:
                         _LOGGER.warning(
                             "Scent Tech handshake failed on %s: %s",
@@ -822,6 +840,15 @@ class ScentDiffuserDevice:
         """True if a NACK for `sub` arrived after `mark` (a _ble_nack_seq value)."""
         return self._ble_nacks.get(sub, 0) > mark
 
+    async def _send_replies(self, frames: list[bytes]) -> None:
+        for frame in frames:
+            try:
+                await self._ble_send(frame)
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.debug("Reply write failed on %s: %s", self._ble_name, err)
+                return
+            await asyncio.sleep(0.15)
+
     def _on_ble_notification(self, sender: int, data: bytearray) -> None:
         """Handle incoming BLE notification."""
         raw = bytes(data)
@@ -832,6 +859,11 @@ class ScentDiffuserDevice:
         updates = self._protocol.parse_notification(raw)
         if not updates:
             return
+        # Frames the device expects in reply (Aroma IOT acks its greeting
+        # and pushed state).
+        replies = updates.pop("reply_frames", None)
+        if replies:
+            asyncio.ensure_future(self._send_replies(replies))
         if "nack" in updates:
             self._ble_nack_seq += 1
             self._ble_nacks[updates["nack"]] = self._ble_nack_seq
@@ -1107,7 +1139,7 @@ class ScentDiffuserDevice:
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol)):
+        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol, AromaIotProtocol)):
             cmd = proto.build_fan(on)
             if await self._ble_execute(cmd):
                 self._state.fan = on

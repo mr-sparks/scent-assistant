@@ -60,7 +60,13 @@ from .const import (
     SCENT_TECH_RESP_STATE, SCENT_TECH_RESP_TIMERS,
     SCENT_TECH_RESP_WRITE_TIMER, SCENT_TECH_RESP_PW_QUERY,
     SCENT_TECH_RESP_PW_SUBMIT, SCENT_TECH_ACTION_POWER,
-    SCENT_TECH_TIMER_RECORD_SIZE,
+    SCENT_TECH_TIMER_RECORD_SIZE, SCENT_TECH_WEEKDAY_ANY,
+    AIOT_MFR_IDS, AIOT_CMD_BIND, AIOT_CMD_LOGIN, AIOT_CMD_WRITE_TIMER,
+    AIOT_RESP_HELLO, AIOT_RESP_BIND, AIOT_RESP_LOGIN, AIOT_RESP_WRITE_TIMER,
+    AIOT_RESP_CONTROL, AIOT_RESP_STATE_BATTERY,
+    AIOT_ACK_HELLO, AIOT_ACK_STATE_MAINS, AIOT_ACK_STATE_BATTERY,
+    AIOT_ACTION_FAN, AIOT_TIMER_RECORD_SIZE, AIOT_TIMER_MODES,
+    AIOT_DEFAULT_TIMER_MODE,
     AROMELY_FRAME_HEADER, AROMELY_DIR_WRITE, AROMELY_DIR_NOTIFY,
     AROMELY_TYPE_READ, AROMELY_TYPE_DATA,
     AROMELY_REG_TIME, AROMELY_REG_SCHED_WRITE, AROMELY_REG_FAN,
@@ -2582,6 +2588,217 @@ class ScentTechProtocol(BleProtocol):
 
 
 # ---------------------------------------------------------------------------
+# Aroma IOT (Tonemy "TMSJ-…") — a Scent Tech firmware variant (#49)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AromaIotTimer:
+    """One 14-byte Aroma IOT timer record.
+
+    Field names match ScentTechTimer so the per-slot Scent Tech entities
+    work unchanged. The record has no enabled flag (a timer exists or it
+    doesn't) and stores the days as a pattern index, not a free mask.
+    """
+
+    weekdays: int          # bit0 Mon … bit6 Sun, bit7 = any day set
+    start_minute: int
+    stop_minute: int
+    run_seconds: int
+    pause_seconds: int
+    timer_id: int
+    enabled: bool = True
+    serial: int = 0
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "AromaIotTimer":
+        if len(data) != AIOT_TIMER_RECORD_SIZE:
+            raise ValueError(f"expected 14 timer bytes, got {len(data)}")
+        mode = int.from_bytes(data[0:2], "little")
+        mask = AIOT_TIMER_MODES[mode] if mode < len(AIOT_TIMER_MODES) else 0
+        return cls(
+            weekdays=mask | (SCENT_TECH_WEEKDAY_ANY if mask else 0),
+            start_minute=int.from_bytes(data[2:4], "little"),
+            stop_minute=int.from_bytes(data[4:6], "little"),
+            run_seconds=int.from_bytes(data[6:8], "little"),
+            pause_seconds=int.from_bytes(data[8:10], "little"),
+            timer_id=int.from_bytes(data[10:14], "little"),
+        )
+
+    @staticmethod
+    def mode_for(weekdays: int) -> int:
+        mask = weekdays & 0x7F
+        if mask in AIOT_TIMER_MODES:
+            return AIOT_TIMER_MODES.index(mask)
+        _LOGGER.warning(
+            "Aroma IOT: day pattern 0x%02X can't be stored on the device — using every day",
+            mask,
+        )
+        return AIOT_DEFAULT_TIMER_MODE
+
+    def to_bytes(self) -> bytes:
+        return b"".join((
+            self.mode_for(self.weekdays).to_bytes(2, "little"),
+            self.start_minute.to_bytes(2, "little"),
+            self.stop_minute.to_bytes(2, "little"),
+            self.run_seconds.to_bytes(2, "little"),
+            self.pause_seconds.to_bytes(2, "little"),
+            self.timer_id.to_bytes(4, "little"),
+        ))
+
+    def with_changes(self, **changes) -> "AromaIotTimer":
+        return replace(self, **changes)
+
+
+class AromaIotProtocol(ScentTechProtocol):
+    """Aroma IOT app diffusers (Tonemy, e.g. battery wall units "TMSJ-…").
+
+    Reuses the Scent Tech framing, reassembly, power, time sync and timer
+    read. Differs in:
+
+    * Session: control needs a LOGIN (0x02 with id + code). The unit pushes
+      a 0x20 greeting on connect, acked with 0xA0. Until logged in it acks
+      operations but ignores them. Binding (0x01) is never done here — only
+      by the config flow, when the user explicitly opts in.
+    * Timers: 14-byte records (see AromaIotTimer), written one at a time
+      with 0x04 -> 0x84.
+    * State: battery models push 0x22 (power/charging flags, fan, lock,
+      battery %, oil % when valid, run/pause), mains models 0x21; both
+      are acked (0xA2 / 0xA1).
+
+    Replies the device expects are returned under "reply_frames".
+    """
+
+    device_type = DeviceType.AROMA_IOT
+
+    def __init__(self, nid: str | None = None, code: str | None = None) -> None:
+        super().__init__()
+        self._nid = nid
+        self._code = code
+        self.logged_in = False
+
+    # -- session -----------------------------------------------------------
+
+    def _credentials(self) -> bytes | None:
+        if not (self._nid and self._code):
+            return None
+        nid = str(self._nid).encode()
+        code = str(self._code).encode()
+        return (
+            len(nid).to_bytes(2, "little") + nid
+            + len(code).to_bytes(2, "little") + code
+        )
+
+    def build_login(self) -> bytes | None:
+        payload = self._credentials()
+        return self._frame(AIOT_CMD_LOGIN, payload) if payload else None
+
+    def build_bind(self) -> bytes | None:
+        """Bind an unbound unit to these credentials (config flow only)."""
+        payload = self._credentials()
+        return self._frame(AIOT_CMD_BIND, payload) if payload else None
+
+    def reset_session(self) -> None:
+        self.logged_in = False
+        self._rx_buffer.clear()
+
+    @property
+    def session_ready(self) -> bool:
+        return self.logged_in
+
+    def build_session_frames(self, password: str | None) -> list[bytes]:
+        """Log in straight away; the 0x20 greeting may never come after a
+        quick reconnect, and the login works without it."""
+        self.reset_session()
+        login = self.build_login()
+        return [login] if login else []
+
+    # -- TX ----------------------------------------------------------------
+
+    def build_fan(self, on: bool) -> bytes:
+        return self._frame(
+            SCENT_TECH_CMD_CONTROL, bytes((AIOT_ACTION_FAN, 0x01 if on else 0x00, 0x00)),
+        )
+
+    def supports_fan(self) -> bool:
+        return True
+
+    def build_write_timer(self, timer: AromaIotTimer) -> bytes:
+        return self._frame(AIOT_CMD_WRITE_TIMER, timer.to_bytes())
+
+    # -- RX ----------------------------------------------------------------
+
+    def parse_notification(self, data: bytes) -> dict:
+        result: dict = {}
+        replies: list[bytes] = []
+        for frame in self._feed(bytes(data)):
+            command = frame[3]
+            payload = frame[4:-2]
+            if command == AIOT_RESP_HELLO:
+                replies.append(self._frame(AIOT_ACK_HELLO))
+                if not self.logged_in and (login := self.build_login()):
+                    replies.append(login)
+            elif command == AIOT_RESP_BIND and payload:
+                result["bind_result"] = payload[0]
+            elif command == AIOT_RESP_LOGIN and payload:
+                result["login_result"] = payload[0]
+                self.logged_in = payload[0] == 0
+                result["password_required"] = not self.logged_in
+                if not self.logged_in:
+                    _LOGGER.warning(
+                        "Aroma IOT: login refused (code %d) — the unit isn't bound to "
+                        "Home Assistant's credentials; re-add it to bind it", payload[0],
+                    )
+            elif command == SCENT_TECH_RESP_TIMERS:
+                timers = self._parse_timers(payload)
+                if timers is not None:
+                    result["timer_slots"] = timers
+            elif command == AIOT_RESP_WRITE_TIMER:
+                result["timer_write_ack"] = True
+                if payload and payload[0] != 0:
+                    _LOGGER.warning("Aroma IOT: device rejected the timer write (code %d)", payload[0])
+            elif command == AIOT_RESP_CONTROL and payload and payload[0] != 0:
+                _LOGGER.warning("Aroma IOT: device rejected the last operation (code %d)", payload[0])
+            elif command == AIOT_RESP_STATE_BATTERY and len(payload) >= 21:
+                # DeviceVo.parseDeviceStatus22 in the official app.
+                power = bool(payload[0] & 0x01)
+                result["power"] = power
+                result["phase"] = "idle" if power else "off"
+                result["fan"] = payload[1] > 0
+                result["lock"] = payload[2] > 0
+                result["battery"] = max(0, min(100, payload[4]))
+                if payload[8] == 0x80:
+                    result["oil_remaining"] = max(0, min(100, payload[7]))
+                replies.append(self._frame(AIOT_ACK_STATE_BATTERY))
+            elif command == SCENT_TECH_RESP_STATE and len(payload) >= 5:
+                # DeviceVo.parseDeviceStatus21 (mains models).
+                power = payload[0] > 0
+                result["power"] = power
+                result["phase"] = "idle" if power else "off"
+                result["fan"] = payload[1] > 0
+                result["lock"] = payload[2] > 0
+                if payload[4] == 0x80:
+                    result["oil_remaining"] = max(0, min(100, payload[3]))
+                replies.append(self._frame(AIOT_ACK_STATE_MAINS))
+        if replies:
+            result["reply_frames"] = replies
+        return result
+
+    @staticmethod
+    def _parse_timers(payload: bytes) -> dict[int, AromaIotTimer] | None:
+        """0x88 payload: u16 LE record count, then that many 14-byte records."""
+        if len(payload) < 2:
+            return None
+        count = int.from_bytes(payload[0:2], "little")
+        size = AIOT_TIMER_RECORD_SIZE
+        if len(payload) < 2 + count * size:
+            return None
+        return {
+            index + 1: AromaIotTimer.from_bytes(payload[2 + index * size:2 + (index + 1) * size])
+            for index in range(count)
+        }
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -2589,6 +2806,8 @@ def get_protocol(
     device_type: DeviceType,
     mac: str = "",
     pid: int | None = None,
+    aiot_nid: str | None = None,
+    aiot_code: str | None = None,
 ) -> BleProtocol:
     """Get the appropriate protocol handler for a device type.
 
@@ -2612,6 +2831,8 @@ def get_protocol(
         return AromelyAroMaxProtocol()
     elif device_type == DeviceType.SCENT_TECH:
         return ScentTechProtocol()
+    elif device_type == DeviceType.AROMA_IOT:
+        return AromaIotProtocol(nid=aiot_nid, code=aiot_code)
     raise ValueError(f"Unknown device type: {device_type}")
 
 
@@ -2704,6 +2925,10 @@ def detect_device_type(
     sm_type = _detect_scent_marketing(advertisement_data)
     if sm_type is not None:
         return sm_type
+
+    mfr_data = getattr(advertisement_data, "manufacturer_data", None) or {}
+    if any(mid in mfr_data for mid in AIOT_MFR_IDS):
+        return DeviceType.AROMA_IOT
 
     if _detect_aromely(advertisement_data):
         return DeviceType.AROMELY_ARO_MAX

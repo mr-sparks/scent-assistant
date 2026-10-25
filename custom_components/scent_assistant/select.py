@@ -9,7 +9,7 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, SCENT_TECH_WEEKDAY_ANY, DeviceType
+from .const import AIOT_TIMER_MODES, DOMAIN, SCENT_TECH_WEEKDAY_ANY, DeviceType
 from .device import ScentDiffuserDevice
 from .timer_entity import TIMER_SLOTS, ScentTechTimerEntity
 
@@ -60,6 +60,8 @@ async def async_setup_entry(
         entities.append(ScheduleModeSelect(device, entry))
     if device.device_type == DeviceType.SCENT_TECH:
         entities.extend(ScentTechTimerDays(device, slot) for slot in TIMER_SLOTS)
+    if device.device_type == DeviceType.AROMA_IOT:
+        entities.extend(AromaIotTimerDays(device, slot) for slot in TIMER_SLOTS)
 
     async_add_entities(entities)
 
@@ -127,3 +129,10 @@ class ScentTechTimerDays(ScentTechTimerEntity, SelectEntity):
         # Bit 7 is the apps' "at least one day selected" marker.
         weekdays = mask | (SCENT_TECH_WEEKDAY_ANY if mask else 0)
         await self._device.set_timer_slot(self._slot, weekdays=weekdays)
+
+
+class AromaIotTimerDays(ScentTechTimerDays):
+    """Weekdays of one Aroma IOT timer: only the app's fixed day patterns
+    can be stored, so offer just those."""
+
+    _attr_options = [_day_label(mask) for mask in AIOT_TIMER_MODES]

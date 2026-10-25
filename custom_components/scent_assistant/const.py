@@ -16,6 +16,7 @@ class DeviceType(StrEnum):
     SCENT_MARKETING_GW_XOR = "scent_marketing_gw_xor"  # Scent Marketing app, GW family with XOR-encrypted JSON payload
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
     SCENT_TECH = "scent_tech"                          # YooAI OEM, ScentLab / Scent Tech apps (FFE1, 55 AA … 5A frames)
+    AROMA_IOT = "aroma_iot"                            # YooAI OEM, Aroma IOT app (Tonemy "TMSJ-*"); Scent Tech framing + login/bind
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +251,47 @@ SM_GW_ALT_NOTIFY_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
 SM_GW_ALT_WRITE_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
 
 # ---------------------------------------------------------------------------
+# Aroma IOT (com.yooai.tommy, Tonemy "TMSJ-…") — Scent Tech framing (#49)
+# ---------------------------------------------------------------------------
+# Another YooAI firmware: same 55 AA … 5A frames, checksum, FFE1 channel,
+# 06 time, 07 <action> <value> 00 and 08 -> 88 timers as Scent Tech, but
+# 14-byte timer records, a login instead of the password, a pushed 0x22
+# battery-model state and per-record timer writes (0x04).
+#
+# Login: on connect the unit pushes 0x20 (MAC, serial and — while unbound —
+# a device key) and expects an 0xA0 ack. 0x02 logs in with a numeric id
+# and a code; a never-paired unit refuses (82 01) until it is BOUND with
+# 0x01 (same payload), and from then on accepts only that pair. Without a
+# login it answers reads, acks operations (87 00) but ignores them, and
+# rejects timer writes (84 01). The official app gets id + code from its
+# cloud; binding with HA's own pair locks that app out, so it is an
+# explicit opt-in in the config flow.
+AIOT_MFR_IDS = (0x4D54, 0x544D)     # "TM"; payload = ASCII type code
+AIOT_NAME_PREFIX = "TMSJ"
+AIOT_CMD_BIND = 0x01                # u16 len, nid ASCII, u16 len, code ASCII -> 0x81
+AIOT_CMD_LOGIN = 0x02               # same payload -> 0x82 (data[0] == 0: OK)
+AIOT_CMD_WRITE_TIMER = 0x04         # one 14-byte record (add/edit by id) -> 0x84
+AIOT_RESP_HELLO = 0x20              # ack with 0xA0
+AIOT_RESP_BIND = 0x81
+AIOT_RESP_LOGIN = 0x82
+AIOT_RESP_WRITE_TIMER = 0x84
+AIOT_RESP_CONTROL = 0x87            # data[0] == 0: accepted
+AIOT_RESP_STATE_BATTERY = 0x22      # ack with 0xA2
+AIOT_ACK_HELLO = 0xA0
+AIOT_ACK_STATE_MAINS = 0xA1
+AIOT_ACK_STATE_BATTERY = 0xA2
+AIOT_ACTION_FAN = 0x10
+AIOT_TIMER_RECORD_SIZE = 14         # mode u16, start u16, stop u16, run u16, pause u16, id u32
+# Timer "mode" = index into the app's day-pattern list (12 = every day).
+# Masks are bit0 Mon … bit6 Sun; no other day combinations can be stored.
+AIOT_TIMER_MODES = (
+    0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40,   # Mon … Sun
+    0x07, 0x0E, 0x1F, 0x60, 0x3F, 0x7F,         # Mon–Wed, Tue–Thu, Mon–Fri, Sat–Sun, Mon–Sat, every day
+    0x15, 0x2A, 0x4F,                           # Mon/Wed/Fri, Tue/Thu/Sat, Sun–Thu
+)
+AIOT_DEFAULT_TIMER_MODE = 12
+
+# ---------------------------------------------------------------------------
 # BLE name patterns for device detection
 # ---------------------------------------------------------------------------
 
@@ -277,6 +319,9 @@ BLE_NAME_PATTERNS = {
     # from Aroma-Link's "Scent " (space); before this entry they fell
     # through to the Aroma-Link default and never answered (#30).
     DeviceType.SCENT_TECH: ["Scent-"],
+    # "TMSJ" — Aroma IOT units (Tonemy). Usually matched by their "TM"
+    # manufacturer data first; the name is only in the scan response.
+    DeviceType.AROMA_IOT: ["TMSJ"],
 }
 
 # Aroma-Link name code: the second dot part of "<name>.<code>.<suffix>".
@@ -570,6 +615,8 @@ CONF_MOMENTARY_SECONDS = "momentary_seconds"
 # firmware sometimes ships locked; setting this lets the device accept
 # our control commands).
 CONF_GW_PASSWORD = "gw_password"
+CONF_AIOT_NID = "aiot_nid"          # Aroma IOT binding id (numeric string)
+CONF_AIOT_CODE = "aiot_code"        # Aroma IOT binding code
 
 # ---------------------------------------------------------------------------
 # Defaults

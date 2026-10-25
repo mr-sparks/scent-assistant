@@ -58,6 +58,12 @@ async def async_setup_entry(
         if device.state.has_battery is not False:
             entities.append(DiffuserBatterySensor(device, entry))
 
+    # Aroma IOT battery models push battery % (and oil % on models that
+    # measure it) in their 0x22 state.
+    if device.device_type == DeviceType.AROMA_IOT:
+        entities.append(DiffuserBatterySensor(device, entry))
+        entities.append(DiffuserOilSensor(device, entry))
+
     if device.device_type in SCENT_MARKETING_TYPES:
         entities.append(DiffuserDetectionDiagnostic(device, entry))
 

@@ -55,6 +55,7 @@
 | Scent Marketing diffusers (SA_* series) | Scent Marketing | BLE | V2 + V3 variants; Power, Fan, Program switch, intensity, schedule read-back |
 | Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
 | Aromely Aro Max | Aromely | BLE | Power, Fan, daily schedule (work/pause), HVAC scent diffuser |
+| Aroma IOT diffusers (Tonemy, `TMSJ-…`) | Aroma IOT | BLE | Power, Fan, battery, per-timer schedules; needs a one-time **bind** at setup, which locks out the Aroma IOT app |
 
 ### Likely Compatible
 

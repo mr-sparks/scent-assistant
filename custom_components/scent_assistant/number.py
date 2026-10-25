@@ -28,7 +28,7 @@ async def async_setup_entry(
         async_add_entities([ScentimentLevelNumber(device, entry)])
         return
     # Scent Tech has per-slot durations instead of one work/pause pair.
-    if device.device_type == DeviceType.SCENT_TECH:
+    if device.device_type in (DeviceType.SCENT_TECH, DeviceType.AROMA_IOT):
         async_add_entities(
             ScentTechTimerDuration(device, slot, field)
             for slot in TIMER_SLOTS

@@ -23,6 +23,8 @@ from .const import (
     CONF_CLOUD_PASSWORD,
     CONF_CLOUD_DEVICE_ID,
     CONF_CONNECTION_MODE,
+    CONF_AIOT_NID,
+    CONF_AIOT_CODE,
     CONF_MOMENTARY_SECONDS,
     BLE_REFRESH_INTERVAL_SECONDS,
     BLE_INITIAL_REFRESH_RETRY_SECONDS,
@@ -77,7 +79,7 @@ SET_SCHEDULE_DEFAULTS = {
     "enabled": True,
 }
 
-SET_SCHEDULE_UNSUPPORTED = {DeviceType.SCENT_TECH, DeviceType.SCENTIMENT}
+SET_SCHEDULE_UNSUPPORTED = {DeviceType.SCENT_TECH, DeviceType.AROMA_IOT, DeviceType.SCENTIMENT}
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -113,6 +115,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cloud_device_id=cloud_device_id,
         sm_metadata=entry.data.get("sm_metadata"),
         gw_password=entry.data.get("gw_password"),
+        aiot_nid=entry.data.get(CONF_AIOT_NID),
+        aiot_code=entry.data.get(CONF_AIOT_CODE),
     )
 
     # Restore local configuration before setting up the device and platforms.

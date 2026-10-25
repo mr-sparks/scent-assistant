@@ -31,7 +31,7 @@ async def async_setup_entry(
         entities.append(MomentaryDiffuseButton(device, entry))
     # Scent Tech is not polled (every connect beeps), so schedules changed
     # in the official app only show up after a manual read.
-    if device.device_type == DeviceType.SCENT_TECH:
+    if device.device_type in (DeviceType.SCENT_TECH, DeviceType.AROMA_IOT):
         entities.append(RefreshSchedulesButton(device, entry))
     async_add_entities(entities)
 
