@@ -344,4 +344,4 @@ class ScentTechTimerDuration(ScentTechTimerEntity, NumberEntity):
         return float(getattr(self.timer, self._field)) if self.timer else None
 
     async def async_set_native_value(self, value: float) -> None:
-        await self._device.set_timer_slot(self._slot, **{self._field: int(value)})
+        await self._async_set_timer_fields(**{self._field: int(value)})

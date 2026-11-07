@@ -203,6 +203,8 @@ These diffusers hold five independent schedules; each one gets its own set of en
 
 Every change reads the schedule from the device first and writes back only the field you changed. If the device has a password set in the app, enter it during setup.
 
+Schedule changes are successful only when a fresh read-back matches the entire edited record. An acknowledgement alone is not enough. If confirmation is missing or differs, the Home Assistant action reports an error and keeps the last values read from the device, without retrying the write automatically. The device may still have applied an unconfirmed change; refresh and check the schedule before making another change.
+
 ---
 
 ## &#x2699;&#xFE0F; Services

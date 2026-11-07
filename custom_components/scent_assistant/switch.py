@@ -258,7 +258,7 @@ class ScentTechTimerSwitch(ScentTechTimerEntity, SwitchEntity):
         return self.timer.enabled if self.timer else None
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._device.set_timer_slot(self._slot, enabled=True)
+        await self._async_set_timer_fields(enabled=True)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._device.set_timer_slot(self._slot, enabled=False)
+        await self._async_set_timer_fields(enabled=False)
