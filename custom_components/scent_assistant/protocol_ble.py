@@ -10,6 +10,8 @@ from .const import (
     DeviceType,
     SERVICE_UUID, CHAR_WRITE_UUID, CHAR_NOTIFY_UUID,
     SCENTIMENT_SERVICE_UUID, SCENTIMENT_CHAR_WRITE_UUID, SCENTIMENT_CHAR_NOTIFY_UUID,
+    SCENTIMENT_CHARGE_STATES, SCENTIMENT_BATTERY_FULL_CODE,
+    AROMELY_AF30_EXCLUDED_NAME_PREFIXES,
     SM_AK_SERVICE_UUID, SM_AK_CHAR_UUID,
     SM_AK_CMD_QUERY_INFO, SM_AK_CMD_PROBE, SM_AK_CMD_QUERY_DEVICE_TYPE,
     SM_AK_CMD_TIME_SYNC, SM_AK_CMD_DEVICE_NAME, SM_AK_CMD_DEVICE_LABEL,
@@ -114,6 +116,7 @@ class DiffuserState:
     # Scentiment-only
     level: int | None = None           # spray intensity 1-3
     battery: int | None = None         # battery percent
+    charge_state: str | None = None    # "discharging" / "charging" / "full"
     rgb_on: bool | None = None         # RGB LED on/off
     rgb_color: tuple[int, int, int] | None = None  # (r, g, b) 0-255
     start_hour: int = 0
@@ -938,6 +941,36 @@ class ScentimentProtocol(BleProtocol):
         # The device pushes state via notifications; no explicit query needed.
         return b""
 
+    @staticmethod
+    def _battery(value: int) -> int:
+        # Bat:200 / byte 6 = 200 means "full on external power" (#42).
+        if value == SCENTIMENT_BATTERY_FULL_CODE:
+            return 100
+        return max(0, min(100, value))
+
+    @classmethod
+    def _parse_status_frame(cls, frame) -> dict:
+        """Charge state and battery from the binary {"data": [...]} frame.
+
+        16 bytes `55 AA 0B FF …`. Byte 5 = `C:` and byte 6 = `Bat:` of the
+        text status, matched on every text line in holmzee's Mini 2 log
+        (#42). The binary frame comes with every state change, the text
+        line only every ~4 min, so this keeps the battery current. Byte 7
+        (oil?) stays unmapped: 50 → 100 with no refill on the Air 2.
+        """
+        if (
+            not isinstance(frame, list)
+            or len(frame) < 16
+            or frame[0] != 0x55
+            or frame[1] != 0xAA
+            or not all(isinstance(b, int) for b in frame)
+        ):
+            return {}
+        result: dict = {"battery": cls._battery(frame[6])}
+        if frame[5] in SCENTIMENT_CHARGE_STATES:
+            result["charge_state"] = SCENTIMENT_CHARGE_STATES[frame[5]]
+        return result
+
     def parse_notification(self, data: bytes) -> dict:
         try:
             text = data.decode("utf-8", errors="replace").strip()
@@ -954,12 +987,9 @@ class ScentimentProtocol(BleProtocol):
             try:
                 parsed = json.loads(text)
                 if isinstance(parsed, dict):
-                    # Binary status frame `{"data": [55 AA 0B FF …]}`, 16
-                    # bytes (#42). Not decoded: byte 7 looked like oil but
-                    # went 50 → 100 with no refill, and byte 6 = 200 next
-                    # to Bat:200 is a single sample. Dropped, not mapped.
-                    parsed.pop("data", None)
+                    frame = parsed.pop("data", None)
                     result.update(parsed)
+                    result.update(self._parse_status_frame(frame))
             except Exception:
                 _LOGGER.debug("Scentiment: unparseable JSON notification: %r", text)
             return result
@@ -982,9 +1012,9 @@ class ScentimentProtocol(BleProtocol):
                 elif key == "l":
                     result["level"] = n
                 elif key == "bat":
-                    # Units report Bat:200 once full on external power
-                    # (#42) — a status code, not a percentage.
-                    result["battery"] = max(0, min(100, n))
+                    result["battery"] = self._battery(n)
+                elif key == "c" and n in SCENTIMENT_CHARGE_STATES:
+                    result["charge_state"] = SCENTIMENT_CHARGE_STATES[n]
             return result
 
         # Single key:value notification
@@ -1696,8 +1726,10 @@ class ScentMarketingAkProtocol(BleProtocol):
             # V3 reply to C7: `48 <16 utf8 bytes, zero-padded>`. We
             # surface it as the device_name fallback when no name has
             # come through yet — it's the user-visible "scene name" in
-            # the official app (e.g. "Evasion").
-            label = bytes(data[1:]).rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+            # the official app (e.g. "Evasion"). Multi-pump units (A309,
+            # #22) send one 16-byte block per endpoint; only the first
+            # belongs to the endpoint this entry controls.
+            label = bytes(data[1:17]).split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
             if label:
                 result.setdefault("device_label", label)
 
@@ -2732,13 +2764,16 @@ def _detect_aromely(advertisement_data) -> bool:
     """
     if advertisement_data is None:
         return False
-    uuids = getattr(advertisement_data, "service_uuids", None) or []
-    for u in uuids:
-        if str(u).lower() == AROMELY_ADV_SERVICE_UUID or str(u).lower().startswith("0000af30"):
-            return True
     mfr_data = getattr(advertisement_data, "manufacturer_data", None) or {}
     for payload in mfr_data.values():
         if b"AroMax" in payload or b"DiffuserAro" in payload:
+            return True
+    name = (getattr(advertisement_data, "local_name", None) or "").upper()
+    if name.startswith(AROMELY_AF30_EXCLUDED_NAME_PREFIXES):
+        return False
+    uuids = getattr(advertisement_data, "service_uuids", None) or []
+    for u in uuids:
+        if str(u).lower() == AROMELY_ADV_SERVICE_UUID or str(u).lower().startswith("0000af30"):
             return True
     return False
 

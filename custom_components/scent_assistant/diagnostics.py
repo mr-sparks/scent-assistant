@@ -45,6 +45,7 @@ async def async_get_config_entry_diagnostics(
             "level": s.level,
             "battery": s.battery,
             "has_battery": s.has_battery,
+            "charge_state": s.charge_state,
             "oil_remaining": s.oil_remaining,
             "oil_current_ml": s.oil_current_ml,
             "oil_max_ml": s.oil_max_ml,
@@ -125,5 +126,6 @@ async def async_get_config_entry_diagnostics(
         "state": state_snapshot,
         "recent_notifications_hex": device.recent_notifications if device else [],
         "recent_commands_hex": device.recent_commands if device else [],
+        "frame_log": device.frame_log if device else [],
     }
     return payload

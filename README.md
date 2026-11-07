@@ -156,6 +156,7 @@ The set of entities depends on which device family is connected.
 | Level | Number | Spray intensity (1–3) |
 | LED | Light | RGB color picker + on/off |
 | Battery | Sensor | Battery percentage (100 % when full on external power) |
+| Charge state | Sensor | `discharging` / `charging` / `full` (diagnostic) |
 
 ### Scent Marketing AK family
 

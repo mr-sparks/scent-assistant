@@ -15,12 +15,14 @@ from bleak import BleakClient, BleakScanner, BleakError
 from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from .const import (
     DeviceType,
     BLE_CONNECT_MAX_ATTEMPTS,
+    BLE_PASSIVE_ONLY_RECENT_SECONDS,
+    DIAG_FRAME_LOG_MAX,
     BLE_INITIAL_REFRESH_RETRY_SECONDS,
     BLE_INITIAL_SILENT_READS_MAX,
     SM_AK_CY_PUSH_SETTLE_SECONDS,
@@ -71,6 +73,10 @@ AL_WEEK_QUERY_MAX_ATTEMPTS = 3
 DEFAULT_MOMENTARY_SECONDS = 30
 
 
+class _NoConnectableScanner(BleakError):
+    """No connectable adapter or proxy has registered yet (HA startup)."""
+
+
 class ScentDiffuserDevice:
     """Manages a single scent diffuser via BLE and/or cloud."""
 
@@ -98,6 +104,10 @@ class ScentDiffuserDevice:
         # Trace ring-buffer for the diagnostics download.
         self._recent_notifications: list[str] = []
         self._recent_commands: list[str] = []
+        # Both directions in arrival order with wall-clock time, so a
+        # diagnostics download shows what the device answered to which
+        # write (#22's fan flicker couldn't be ordered without it).
+        self._frame_log: list[str] = []
         # BLE
         self._ble_address = ble_address
         self._ble_name = ble_name or ""
@@ -210,6 +220,16 @@ class ScentDiffuserDevice:
     @property
     def recent_commands(self) -> list[str]:
         return list(self._recent_commands)
+
+    @property
+    def frame_log(self) -> list[str]:
+        return list(self._frame_log)
+
+    def _log_frame(self, arrow: str, data: bytes) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self._frame_log.append(f"{stamp} {arrow} {data.hex()}")
+        if len(self._frame_log) > DIAG_FRAME_LOG_MAX:
+            del self._frame_log[0]
 
     @property
     def ble_write_response(self) -> bool | None:
@@ -425,17 +445,14 @@ class ScentDiffuserDevice:
                 target = self._ble_address
                 if self._hass is not None:
                     if bluetooth.async_scanner_count(self._hass, connectable=True) == 0:
-                        raise BleakError(
+                        raise _NoConnectableScanner(
                             "no connectable Bluetooth adapter or proxy is ready yet"
                         )
                     target = self._ha_ble_device()
                     if target is None or not bluetooth.async_scanner_devices_by_address(
                         self._hass, self._ble_address, connectable=True
                     ):
-                        raise BleakError(
-                            "not currently seen by any Bluetooth adapter or proxy"
-                            + self._last_seen_hint()
-                        )
+                        raise BleakError(self._unseen_reason())
                 # Use bleak_retry_connector for robust connection
                 # establishment (handles transient failures with
                 # exponential backoff and is required by HA's bluetooth
@@ -621,7 +638,16 @@ class ScentDiffuserDevice:
                 return True
 
             except (BleakError, asyncio.TimeoutError, OSError) as err:
-                _LOGGER.warning("BLE connect failed for %s: %s", self._ble_name, err)
+                # During startup the proxies connect after the integrations
+                # load; the read is retried once one sees the device.
+                quiet = (
+                    isinstance(err, _NoConnectableScanner)
+                    and self._hass is not None
+                    and self._hass.state is not CoreState.running
+                )
+                (_LOGGER.debug if quiet else _LOGGER.warning)(
+                    "BLE connect failed for %s: %s", self._ble_name, err
+                )
                 await self._teardown_ble_client()
                 self._ble_last_failure_ts = loop.time()
                 return False
@@ -665,6 +691,27 @@ class ScentDiffuserDevice:
         return bluetooth.async_ble_device_from_address(
             self._hass, self._ble_address, connectable=True,
         )
+
+    def _unseen_reason(self) -> str:
+        """Why no connectable scanner can reach the device right now.
+
+        Passive scanners (Shelly, or proxies without active connections)
+        report advertisements but can't connect, so a device heard only
+        by them looks present in HA's advertisement monitor while every
+        connect fails (#47).
+        """
+        # Callers only get here when no connectable scanner currently
+        # lists the device, so a fresh advertisement came via a passive one.
+        info = bluetooth.async_last_service_info(
+            self._hass, self._ble_address, connectable=False
+        )
+        if info is not None and time.monotonic() - info.time < BLE_PASSIVE_ONLY_RECENT_SECONDS:
+            return (
+                "seen only by passive Bluetooth scanners, which can't connect "
+                "(e.g. Shelly); it needs an ESPHome Bluetooth proxy or an "
+                "adapter in range" + self._last_seen_hint()
+            )
+        return "not currently seen by any Bluetooth adapter or proxy" + self._last_seen_hint()
 
     def _last_seen_hint(self) -> str:
         """Describe the last advertisement HA got, for connect warnings.
@@ -789,6 +836,7 @@ class ScentDiffuserDevice:
             self._recent_commands.append(data.hex())
             if len(self._recent_commands) > 10:
                 del self._recent_commands[0]
+            self._log_frame("->", data)
         with_response = self._write_needs_response()
         for chunk in chunks:
             await self._ble_client.write_gatt_char(
@@ -829,6 +877,7 @@ class ScentDiffuserDevice:
         self._recent_notifications.append(raw.hex())
         if len(self._recent_notifications) > 20:
             del self._recent_notifications[0]
+        self._log_frame("<-", raw)
         updates = self._protocol.parse_notification(raw)
         if not updates:
             return
@@ -869,6 +918,9 @@ class ScentDiffuserDevice:
             changed = True
         if "battery" in updates:
             self._state.battery = updates["battery"]
+            changed = True
+        if "charge_state" in updates:
+            self._state.charge_state = updates["charge_state"]
             changed = True
         if "has_fan" in updates:
             self._state.has_fan = updates["has_fan"]

@@ -13,7 +13,7 @@ from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, DeviceType
+from .const import DOMAIN, SCENTIMENT_CHARGE_STATES, DeviceType
 from .device import ScentDiffuserDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ async def async_setup_entry(
     ]
     if device.device_type == DeviceType.SCENTIMENT:
         entities.append(DiffuserBatterySensor(device, entry))
+        entities.append(DiffuserChargeStateSensor(device, entry))
 
     if device.device_type in GW_TYPES:
         entities.append(DiffuserBatterySensor(device, entry))
@@ -140,6 +141,36 @@ class DiffuserBatterySensor(SensorEntity):
     @property
     def available(self) -> bool:
         return self._device.available and self._device.state.battery is not None
+
+
+class DiffuserChargeStateSensor(SensorEntity):
+    """Scentiment charge state: discharging / charging / full (#42)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Charge state"
+    _attr_icon = "mdi:battery-charging"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(SCENTIMENT_CHARGE_STATES.values())
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_charge_state"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> str | None:
+        return self._device.state.charge_state
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and self._device.state.charge_state is not None
 
 
 class DiffuserOilSensor(SensorEntity):

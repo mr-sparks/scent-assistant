@@ -32,6 +32,11 @@ SCENTIMENT_SERVICE_UUID = "00000180-0000-1000-8000-00805f9b34fb"
 SCENTIMENT_CHAR_WRITE_UUID = "0000dead-0000-1000-8000-00805f9b34fb"  # Commands (JSON)
 SCENTIMENT_CHAR_NOTIFY_UUID = "0000fef3-0000-1000-8000-00805f9b34fb"  # State notifications
 SCENTIMENT_CHAR_INFO_UUID = "0000fef4-0000-1000-8000-00805f9b34fb"   # Device metadata (read)
+# Charge state = the `C:` field of the text status, mirrored in byte 5 of
+# the binary {"data": [...]} frame (#42, holmzee's Mini 2 log). Battery
+# (`Bat:`, byte 6) reads 200 while in SCENTIMENT_CHARGE_FULL.
+SCENTIMENT_CHARGE_STATES = {0: "discharging", 1: "charging", 2: "full"}
+SCENTIMENT_BATTERY_FULL_CODE = 200
 
 # Scent Marketing app — AK family (FFF0 service, simple byte commands + heartbeat)
 SM_AK_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
@@ -50,6 +55,11 @@ AROMELY_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 AROMELY_CHAR_WRITE_UUID = "0000ffe2-0000-1000-8000-00805f9b34fb"
 AROMELY_CHAR_NOTIFY_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 AROMELY_ADV_SERVICE_UUID = "0000af30-0000-1000-8000-00805f9b34fb"
+# Other products that advertise AF30 too: Hi-Link HLK-LD2450 mmWave radars
+# (on by default in every Everything Presence Lite, #56). An AF30-only
+# match is rejected for these local-name prefixes; the "AroMax" marker in
+# the manufacturer data still wins.
+AROMELY_AF30_EXCLUDED_NAME_PREFIXES = ("HLK-",)
 
 # Frame: 55 <dir> <reg> <type> [<len> <payload...>] <checksum>
 # checksum = sum of every byte after the 0x55 header, mod 256.
@@ -527,6 +537,11 @@ BLE_REFRESH_INTERVAL_SECONDS = 300
 # retries on top of ours, so keeping this low avoids 6-8 rapid connect
 # attempts that can wedge some firmwares.
 BLE_CONNECT_MAX_ATTEMPTS = 2
+# A connect that finds no connectable scanner, while an advertisement
+# arrived this recently, means only passive scanners hear the device (#47).
+BLE_PASSIVE_ONLY_RECENT_SECONDS = 60
+# Timestamped frames (both directions) kept for the diagnostics download.
+DIAG_FRAME_LOG_MAX = 60
 
 # A BLE device HA can't reach at setup (not yet seen after a restart,
 # switched off, proxy still connecting) gets its first state read
