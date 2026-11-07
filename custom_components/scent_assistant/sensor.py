@@ -89,6 +89,14 @@ async def async_setup_entry(
         entities.append(DiffuserOilConsumptionSensor(device, entry))
         entities.append(DiffuserOilDaysSensor(device, entry))
 
+    # AI-Diffuser 0A frame: volume (once the oil is set in the app),
+    # bottle capacity and the consumption rate.
+    if device.device_type == DeviceType.AI_DIFFUSER:
+        entities.append(DiffuserOilSensor(device, entry))
+        entities.append(DiffuserOilCurrentSensor(device, entry))
+        entities.append(DiffuserOilCapacitySensor(device, entry))
+        entities.append(DiffuserOilConsumptionSensor(device, entry))
+
     async_add_entities(entities)
 
 

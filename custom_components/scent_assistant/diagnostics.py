@@ -123,6 +123,7 @@ async def async_get_config_entry_diagnostics(
             "silent_state_reads": device.silent_state_reads if device else None,
             "ak_cy_variant": device.ak_cy_variant if device else None,
             "gw_gear_limits": device.gw_gear_limits if device else None,
+            "ai_diffuser_schedule": device.ai_diffuser_schedule if device else None,
             "supports_fan": device.supports_fan if device else None,
             "supports_cloud": device.supports_cloud if device else None,
             "schedule_window_read": device.schedule_window_read if device else None,

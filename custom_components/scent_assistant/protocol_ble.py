@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from .const import (
     DeviceType,
@@ -68,6 +68,11 @@ from .const import (
     AROMELY_REG_TIME, AROMELY_REG_SCHED_WRITE, AROMELY_REG_FAN,
     AROMELY_REG_SESSION, AROMELY_REG_POWER, AROMELY_REG_NAME,
     AROMELY_REG_LABEL, AROMELY_REG_SCHED1,
+    AI_DIFFUSER_SERVICE_UUID, AI_DIFFUSER_CHAR_UUID, AI_DIFFUSER_ADV_SERVICE_UUIDS,
+    AI_DIFFUSER_CMD_STATUS, AI_DIFFUSER_CMD_GEAR, AI_DIFFUSER_CMD_CUSTOM,
+    AI_DIFFUSER_CMD_HARDWARE, AI_DIFFUSER_CMD_WEEK, AI_DIFFUSER_CMD_OIL,
+    AI_DIFFUSER_SUB_TIME, AI_DIFFUSER_SUB_POWER, AI_DIFFUSER_SUB_SLOT,
+    AI_DIFFUSER_SUB_WEEK, AI_DIFFUSER_SLOTS,
     BLE_NAME_PATTERNS,
     AL_NAME_CODES,
     TUYA_HEADER, TUYA_VERSION,
@@ -2728,6 +2733,453 @@ class ScentTechProtocol(BleProtocol):
 
 
 # ---------------------------------------------------------------------------
+# AI-Diffuser app (com.lm.aidiffuser) — JSON-wrapped FE EF frames
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AiDiffuserSlot:
+    """One of the six schedule slots, as read from a 06/07 table frame."""
+
+    start_hour: int = 0
+    start_minute: int = 0
+    end_hour: int = 0
+    end_minute: int = 0
+    work_seconds: int = 0
+    pause_seconds: int = 0
+    enabled: bool = False
+
+
+class AiDiffuserProtocol(BleProtocol):
+    """AI-Diffuser app devices (e.g. ADS644BT), decoded from the Android app.
+
+    Transport: one Telink characteristic (2b10) carries both directions.
+    Commands are JSON envelopes ``{"TYPE":4,"ID":"0","TO":"<mac as
+    decimal>","MSG":"order:FEEF…EFFF"}`` holding a 24-byte frame. Replies
+    are JSON objects whose ``ALL`` holds the frame as space-separated hex;
+    64-byte frames arrive as two parts (``num``/``duan``). The device also
+    echoes each command envelope back, which is ignored here. BLE
+    notifications are split at the ATT MTU, so objects are reassembled
+    from a text buffer before decoding.
+
+    No login: the app only *reads* the device password (02) and compares
+    it locally.
+    """
+
+    device_type = DeviceType.AI_DIFFUSER
+    service_uuid = AI_DIFFUSER_SERVICE_UUID
+    write_char_uuid = AI_DIFFUSER_CHAR_UUID
+    notify_char_uuid = AI_DIFFUSER_CHAR_UUID
+    # Polled: connecting and reading are silent. Only the clock write
+    # (00 07) makes the unit beep three times, so the clock is never set
+    # automatically — the Sync Time button does it on demand.
+    periodic_refresh = True
+
+    _RX_MAX = 4096
+    _FRAME_LEN = 24
+
+    def __init__(self, mac: str = "") -> None:
+        mac = (mac or "").replace(":", "")
+        try:
+            self._to_id = str(int(mac, 16)) if mac else "0"
+        except ValueError:
+            self._to_id = "0"
+        if self._to_id == "0":
+            # macOS (CoreBluetooth) hands out UUIDs instead of MACs. The
+            # ADS644BT ignores TO, so "0" still works there.
+            _LOGGER.debug("AI-Diffuser: address %r is not a MAC, sending TO \"0\"", mac)
+        self.reset_rx()
+        # Last-read device data, kept so writes can reuse what the device
+        # reported (gear/pump bytes, day masks) and so derived fields can
+        # be recomputed whichever frame arrives last.
+        self._tables: dict[int, list[AiDiffuserSlot]] = {}
+        self._day_masks: list[int] | None = None
+        self._gears: list[int] | None = None
+        self._pumps: list[int] | None = None
+        self._gear_mode: bool | None = None
+        self._active_index: int | None = None   # 0-based slot the device is in
+        self._edit_index: int | None = None     # 0-based slot schedule edits target
+        self.model: str | None = None
+        self.hardware_version: str | None = None
+        # The full read-back runs once per HA session; later connects (the
+        # 5-minute refresh, commands) only send what they need, which also
+        # leaves fewer frames to lose on a weak link.
+        self.full_read_needed = True
+
+    @property
+    def schedule_known(self) -> bool:
+        """True once the mode, the day masks and the active table were read.
+
+        Slot writes rebuild the whole slot record from these; writing
+        before they're known would overwrite the slot with defaults.
+        """
+        if self._gear_mode is None or self._day_masks is None:
+            return False
+        active = AI_DIFFUSER_CMD_GEAR if self._gear_mode else AI_DIFFUSER_CMD_CUSTOM
+        return active in self._tables
+
+    def diagnostics(self) -> dict:
+        """Parsed schedule state for the diagnostics download."""
+        return {
+            "gear_mode": self._gear_mode,
+            "active_slot": self._active_index + 1 if self._active_index is not None else None,
+            "edit_slot": self.active_slot,
+            "full_read_needed": self.full_read_needed,
+            "day_masks": [f"{m:02X}" for m in self._day_masks] if self._day_masks else None,
+            "gears": self._gears,
+            "pumps": [f"{p:02X}" for p in self._pumps] if self._pumps else None,
+            "tables": {
+                f"{kind:02X}": [asdict(slot) for slot in slots]
+                for kind, slots in self._tables.items()
+            },
+            "model": self.model,
+            "hardware_version": self.hardware_version,
+        }
+
+    def session_frames(self) -> list[bytes]:
+        """Frames to send right after connecting (never the clock: it beeps)."""
+        return self.build_read_queries() if self.full_read_needed else []
+
+    def reset_rx(self) -> None:
+        self._rx = ""
+        self._parts: list[str] = []
+
+    # ---- encoding -------------------------------------------------------
+
+    @classmethod
+    def _frame(cls, *payload: int) -> str:
+        body = bytes([0xFE, 0xEF, *payload])
+        body += bytes(cls._FRAME_LEN - 2 - len(body)) + b"\xEF\xFF"
+        return body.hex().upper()
+
+    def _envelope(self, frame_hex: str) -> bytes:
+        msg = {"TYPE": 4, "ID": "0", "TO": self._to_id, "MSG": "order:" + frame_hex}
+        return json.dumps(msg, separators=(",", ":")).encode("utf-8")
+
+    def _read(self, cmd: int) -> bytes:
+        return self._envelope(self._frame(cmd))
+
+    def build_query(self) -> bytes:
+        return self._read(AI_DIFFUSER_CMD_STATUS)
+
+    def build_oil_query(self) -> bytes:
+        return self._read(AI_DIFFUSER_CMD_OIL)
+
+    def build_week_query(self) -> bytes:
+        return self._read(AI_DIFFUSER_CMD_WEEK)
+
+    def build_table_query(self) -> bytes:
+        """Read the schedule table of the mode the device is in."""
+        return self._read(AI_DIFFUSER_CMD_GEAR if self._gear_mode else AI_DIFFUSER_CMD_CUSTOM)
+
+    def build_read_queries(self) -> list[bytes]:
+        """Read-back sent after every connect (mirrors OrderSender.searchAll)."""
+        return [
+            self._read(AI_DIFFUSER_CMD_HARDWARE),
+            self._read(AI_DIFFUSER_CMD_WEEK),
+            self._read(AI_DIFFUSER_CMD_CUSTOM),
+            self._read(AI_DIFFUSER_CMD_GEAR),
+            self._read(AI_DIFFUSER_CMD_OIL),
+            self._read(AI_DIFFUSER_CMD_STATUS),
+        ]
+
+    def build_power(self, on: bool) -> bytes:
+        # Verified on an ADS644BT: 00 starts the program, 01 stops it.
+        return self._envelope(self._frame(0x00, AI_DIFFUSER_SUB_POWER, 0x00 if on else 0x01))
+
+    def build_time_sync(self, now: datetime | None = None) -> bytes:
+        if now is None:
+            # Local wall-clock time, which the schedule windows run on.
+            # The HA process zone is often UTC in containers, so use HA's
+            # configured zone (same as Scent Tech).
+            try:
+                from homeassistant.util import dt as dt_util
+                now = dt_util.now()
+            except ImportError:
+                now = datetime.now().astimezone()
+        return self._envelope(self._frame(
+            0x00, AI_DIFFUSER_SUB_TIME,
+            (now.year >> 8) & 0xFF, now.year & 0xFF, now.month, now.day,
+            now.isoweekday(), now.hour, now.minute, now.second,
+        ))
+
+    @property
+    def active_slot(self) -> int:
+        """1-based slot that schedule edits apply to."""
+        return (self._edit_index if self._edit_index is not None else 0) + 1
+
+    def build_schedule(self, slot: ScheduleSlot, weekday_mask: int | None = None) -> list[bytes]:
+        """Write the slot the device is in (the single-schedule entities)."""
+        return self.build_slot_frames(
+            self.active_slot,
+            slot.start_hour, slot.start_minute, slot.end_hour, slot.end_minute,
+            slot.work_seconds, slot.pause_seconds, slot.enabled, weekday_mask,
+        )
+
+    def build_slot_frames(
+        self, n: int,
+        start_hour: int, start_minute: int, end_hour: int, end_minute: int,
+        work_seconds: int, pause_seconds: int, enabled: bool,
+        weekday_mask: int | None = None,
+    ) -> list[bytes]:
+        """Slot write (00 18) followed by its day-mask write (00 14).
+
+        Layout from TimerSetFragment.SendRunnable. Times and durations go
+        out big-endian although the device reports them little-endian —
+        that is what the app does. Gear and pump bytes are written back as
+        read so an edit doesn't change them. Day mask: bit 0 = Monday …
+        bit 6 = Sunday (TimeUtils.getWeekData).
+        """
+        i = n - 1
+        gear_mode = bool(self._gear_mode)
+        gear = self._gears[i] if self._gears else 0
+        if gear == 0xFF:
+            gear = 0
+        # The app only ever writes 00 or a 10/11/12 pump selection; an
+        # unused slot reads back FF, which must not be echoed.
+        pump = self._pumps[i] if self._pumps else 0
+        if pump not in (0x10, 0x11, 0x12):
+            pump = 0x00
+        work = 0 if gear_mode else max(0, min(0xFFFF, int(work_seconds)))
+        pause = 0 if gear_mode else max(0, min(0xFFFF, int(pause_seconds)))
+        if weekday_mask is None:
+            weekday_mask = self._day_masks[i] if self._day_masks else 0x7F
+        slot_frame = self._frame(
+            0x00, AI_DIFFUSER_SUB_SLOT, 0x01 if gear_mode else 0x00, n,
+            start_hour, start_minute, end_hour, end_minute,
+            work >> 8, work & 0xFF, pause >> 8, pause & 0xFF,
+            0x05, 0x0A,
+            0x00 if enabled else (1 << i),
+            gear & 0xFF, 0x00, 0x00, 0x00, pump & 0xFF,
+        )
+        week_frame = self._frame(
+            0x00, AI_DIFFUSER_SUB_WEEK, 0x01 if gear_mode else 0x00, n,
+            weekday_mask & 0x7F,
+        )
+        return [self._envelope(slot_frame), self._envelope(week_frame)]
+
+    def build_timer_frames(self, n: int, timer: "ScentTechTimer") -> list[bytes]:
+        """Write one slot from the shared per-slot record (Schedule N entities)."""
+        return self.build_slot_frames(
+            n,
+            timer.start_minute // 60, timer.start_minute % 60,
+            timer.stop_minute // 60, timer.stop_minute % 60,
+            timer.run_seconds, timer.pause_seconds, timer.enabled,
+            timer.weekdays & 0x7F,
+        )
+
+    # ---- decoding -------------------------------------------------------
+
+    def parse_notification(self, data: bytes) -> dict:
+        self._rx += data.decode("utf-8", errors="replace")
+        if len(self._rx) > self._RX_MAX:
+            _LOGGER.debug("AI-Diffuser: RX buffer overflow, dropping %d chars", len(self._rx))
+            self.reset_rx()
+            return {}
+        result: dict = {}
+        # Every object the device sends is flat JSON whose strings hold no
+        # braces, so an object ends at the first "}" after its "{". A "{"
+        # before that "}" means the previous object lost its tail (a
+        # dropped notification): skip to the new one instead of waiting
+        # on an object that will never complete.
+        while True:
+            start = self._rx.find("{")
+            if start < 0:
+                self._rx = ""
+                break
+            close = self._rx.find("}", start)
+            following = self._rx.find("{", start + 1)
+            if following >= 0 and (close < 0 or following < close):
+                _LOGGER.debug("AI-Diffuser: dropping truncated object %r", self._rx[start:following])
+                self._rx = self._rx[following:]
+                continue
+            if close < 0:
+                self._rx = self._rx[start:]   # rest arrives in the next notification
+                break
+            chunk = self._rx[start:close + 1]
+            self._rx = self._rx[close + 1:]
+            try:
+                obj = json.loads(chunk)
+            except ValueError:
+                _LOGGER.debug("AI-Diffuser: dropping malformed object %r", chunk)
+                continue
+            if isinstance(obj, dict):
+                result.update(self._handle_object(obj))
+        if self.full_read_needed and self.schedule_known:
+            # Cleared on the replies, not on sending: a read-back lost on a
+            # weak link is resent on the next connect (the 5-minute poll).
+            self.full_read_needed = False
+        return result
+
+    def _handle_object(self, obj: dict) -> dict:
+        if "ALL" not in obj:
+            return {}   # echo of our own command envelope
+        text = str(obj["ALL"])
+        num = obj.get("num")
+        duan = obj.get("duan")
+        if isinstance(num, int) and num > 1 and isinstance(duan, int):
+            if duan == 0:
+                self._parts = []
+            self._parts.append(text)
+            if duan != num - 1:
+                return {}
+            text = " ".join(self._parts)
+            self._parts = []
+        tokens = text.replace("|", " ").split()
+        try:
+            frame = [int(t, 16) for t in tokens]
+        except ValueError:
+            _LOGGER.debug("AI-Diffuser: non-hex ALL payload: %r", text)
+            return {}
+        if len(frame) < 4 or frame[0] != 0xFE or frame[1] != 0xEF:
+            return {}
+        return self._decode(frame)
+
+    @staticmethod
+    def _le16(lo: int, hi: int) -> int:
+        return lo | (hi << 8)
+
+    @staticmethod
+    def _ascii(values: list[int]) -> str:
+        return "".join(chr(v) for v in values if 27 <= v <= 126).strip()
+
+    def _decode(self, f: list[int]) -> dict:
+        kind = f[2]
+        if len(f) == 24 and kind == AI_DIFFUSER_CMD_STATUS:
+            return self._decode_status(f)
+        if len(f) == 24 and kind == AI_DIFFUSER_CMD_OIL:
+            return self._decode_oil(f)
+        if len(f) == 64 and kind == AI_DIFFUSER_CMD_HARDWARE:
+            self.model = self._ascii(f[3:35]) or None
+            self.hardware_version = self._ascii(f[40:49]) or None
+            out: dict = {}
+            if self.model:
+                out["model_code"] = self.model
+            if self.hardware_version:
+                out["firmware_version"] = self.hardware_version
+            return out
+        if len(f) == 64 and kind == AI_DIFFUSER_CMD_WEEK:
+            self._day_masks = [f[3 + i] for i in range(AI_DIFFUSER_SLOTS)]
+            self._gears = [f[19 + i] for i in range(AI_DIFFUSER_SLOTS)]
+            self._pumps = [f[27 + i] for i in range(AI_DIFFUSER_SLOTS)]
+            return self._derived()
+        if len(f) == 64 and kind in (AI_DIFFUSER_CMD_CUSTOM, AI_DIFFUSER_CMD_GEAR):
+            disabled = f[60]
+            slots = []
+            for i in range(AI_DIFFUSER_SLOTS):
+                slots.append(AiDiffuserSlot(
+                    start_hour=f[3 + i], start_minute=f[9 + i],
+                    end_hour=f[15 + i], end_minute=f[21 + i],
+                    work_seconds=self._le16(f[27 + 2 * i], f[28 + 2 * i]),
+                    pause_seconds=self._le16(f[39 + 2 * i], f[40 + 2 * i]),
+                    enabled=not (disabled >> i) & 1,
+                ))
+            self._tables[kind] = slots
+            out = self._derived()
+            # Both tables end with a clock, but only the one for the
+            # mode in use is live: the other repeats a stale time (seen
+            # on an ADS644BT: 07 stuck at 16:00:12 while 06 tracked).
+            active_kind = None if self._gear_mode is None else (
+                AI_DIFFUSER_CMD_GEAR if self._gear_mode else AI_DIFFUSER_CMD_CUSTOM
+            )
+            if active_kind not in (None, kind):
+                return out
+            try:
+                out["device_clock"] = datetime(
+                    (f[51] << 8) | f[52], f[53], f[54], f[56], f[57], f[58],
+                )
+            except ValueError:
+                pass
+            return out
+        _LOGGER.debug("AI-Diffuser: unhandled frame %02X (%d bytes)", kind, len(f))
+        return {}
+
+    def _decode_status(self, f: list[int]) -> dict:
+        flags = f[3]
+        power = not (flags & 0x01)            # Pump_Auto_Close
+        self._gear_mode = bool(flags & 0x02)  # ModelType: 1 = gear (level) mode
+        pump_running = f[4] == 1
+        self._active_index = f[5] if f[5] < AI_DIFFUSER_SLOTS else None
+        if not power:
+            phase = "off"
+        elif self._active_index is None:
+            phase = "idle"
+        else:
+            phase = "spraying" if pump_running else "paused"
+        out: dict = {
+            "power": power,
+            "phase": phase,
+            "fan": bool(flags & 0x10),        # Fan_Work_State
+            "schedule_slot": self._active_index + 1 if self._active_index is not None else None,
+        }
+        out.update(self._derived())
+        return out
+
+    def _decode_oil(self, f: list[int]) -> dict:
+        out: dict = {}
+        current = self._le16(f[5], f[6])
+        capacity = self._le16(f[7], f[8])
+        if current != 0xFFFF:
+            out["oil_current_ml"] = current
+        if capacity not in (0, 0xFFFF):
+            out["oil_max_ml"] = capacity
+        speed = self._le16(f[3], f[4])
+        decimal = self._le16(f[9], f[10])
+        if speed != 0xFFFF and decimal != 0xFFFF:
+            out["oil_consumption_mlh"] = round(speed + decimal / 10000, 2)
+        if "oil_current_ml" in out and "oil_max_ml" in out:
+            out["oil_remaining"] = round(100 * out["oil_current_ml"] / out["oil_max_ml"])
+        return out
+
+    def _derived(self) -> dict:
+        """Schedule fields for the slot the device is in (or the first enabled one)."""
+        table = None
+        if self._gear_mode is not None:
+            table = self._tables.get(AI_DIFFUSER_CMD_GEAR if self._gear_mode else AI_DIFFUSER_CMD_CUSTOM)
+        if table is None:
+            return {}
+        index = self._active_index
+        if index is None:
+            index = next((i for i, s in enumerate(table) if s.enabled), 0)
+        self._edit_index = index
+        slot = table[index]
+        out = {
+            "start_hour": slot.start_hour, "start_minute": slot.start_minute,
+            "end_hour": slot.end_hour, "end_minute": slot.end_minute,
+            "schedule_enabled": slot.enabled,
+            "schedule_custom_mode": not self._gear_mode,
+        }
+        if not self._gear_mode and slot.work_seconds and slot.pause_seconds:
+            out["work_seconds"] = slot.work_seconds
+            out["pause_seconds"] = slot.pause_seconds
+        if self._day_masks is not None:
+            out["weekday_mask"] = self._day_masks[index]
+            # All six slots in the record shape the per-slot (Schedule N)
+            # entities share with Scent Tech: minutes of day, weekday bit
+            # 0 = Monday … 6 = Sunday, bit 7 = "some day set".
+            timers = {}
+            for i, t in enumerate(table):
+                mask = self._day_masks[i] & 0x7F if self._day_masks[i] != 0xFF else 0
+                timers[i + 1] = ScentTechTimer(
+                    enabled=t.enabled, serial=0,
+                    weekdays=mask | (0x80 if mask else 0),
+                    start_minute=t.start_hour * 60 + t.start_minute,
+                    stop_minute=t.end_hour * 60 + t.end_minute,
+                    run_seconds=t.work_seconds, pause_seconds=t.pause_seconds,
+                    timer_id=0,
+                )
+            out["timer_slots"] = timers
+        return out
+
+
+def _detect_ai_diffuser(advertisement_data) -> bool:
+    """Match an AI-Diffuser device by the 16-bit service UUID it advertises."""
+    if advertisement_data is None:
+        return False
+    uuids = getattr(advertisement_data, "service_uuids", None) or []
+    return any(str(u).lower() in AI_DIFFUSER_ADV_SERVICE_UUIDS for u in uuids)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -2758,6 +3210,8 @@ def get_protocol(
         return AromelyAroMaxProtocol()
     elif device_type == DeviceType.SCENT_TECH:
         return ScentTechProtocol()
+    elif device_type == DeviceType.AI_DIFFUSER:
+        return AiDiffuserProtocol(mac=mac)
     raise ValueError(f"Unknown device type: {device_type}")
 
 
@@ -2853,6 +3307,9 @@ def detect_device_type(
 
     if _detect_aromely(advertisement_data):
         return DeviceType.AROMELY_ARO_MAX
+
+    if _detect_ai_diffuser(advertisement_data):
+        return DeviceType.AI_DIFFUSER
 
     parts = ble_name.split(".") if ble_name else []
     if len(parts) > 1 and parts[1] in AL_NAME_CODES:

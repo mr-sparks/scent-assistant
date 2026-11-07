@@ -51,6 +51,7 @@ from .protocol_ble import (
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
     ScentTechProtocol,
+    AiDiffuserProtocol,
     get_protocol,
     detect_device_type,
 )
@@ -213,6 +214,8 @@ class ScentDiffuserDevice:
         # they must not interleave; the events let a write wait for the
         # device's 0x88 table and 0x94 acknowledgement.
         self._timer_write_lock = asyncio.Lock()
+        # AI-Diffuser: whether the last connect sent the full read-back.
+        self._ai_read_sent = False
         self._timers_received = asyncio.Event()
         self._timer_write_acked = asyncio.Event()
 
@@ -292,6 +295,7 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_MARKETING_GW_XOR: "Scent Marketing (GW, encrypted)",
             DeviceType.AROMELY_ARO_MAX: "Aromely Aro Max",
             DeviceType.SCENT_TECH: "Scent Tech / ScentLab",
+            DeviceType.AI_DIFFUSER: "AI-Diffuser",
         }
         base = mapping.get(self._device_type, self._device_type.value)
         if self._device_type == DeviceType.AROMA_LINK and self._state.model_code:
@@ -414,6 +418,14 @@ class ScentDiffuserDevice:
         return None
 
     @property
+    def ai_diffuser_schedule(self) -> dict | None:
+        """Parsed AI-Diffuser tables, day masks and mode (diagnostics)."""
+        proto = self._protocol
+        if isinstance(proto, AiDiffuserProtocol):
+            return proto.diagnostics()
+        return None
+
+    @property
     def gw_gear_limits(self) -> tuple[int, int, int, int] | None:
         """GW work/pause limits from the last DP 15 report (diagnostics)."""
         proto = self._protocol
@@ -442,6 +454,14 @@ class ScentDiffuserDevice:
 
     def require_schedule_read(self) -> None:
         """Refuse a schedule edit that would overwrite values not yet read."""
+        if isinstance(self._protocol, AiDiffuserProtocol) and not self._protocol.schedule_known:
+            # A slot write carries the whole record (mode, window, gear,
+            # pump, days): built from defaults it would wipe the slot.
+            raise HomeAssistantError(
+                f"{self._ble_name}: the schedule hasn't been read from the "
+                "device yet, so this edit would overwrite it with defaults. "
+                "Press Refresh, or try again once the device is reachable."
+            )
         if not (self.schedule_window_read and self.schedule_durations_read):
             raise HomeAssistantError(
                 f"{self._ble_name}: the schedule hasn't been read from the "
@@ -572,7 +592,7 @@ class ScentDiffuserDevice:
                 )
                 self._ble_connected = True
                 await self._check_gatt_services()
-                if isinstance(self._protocol, AromaLinkBleProtocol):
+                if isinstance(self._protocol, (AromaLinkBleProtocol, AiDiffuserProtocol)):
                     self._protocol.reset_rx()
 
                 # Subscribe to notifications for responses. Without these
@@ -694,6 +714,33 @@ class ScentDiffuserDevice:
                     except (BleakError, asyncio.TimeoutError, OSError) as err:
                         _LOGGER.warning(
                             "Aromely Aro Max handshake failed on %s: %s",
+                            self._ble_name, err,
+                        )
+                        await self._teardown_ble_client()
+                        self._ble_last_failure_ts = loop.time()
+                        return False
+
+                # AI-Diffuser — the app sets the clock and reads back the
+                # model, day masks, both schedule tables, oil and status on
+                # every connect (OrderSender.searchAll). We read once per
+                # session and never set the clock on our own: the clock
+                # write makes the unit beep. Replies are parsed
+                # asynchronously; each 64-byte one arrives in two parts.
+                if isinstance(self._protocol, AiDiffuserProtocol):
+                    try:
+                        frames = self._protocol.session_frames()
+                        for frame in frames:
+                            await self._ble_send(frame)
+                            await asyncio.sleep(0.4)
+                        # The protocol clears full_read_needed once the
+                        # replies are decoded, not here.
+                        self._ai_read_sent = bool(frames)
+                        # Keeps the generic first-connect sync below from
+                        # sending the clock.
+                        self._ble_has_synced_time = True
+                    except (BleakError, asyncio.TimeoutError, OSError) as err:
+                        _LOGGER.warning(
+                            "AI-Diffuser handshake failed on %s: %s",
                             self._ble_name, err,
                         )
                         await self._teardown_ble_client()
@@ -1720,6 +1767,23 @@ class ScentDiffuserDevice:
                 )
                 cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
 
+            elif isinstance(self._protocol, AiDiffuserProtocol):
+                self.require_schedule_read()
+                slot = ScheduleSlot(
+                    start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
+                    enabled=enabled, work_seconds=work, pause_seconds=pause,
+                )
+                slot_frame, week_frame = self._protocol.build_schedule(
+                    slot, weekday_mask=weekday_mask,
+                )
+                # The app sends the day mask a second after the slot.
+                if await self._ble_execute(slot_frame) and await self._ble_execute(week_frame):
+                    # Read the table back so HA shows what the device stored.
+                    await self._ble_execute(self._protocol.build_table_query())
+                    self._notify_state_changed()
+                    return True
+                return False
+
             if cmd and await self._ble_execute(cmd):
                 self._notify_state_changed()
                 return True
@@ -1748,6 +1812,8 @@ class ScentDiffuserDevice:
         and anything the official app set stay intact. Reads the table
         again afterwards so HA shows what the device actually stored.
         """
+        if isinstance(self._protocol, AiDiffuserProtocol) and self._ble_address:
+            return await self._set_ai_diffuser_slot(slot, **changes)
         if not isinstance(self._protocol, ScentTechProtocol) or not self._ble_address:
             return False
         async with self._timer_write_lock:
@@ -1790,6 +1856,39 @@ class ScentDiffuserDevice:
                 async with self._ble_lock:
                     await self._teardown_ble_client(reason="write-failure")
                 return False
+
+    async def _set_ai_diffuser_slot(self, slot: int, **changes) -> bool:
+        """Change fields of one AI-Diffuser schedule slot (Schedule N entities).
+
+        Builds on the slot as last read (the read-back after every
+        connect keeps it current), writes the slot and its day mask the
+        way the app does, then reads both tables back.
+        """
+        self.require_schedule_read()
+        timers = self._state.timer_slots or {}
+        if slot not in timers:
+            raise HomeAssistantError(
+                f"{self._ble_name}: schedule {slot} hasn't been read yet, press Refresh"
+            )
+        updated = timers[slot].with_changes(**changes)
+        if not (0 <= updated.start_minute <= 1439 and 0 <= updated.stop_minute <= 1439):
+            _LOGGER.warning("AI-Diffuser %s: times must be within one day", self._ble_name)
+            return False
+        async with self._timer_write_lock:
+            for frame in self._protocol.build_timer_frames(slot, updated):
+                if not await self._ble_execute(frame):
+                    return False
+            # Show the write right away; the read-back below replaces it.
+            slots = dict(timers)
+            slots[slot] = updated
+            self._state.timer_slots = slots
+            self._notify_state_changed()
+            for frame in (
+                self._protocol.build_week_query(),
+                self._protocol.build_table_query(),
+            ):
+                await self._ble_execute(frame)
+        return True
 
     async def _read_scent_tech_timers(self) -> dict | None:
         """Ask for the timer table and wait for it. Connection must be open."""
@@ -2085,10 +2184,31 @@ class ScentDiffuserDevice:
                 setattr(self._state, field, schedule[field])
         self._notify_state_changed()
 
+    async def async_full_refresh(self) -> None:
+        """Read the whole device state back (AI-Diffuser Refresh button)."""
+        if not isinstance(self._protocol, AiDiffuserProtocol):
+            await self.refresh_state()
+            return
+        self._protocol.full_read_needed = True
+        self._ai_read_sent = False
+        if not await self._ble_connect():
+            raise HomeAssistantError(
+                f"Could not reach {self._ble_name} over Bluetooth" + self._last_seen_hint()
+            )
+        # A link that was still open skipped the connect-time read-back.
+        if not self._ai_read_sent:
+            for frame in self._protocol.build_read_queries():
+                if not await self._ble_execute(frame):
+                    raise HomeAssistantError(f"Lost the Bluetooth link to {self._ble_name}")
+        _LOGGER.info("AI-Diffuser %s refreshed", self._ble_name)
+
     async def sync_time(self) -> bool:
         """Sync device clock to current local time (BLE only)."""
         if not self._ble_address:
             return False
+        # AI-Diffuser never sets the clock on connect (it beeps); only here.
+        if isinstance(self._protocol, AiDiffuserProtocol):
+            return await self._ble_execute(self._protocol.build_time_sync())
         self._ble_has_synced_time = False
         if not await self._ble_connect():
             return False

@@ -33,6 +33,9 @@ async def async_setup_entry(
     # in the official app only show up after a manual read.
     if device.device_type == DeviceType.SCENT_TECH:
         entities.append(RefreshSchedulesButton(device, entry))
+    # AI-Diffuser polls status and oil only; Refresh re-reads everything.
+    if device.device_type == DeviceType.AI_DIFFUSER:
+        entities.append(AiDiffuserRefreshButton(device, entry))
     async_add_entities(entities)
 
 
@@ -114,3 +117,16 @@ class RefreshSchedulesButton(ButtonEntity):
 
     async def async_press(self) -> None:
         await self._device.refresh_state()
+
+
+class AiDiffuserRefreshButton(RefreshSchedulesButton):
+    """Re-read model, schedules, day masks, oil and status from an AI-Diffuser unit."""
+
+    _attr_name = "Refresh"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        super().__init__(device, entry)
+        self._attr_unique_id = f"{device.unique_id}_refresh"
+
+    async def async_press(self) -> None:
+        await self._device.async_full_refresh()
