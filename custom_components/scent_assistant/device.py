@@ -118,7 +118,7 @@ class ScentDiffuserDevice:
         # Both directions in arrival order with wall-clock time, so a
         # diagnostics download shows what the device answered to which
         # write (#22's fan flicker couldn't be ordered without it).
-        self._frame_log: list[str] = []
+        self._frame_log: list[tuple[str, str, str]] = []
         # BLE
         self._ble_address = ble_address
         self._ble_name = ble_name or ""
@@ -247,11 +247,11 @@ class ScentDiffuserDevice:
 
     @property
     def frame_log(self) -> list[str]:
-        return list(self._frame_log)
+        return [f"{stamp} {arrow} {hex_}" for stamp, arrow, hex_ in self._frame_log]
 
-    def _log_frame(self, arrow: str, data: bytes) -> None:
+    def _log_frame(self, arrow: str, hex_: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self._frame_log.append(f"{stamp} {arrow} {data.hex()}")
+        self._frame_log.append((stamp, arrow, hex_))
         if len(self._frame_log) > DIAG_FRAME_LOG_MAX:
             del self._frame_log[0]
 
@@ -329,16 +329,17 @@ class ScentDiffuserDevice:
 
     @property
     def supports_oil_percent(self) -> bool:
-        # App oil read order: scale 52 04, else low-oil 52 1D, else 52 1E.
+        # App oil read order (dynaGetRemainOli): low-oil 52 1D if the unit
+        # has oil detection, else 52 1E if oijShowType, and only then the
+        # scale. A scale doesn't stop the percentage read.
         s = self._state
-        if s.has_oil_percent is False or s.has_weight or s.has_oil_detect:
+        if s.has_oil_percent is False or s.has_oil_detect:
             return False
         return True
 
     @property
     def supports_oil_detect(self) -> bool:
-        s = self._state
-        return s.has_oil_detect is True and s.has_weight is not True
+        return self._state.has_oil_detect is True
 
     @property
     def fan_present(self) -> bool | None:
@@ -357,9 +358,18 @@ class ScentDiffuserDevice:
         return self._once_reported(self._state.has_battery is not False)
 
     def _once_reported(self, value: bool) -> bool | None:
-        """Return value, or None before an Aroma-Link BLE unit's first 0A."""
+        """Return value, or None before an Aroma-Link BLE unit's first 0A.
+
+        A unit that stays silent through the initial reads keeps the
+        entities it had before capability flags existed.
+        """
         proto = self._protocol
-        if self._ble_address and isinstance(proto, AromaLinkBleProtocol) and not proto.status_seen:
+        if (
+            self._ble_address
+            and isinstance(proto, AromaLinkBleProtocol)
+            and not proto.status_seen
+            and self._silent_state_reads < BLE_INITIAL_SILENT_READS_MAX
+        ):
             return None
         return value
 
@@ -933,7 +943,7 @@ class ScentDiffuserDevice:
             self._recent_commands.append(data.hex())
             if len(self._recent_commands) > 10:
                 del self._recent_commands[0]
-            self._log_frame("->", data)
+            self._log_frame("->", data.hex())
         with_response = self._write_needs_response()
         for chunk in chunks:
             await self._ble_client.write_gatt_char(
@@ -972,10 +982,11 @@ class ScentDiffuserDevice:
         raw = bytes(data)
         # Keep a short ring of raw frames for diagnostics, 52 0D IMEI masked.
         ring_hex = getattr(self._protocol, "ring_hex", None)
-        self._recent_notifications.append(ring_hex(raw) if ring_hex else raw.hex())
+        raw_hex = ring_hex(raw) if ring_hex else raw.hex()
+        self._recent_notifications.append(raw_hex)
         if len(self._recent_notifications) > 20:
             del self._recent_notifications[0]
-        self._log_frame("<-", raw)
+        self._log_frame("<-", raw_hex)
         updates = self._protocol.parse_notification(raw)
         masked = updates.get("masked_frame_hex")
         if masked:
@@ -986,6 +997,17 @@ class ScentDiffuserDevice:
                 i -= 1
                 start = end - len(self._recent_notifications[i])
                 self._recent_notifications[i] = masked[max(start, 0):end]
+                end = start
+            # Same for the timestamped log (incoming entries only).
+            end = len(masked)
+            i = len(self._frame_log)
+            while end > 0 and i > 0:
+                i -= 1
+                stamp, arrow, hex_ = self._frame_log[i]
+                if arrow != "<-":
+                    continue
+                start = end - len(hex_)
+                self._frame_log[i] = (stamp, arrow, masked[max(start, 0):end])
                 end = start
         if not updates:
             return
@@ -1968,6 +1990,9 @@ class ScentDiffuserDevice:
                         await self._ble_send(self._protocol.build_time_sync())
                     if not self._ble_state_read:
                         self._silent_state_reads += 1
+                        if self._silent_state_reads == BLE_INITIAL_SILENT_READS_MAX:
+                            # Lets capability entities resolve (_once_reported).
+                            self._notify_state_changed()
                     self._ble_full_refresh_unanswered = not self._ble_state_read
                 except (BleakError, asyncio.TimeoutError, OSError) as err:
                     _LOGGER.debug("BLE refresh query failed on %s: %s", self._ble_name, err)
