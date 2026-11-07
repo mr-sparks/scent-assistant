@@ -79,7 +79,7 @@ from .const import (
     AL_SUB_POWER, AL_SUB_FAN, AL_SUB_SCHEDULE, AL_SUB_TIME_SYNC, AL_SUB_DEVICE_INFO,
     AL_SUB_QUERY_SCHEDULES, AL_SUB_OIL_LEVEL, AL_SUB_ALL_WORK_INFO,
     AL_SUB_WORK_INFO, AL_SUB_WORK_FREQUENCY, AL_RX_BUFFER_MAX,
-    AL_SUB_OIL_DETECT,
+    AL_SUB_OIL_DETECT, AL_SUB_RADAR_MODE, AL_SUB_RADAR_SETTINGS,
     AL_FAN_ON_VALUE, AL_FAN_OFF_VALUE,
     AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
@@ -117,8 +117,14 @@ class DiffuserState:
     has_ota: bool | None = None
     has_oil_detect: bool | None = None
     has_oil_percent: bool | None = None
+    has_radar: bool | None = None
     # Aroma-Link 52/53 1D: True where the app shows "oil insufficient".
     oil_low: bool | None = None
+    # Aroma-Link 0A radar mode (0 app, 1 radar), level (1 Min..5 Max, 0 none).
+    radar_mode: int | None = None
+    radar_level: int | None = None
+    # Aroma-Link 52 21: (minutes, people, work_s, pause_s), index = level - 1.
+    radar_settings: list | None = None
     phase: str = "unknown"             # "off", "idle", "spraying", "paused"
     work_seconds: int = 0
     pause_seconds: int = 0
@@ -473,6 +479,21 @@ class AromaLinkBleProtocol(BleProtocol):
             AL_FAN_ON_VALUE if on else AL_FAN_OFF_VALUE,
         ]))
 
+    def build_radar_mode(self, radar: bool) -> bytes:
+        """Build the radar mode write (`57 20`, app: setRadarWorkMode)."""
+        return self._build_packet(bytes([AL_CMD_WRITE, AL_SUB_RADAR_MODE, 0x01 if radar else 0x00]))
+
+    def build_radar_settings(self, settings: list) -> bytes:
+        """Build `57 21` radar settings (app: getSetRadarSettingPack)."""
+        data = bytearray([AL_CMD_WRITE, AL_SUB_RADAR_SETTINGS])
+        for minutes, people, work, pause in settings:
+            data.extend([
+                minutes & 0xFF, people & 0xFF,
+                (work >> 8) & 0xFF, work & 0xFF,
+                (pause >> 8) & 0xFF, pause & 0xFF,
+            ])
+        return self._build_packet(bytes(data))
+
     def build_query(self) -> bytes:
         """Status query: the "all work info" register (52 0A).
 
@@ -514,6 +535,10 @@ class AromaLinkBleProtocol(BleProtocol):
     def build_week_schedule_query(self) -> bytes:
         """Build READ_WEEK_WORK_TIME (`52 15`, app: getAllWorkTimePack)."""
         return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_QUERY_SCHEDULES]))
+
+    def build_radar_query(self) -> bytes:
+        """Build the radar query (`52 21`, app: readRadarWorkSetting)."""
+        return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_RADAR_SETTINGS]))
 
     def build_all_work_query(self) -> bytes:
         """Read the "all work info" register (`52 0A`).
@@ -651,6 +676,7 @@ class AromaLinkBleProtocol(BleProtocol):
         #   [31] has-battery flag  [32] has-fan flag  [33..] more flags
         #   [34] has-weight flag  [37] has-lamp flag  [39] has-OTA flag
         #   [41] has-oil-detect flag  [42] has-oil-percent flag
+        #   [43] has-radar flag  [44] radar mode  [45] radar level
         #   [47..48] deviceCode (u16)
         # [10]: low nibble fan, read only when the [32] has-fan flag is set.
         # The on/off byte and work status are plain bytes the app reads
@@ -704,6 +730,12 @@ class AromaLinkBleProtocol(BleProtocol):
                 result["has_oil_detect"] = payload[41] == 1
             if len(payload) >= 43:
                 result["has_oil_percent"] = payload[42] == 1
+            if len(payload) >= 44:
+                result["has_radar"] = payload[43] == 1
+            if result.get("has_radar") and len(payload) >= 45:
+                result["radar_mode"] = payload[44]
+            if result.get("has_radar") and len(payload) >= 46:
+                result["radar_level"] = payload[45]
             if len(payload) >= 49:
                 result["device_code"] = (payload[47] << 8) | payload[48]
             return result
@@ -810,6 +842,15 @@ class AromaLinkBleProtocol(BleProtocol):
             # @ndoty's capture showed 0x50 (80) matching the app's 80%, so
             # the byte is a straight 0–100 percentage.
             result["oil_remaining"] = max(0, min(100, payload[2]))
+
+        elif cmd == AL_CMD_QUERY and sub == AL_SUB_RADAR_SETTINGS and len(payload) >= 32:
+            # `52 21` + 5 × `<minutes> <people> <work u16> <pause u16>`
+            levels = []
+            for base in range(2, 32, 6):
+                work = (payload[base + 2] << 8) | payload[base + 3]
+                pause = (payload[base + 4] << 8) | payload[base + 5]
+                levels.append((payload[base], payload[base + 1], work, pause))
+            result["radar_settings"] = levels
 
         elif cmd == AL_CMD_WRITE:
             # Any 57 reply other than NACK is an ACK, including empty data.

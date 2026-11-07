@@ -68,7 +68,7 @@ class DiffuserStartTime(TimeEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.available
+        return self._device.available and not self._device.radar_mode_active
 
     async def async_set_value(self, value: time) -> None:
         """Set the start time and write schedule to device."""
@@ -106,7 +106,7 @@ class DiffuserEndTime(TimeEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.available
+        return self._device.available and not self._device.radar_mode_active
 
     async def async_set_value(self, value: time) -> None:
         """Set the end time and write schedule to device."""

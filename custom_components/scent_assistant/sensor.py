@@ -25,6 +25,7 @@ SCENT_MARKETING_TYPES = {
     DeviceType.SCENT_MARKETING_GW_XOR,
 }
 GW_TYPES = {DeviceType.SCENT_MARKETING_GW, DeviceType.SCENT_MARKETING_GW_XOR}
+RADAR_LEVELS = {1: "min", 2: "low", 3: "med", 4: "high", 5: "max"}
 
 
 async def async_setup_entry(
@@ -68,6 +69,11 @@ async def async_setup_entry(
             hass, entry, device, async_add_entities,
             [DiffuserBatterySensor(device, entry)],
             lambda: device.battery_present,
+        )
+        add_when_present(
+            hass, entry, device, async_add_entities,
+            [DiffuserRadarLevelSensor(device, entry)],
+            lambda: device.radar_present,
         )
 
     if device.device_type in SCENT_MARKETING_TYPES:
@@ -409,6 +415,69 @@ class DiffuserPauseRemainSensor(SensorEntity):
     @property
     def available(self) -> bool:
         return self._device.available and self._device.state.pause_remaining is not None
+
+
+class DiffuserRadarLevelSensor(SensorEntity):
+    """Active radar level (Aroma-Link 52 0A, 52 21)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Radar level"
+    _attr_icon = "mdi:radar"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = [*RADAR_LEVELS.values(), "disabled"]
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_radar_level"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> str | None:
+        state = self._device.state
+        if state.radar_mode == 0:
+            return "disabled"
+        return RADAR_LEVELS.get(state.radar_level)
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        state = self._device.state
+        settings = state.radar_settings
+        if not settings:
+            return None
+        attrs = {
+            "levels": {
+                name: {
+                    "detection_minutes": minutes,
+                    "people": people,
+                    "work_seconds": work,
+                    "pause_seconds": pause,
+                }
+                for name, (minutes, people, work, pause) in zip(RADAR_LEVELS.values(), settings)
+            },
+        }
+        level = state.radar_level
+        if state.radar_mode == 1 and level in RADAR_LEVELS:
+            minutes, people, work, pause = settings[level - 1]
+            attrs["detection_minutes"] = minutes
+            attrs["people_from"] = people
+            attrs["people_to"] = settings[level][1] if level < len(settings) else None
+            attrs["work_seconds"] = work
+            attrs["pause_seconds"] = pause
+        return attrs
+
+    @property
+    def available(self) -> bool:
+        return (
+            self._device.available
+            and self._device.supports_radar
+            and self._device.state.radar_level is not None
+        )
 
 
 class DiffuserDetectionDiagnostic(SensorEntity):

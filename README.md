@@ -47,7 +47,7 @@
 | DAP Smart Scent Air Machine (Model 11, A5) | AromaPlan | BLE | Broadcasts as `DAP.A5.Bluetooth`; uses Aroma-Link protocol |
 | Aromadd U5 Pro | Aromadd | BLE | Same as Aroma-Link, different branding; reports oil level |
 | Aromadd U5 | Aromadd | BLE | Same as Aroma-Link, different branding; broadcasts as `<name>.A5.WIFI`, where `<name>` is set in the app; built-in fan, no oil sensor |
-| Aromadd Rad-2 | Aromadd | BLE | Same as Aroma-Link, different branding; broadcasts as `<name>.A5.WIFI`, where `<name>` is set in the app; reports oil level |
+| Aromadd Rad-2 | Aromadd | BLE | Same as Aroma-Link, different branding; broadcasts as `<name>.A5.WIFI`, where `<name>` is set in the app; reports oil level; presence radar (App / Radar mode) |
 | Crearoma Diffusers | Aroma-Link | BLE + Cloud | Same as Aroma-Link, different branding |
 | ShinePick QT-I300 | Aroma Buddy | BLE | Tuya BLE protocol |
 | Scentiment Diffuser Air 2 | Scentiment | BLE | JSON-over-BLE protocol; intensity, RGB LED, battery |
@@ -149,6 +149,10 @@ The set of entities depends on which device family is connected.
 | Diffusion time remaining | Sensor | Seconds left in the current spray phase (Aroma-Link, BLE + Cloud) |
 | Pause time remaining | Sensor | Seconds left in the current pause phase (Aroma-Link, BLE + Cloud) |
 | Battery | Sensor | Battery percentage (Aroma-Link models with a battery) |
+| Mode | Select | Work mode: App / Radar; Start Time, End Time, Work Duration and Pause Duration unavailable in radar mode, where `set_schedule` skips the unit (Aroma-Link models with a radar, BLE only) |
+| Radar level | Sensor | Active radar level: min / low / med / high / max, or disabled in app mode; every level's settings and the active level's values as attributes (Aroma-Link models with a radar, BLE only) |
+| Radar 1 Min / 2 Low / 3 Med / 4 High / 5 Max Work | Number | Spray seconds in that radar level, rising from Min to Max, within the Aroma-Link app's limits for the model, e.g. 5-120 s on the Rad-2; unavailable outside radar mode (Aroma-Link models with a radar, BLE only) |
+| Radar 1 Min / 2 Low / 3 Med / 4 High / 5 Max Pause | Number | Pause seconds in that radar level, within the Aroma-Link app's limits for the model, e.g. 90-900 s on the Rad-2; unavailable outside radar mode (Aroma-Link models with a radar, BLE only) |
 
 ### Scentiment Diffuser Air 2 / Mini 2
 
@@ -221,7 +225,7 @@ data:
 | `pause_seconds` | No | device value (Aroma-Link), else `120` | Pause between sprays (5-3600 seconds) |
 | `enabled` | No | device value (Aroma-Link), else `true` | Enable or disable the schedule slot |
 
-An Aroma-Link diffuser is skipped when an omitted field has not been read from it yet, or when the start time is after the end time.
+An Aroma-Link diffuser is skipped in radar mode, when an omitted field has not been read from it yet, or when the start time is after the end time.
 
 Scent Tech / ScentLab and Scentiment diffusers are skipped; Scent Tech uses its Schedule N entities.
 
