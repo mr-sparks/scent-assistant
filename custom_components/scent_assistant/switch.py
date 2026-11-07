@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .capability_entity import add_when_present
 from .const import DOMAIN, DeviceType
 from .device import ScentDiffuserDevice
 from .timer_entity import TIMER_SLOTS, ScentTechTimerEntity
@@ -32,8 +33,12 @@ async def async_setup_entry(
     entities: list[SwitchEntity] = [DiffuserPowerSwitch(device, entry)]
 
     is_cloud = entry.data.get("connection_mode") == "cloud"
-    if device.supports_fan and not is_cloud:
-        entities.append(DiffuserFanSwitch(device, entry))
+    if not is_cloud:
+        add_when_present(
+            hass, entry, device, async_add_entities,
+            [DiffuserFanSwitch(device, entry)],
+            lambda: device.fan_present,
+        )
 
     # Scent Marketing devices expose extra controls when running on BLE.
     if device.device_type in SCENT_MARKETING_TYPES and not is_cloud:
@@ -41,7 +46,7 @@ async def async_setup_entry(
         if device.device_type == DeviceType.SCENT_MARKETING_AK:
             # The AK control bitmask carries a lamp bit we can drive
             # without any extra protocol work. (The fan switch is already
-            # added above via `device.supports_fan`, which is True for AK —
+            # added above via `device.fan_present`, which is True for AK;
             # appending it here too would register a second entity with the
             # same `_fan` unique_id and HA would reject the duplicate.)
             entities.append(DiffuserLampSwitch(device, entry))

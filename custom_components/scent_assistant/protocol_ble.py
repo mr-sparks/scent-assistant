@@ -76,9 +76,10 @@ from .const import (
     TUYA_DP_POWER, TUYA_DP_SCHEDULE,
     AL_HEADER, AL_TRAILER,
     AL_CMD_QUERY, AL_CMD_STATUS, AL_CMD_WRITE,
-    AL_SUB_POWER, AL_SUB_FAN, AL_SUB_SCHEDULE, AL_SUB_TIME_SYNC,
+    AL_SUB_POWER, AL_SUB_FAN, AL_SUB_SCHEDULE, AL_SUB_TIME_SYNC, AL_SUB_DEVICE_INFO,
     AL_SUB_QUERY_SCHEDULES, AL_SUB_OIL_LEVEL, AL_SUB_ALL_WORK_INFO,
     AL_SUB_WORK_INFO, AL_SUB_WORK_FREQUENCY, AL_RX_BUFFER_MAX,
+    AL_SUB_OIL_DETECT,
     AL_FAN_ON_VALUE, AL_FAN_OFF_VALUE,
     AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
@@ -110,6 +111,14 @@ class DiffuserState:
     has_fan: bool | None = None
     # Same for the battery (0A payload[31]); False skips the sensor.
     has_battery: bool | None = None
+    # Aroma-Link 52/53 0A capability flags; None = not reported.
+    has_weight: bool | None = None
+    has_lamp: bool | None = None
+    has_ota: bool | None = None
+    has_oil_detect: bool | None = None
+    has_oil_percent: bool | None = None
+    # Aroma-Link 52/53 1D: True where the app shows "oil insufficient".
+    oil_low: bool | None = None
     phase: str = "unknown"             # "off", "idle", "spraying", "paused"
     work_seconds: int = 0
     pause_seconds: int = 0
@@ -152,7 +161,8 @@ class DiffuserState:
     # Scent Tech: the device's timer records keyed by 1-based slot, as
     # last read from a 0x88 frame. None until the first read.
     timer_slots: dict[int, "ScentTechTimer"] | None = None
-    firmware_version: str | None = None    # PCB+MCU version string
+    # AK/GW firmware version; Aroma-Link 52 0D bleVersion.
+    firmware_version: str | None = None
     # Scent Marketing AK family — spray intensity bundled into schedule
     # writes. Per @Mins95's captures the V2 firmware accepts 0-10 and the
     # V3 firmware accepts 0-20; we clamp on send and let the AK protocol
@@ -171,8 +181,7 @@ class DiffuserState:
     # V3-only "scene label" the user assigned via the official app
     # (e.g. "Evasion"). Surfaced in the device info on read-back.
     device_label: str | None = None
-    # V3-only model code (e.g. "A305M"). Useful for triage when
-    # different hardware variants reveal protocol quirks.
+    # AK V3 model code (e.g. "A305M"); Aroma-Link 52 0D hostName.
     model_code: str | None = None
     # Whether the device's active program/schedule is currently set to
     # run. Distinct from `power` on V3 — a V3 diffuser can be powered
@@ -418,6 +427,12 @@ class AromaLinkBleProtocol(BleProtocol):
         self._rx_buffer = bytearray()
         # Set on a header; then a bare chunk on an empty buffer is a lost tail.
         self._framed = False
+        self._status_seen = False
+
+    @property
+    def status_seen(self) -> bool:
+        """True once a 52/53 0A frame has been parsed."""
+        return self._status_seen
 
     @staticmethod
     def _phase_from_status(status: int, power: bool) -> str:
@@ -479,14 +494,22 @@ class AromaLinkBleProtocol(BleProtocol):
         """
         return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_WORK_FREQUENCY, weekday & 0xFF]))
 
+    def build_device_info_query(self) -> bytes:
+        """Build the device info query (`52 0D`, app: getDeviceInfoPack)."""
+        return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_DEVICE_INFO]))
+
     def build_oil_query(self) -> bytes:
         """Read the liquid/oil level register (`52 1E`).
 
         The device only reports the level on demand, so this is sent
-        alongside the schedule query on every refresh. The reply is
+        alongside the status query when the 0A flags allow it. The reply is
         parsed below into `oil_remaining`.
         """
         return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_OIL_LEVEL]))
+
+    def build_oil_detect_query(self) -> bytes:
+        """Build the low-oil query (`52 1D`, app: getOjiDetectPackByDetection)."""
+        return self._build_packet(bytes([AL_CMD_QUERY, AL_SUB_OIL_DETECT]))
 
     def build_week_schedule_query(self) -> bytes:
         """Build READ_WEEK_WORK_TIME (`52 15`, app: getAllWorkTimePack)."""
@@ -545,6 +568,22 @@ class AromaLinkBleProtocol(BleProtocol):
 
     def supports_fan(self) -> bool:
         return True
+
+    def ring_hex(self, data: bytes) -> str:
+        """Return ring hex with a 52 0D IMEI masked; call before parsing."""
+        info = bytes([AL_CMD_QUERY, AL_SUB_DEVICE_INFO])
+        keep = len(data)
+        if data[:3] == AL_HEADER:
+            if data[4:6] == info:
+                # IMEI: frame bytes 48-62.
+                keep = 48
+        elif self._rx_buffer and (self._rx_buffer + data)[4:6] == info:
+            # Masked whole: offsets are unknown after a lost chunk.
+            keep = 0
+        elif self._framed and not self._rx_buffer:
+            # Header lost: _feed drops this chunk, which may hold a 52 0D IMEI.
+            keep = 0
+        return data[:keep].hex() + "xx" * len(data[keep:])
 
     def _feed(self, data: bytes) -> bytes | None:
         """Accumulate one notification; return a complete, checksum-valid frame or None."""
@@ -610,6 +649,8 @@ class AromaLinkBleProtocol(BleProtocol):
         #   [17..18] start HH MM  [19..20] end HH MM  [21] air pump
         #   [22..27] MAC  [28..29] raw oil weight  [30] battery
         #   [31] has-battery flag  [32] has-fan flag  [33..] more flags
+        #   [34] has-weight flag  [37] has-lamp flag  [39] has-OTA flag
+        #   [41] has-oil-detect flag  [42] has-oil-percent flag
         #   [47..48] deviceCode (u16)
         # [10]: low nibble fan, read only when the [32] has-fan flag is set.
         # The on/off byte and work status are plain bytes the app reads
@@ -617,6 +658,7 @@ class AromaLinkBleProtocol(BleProtocol):
         # (i+16)), so those are safe and are what keeps the phase honest
         # between pushes — see the 53 09 branch for why that matters.
         if sub == AL_SUB_ALL_WORK_INFO and cmd in (AL_CMD_STATUS, AL_CMD_QUERY):
+            self._status_seen = True
             if len(payload) >= 9:
                 try:
                     result["device_clock"] = datetime(
@@ -652,8 +694,24 @@ class AromaLinkBleProtocol(BleProtocol):
             if result.get("has_fan"):
                 # Low nibble here; the app reads 53 03 the other way round.
                 result["fan"] = (payload[10] & 0x0F) == 1
+            if len(payload) >= 35:
+                result["has_weight"] = payload[34] == 1
+            if len(payload) >= 38:
+                result["has_lamp"] = payload[37] == 1
+            if len(payload) >= 40:
+                result["has_ota"] = payload[39] == 1
+            if len(payload) >= 42:
+                result["has_oil_detect"] = payload[41] == 1
+            if len(payload) >= 43:
+                result["has_oil_percent"] = payload[42] == 1
             if len(payload) >= 49:
                 result["device_code"] = (payload[47] << 8) | payload[48]
+            return result
+
+        if sub == AL_SUB_OIL_DETECT and cmd in (AL_CMD_STATUS, AL_CMD_QUERY):
+            # `52/53 1D <flag>` (app: lowOjiWarn)
+            if len(payload) >= 3:
+                result["oil_low"] = {0: False, 1: True}.get(payload[2])
             return result
 
         if cmd == AL_CMD_STATUS:
@@ -684,6 +742,20 @@ class AromaLinkBleProtocol(BleProtocol):
                 result["end_minute"] = payload[10]
                 if len(payload) >= 12:
                     result["air_pump"] = payload[11]
+
+        elif cmd == AL_CMD_QUERY and sub == AL_SUB_DEVICE_INFO and len(payload) >= 42:
+            # `52 0D <hostName 20> <bleVersion 20> <caps> <netType> <IMEI 15>`
+            host = payload[2:22].replace(b"\x00", b"").decode("utf-8", errors="replace").strip()
+            version = payload[22:42].replace(b"\x00", b"").decode("utf-8", errors="replace").strip()
+            if host:
+                result["model_code"] = host
+            if version:
+                result["firmware_version"] = version
+            # Frame hex with the IMEI masked, for the diagnostics ring.
+            masked = payload[:44].hex() + "xx" * len(payload[44:59]) + payload[59:].hex()
+            if len(frame) > len(payload):
+                masked = frame[:4].hex() + masked + frame[-3:].hex()
+            result["masked_frame_hex"] = masked
 
         elif cmd == AL_CMD_QUERY and sub == AL_SUB_WORK_FREQUENCY and len(payload) >= 8:
             # `52 06 <weekday>` + 5 × `<work u16> <pause u16> <level<<4|enabled>`

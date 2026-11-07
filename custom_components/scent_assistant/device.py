@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime
 
 from bleak import BleakClient, BleakScanner, BleakError
@@ -17,6 +18,7 @@ from bleak_retry_connector import establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+import homeassistant.helpers.device_registry as dr
 
 from .const import (
     DeviceType,
@@ -90,11 +92,13 @@ class ScentDiffuserDevice:
         cloud_device_id: str | None = None,
         sm_metadata: dict | None = None,
         gw_password: str | None = None,
+        entry_id: str | None = None,
     ) -> None:
         # HomeAssistant reference, used to fetch a cached BLEDevice via
         # the core bluetooth integration before opening a connection.
         # Optional so the manager can still be unit-tested without HA.
         self._hass = hass
+        self._entry_id = entry_id
         # Detection metadata from the config flow — populated only for
         # Scent Marketing family devices.
         self._sm_metadata = sm_metadata or {}
@@ -133,6 +137,7 @@ class ScentDiffuserDevice:
         # enough that even the official app can't reconnect until a
         # power cycle, per @Mins95's 2026-06-01 report).
         self._ble_last_failure_ts: float = 0.0
+        self._device_info_query_sent = False
 
         # Device type
         if device_type:
@@ -161,6 +166,7 @@ class ScentDiffuserDevice:
         # State
         self._state = DiffuserState()
         self._state_callbacks: list[callable] = []
+        self._capability_unsubs: list[Callable[[], None]] = []
         # Wall-clock time of the last BLE notification that changed
         # state. Lets a user tell a fresh reading from a stale one
         # without the entity flapping to unavailable (#32).
@@ -270,6 +276,8 @@ class ScentDiffuserDevice:
             DeviceType.SCENT_TECH: "Scent Tech / ScentLab",
         }
         base = mapping.get(self._device_type, self._device_type.value)
+        if self._device_type == DeviceType.AROMA_LINK and self._state.model_code:
+            base = f"{base} {self._state.model_code}"
         # Append the PID when known — different OEMs share the same family
         # but have distinct PIDs, useful for triage.
         pid = self._sm_metadata.get("pid")
@@ -285,6 +293,7 @@ class ScentDiffuserDevice:
             "name": self.name,
             "manufacturer": "Scent Diffuser",
             "model": self.model_name,
+            "sw_version": self._state.firmware_version,
         }
 
     @property
@@ -299,6 +308,42 @@ class ScentDiffuserDevice:
         if self._state.has_fan is False:
             return False
         return self._protocol.supports_fan()
+
+    @property
+    def supports_oil_percent(self) -> bool:
+        # App oil read order: scale 52 04, else low-oil 52 1D, else 52 1E.
+        s = self._state
+        if s.has_oil_percent is False or s.has_weight or s.has_oil_detect:
+            return False
+        return True
+
+    @property
+    def supports_oil_detect(self) -> bool:
+        s = self._state
+        return s.has_oil_detect is True and s.has_weight is not True
+
+    @property
+    def fan_present(self) -> bool | None:
+        return self._once_reported(self.supports_fan)
+
+    @property
+    def oil_percent_present(self) -> bool | None:
+        return self._once_reported(self.supports_oil_percent)
+
+    @property
+    def oil_detect_present(self) -> bool | None:
+        return self._once_reported(self.supports_oil_detect)
+
+    @property
+    def battery_present(self) -> bool | None:
+        return self._once_reported(self._state.has_battery is not False)
+
+    def _once_reported(self, value: bool) -> bool | None:
+        """Return value, or None before an Aroma-Link BLE unit's first 0A."""
+        proto = self._protocol
+        if self._ble_address and isinstance(proto, AromaLinkBleProtocol) and not proto.status_seen:
+            return None
+        return value
 
     @property
     def protocol_is_v3(self) -> bool:
@@ -373,11 +418,18 @@ class ScentDiffuserDevice:
     def available(self) -> bool:
         return self.connection_mode != "offline"
 
-    def register_state_callback(self, callback: callable) -> None:
+    def register_state_callback(self, callback: callable) -> Callable[[], None]:
+        """Add a state listener; return a function that removes it."""
         self._state_callbacks.append(callback)
 
+        def _remove() -> None:
+            if callback in self._state_callbacks:
+                self._state_callbacks.remove(callback)
+
+        return _remove
+
     def _notify_state_changed(self) -> None:
-        for cb in self._state_callbacks:
+        for cb in list(self._state_callbacks):
             try:
                 cb()
             except Exception:
@@ -873,12 +925,23 @@ class ScentDiffuserDevice:
     def _on_ble_notification(self, sender: int, data: bytearray) -> None:
         """Handle incoming BLE notification."""
         raw = bytes(data)
-        # Keep a short ring-buffer of raw frames for the diagnostics export.
-        self._recent_notifications.append(raw.hex())
+        # Keep a short ring of raw frames for diagnostics, 52 0D IMEI masked.
+        ring_hex = getattr(self._protocol, "ring_hex", None)
+        self._recent_notifications.append(ring_hex(raw) if ring_hex else raw.hex())
         if len(self._recent_notifications) > 20:
             del self._recent_notifications[0]
         self._log_frame("<-", raw)
         updates = self._protocol.parse_notification(raw)
+        masked = updates.get("masked_frame_hex")
+        if masked:
+            # The frame's chunks are the newest ring entries.
+            end = len(masked)
+            i = len(self._recent_notifications)
+            while end > 0 and i > 0:
+                i -= 1
+                start = end - len(self._recent_notifications[i])
+                self._recent_notifications[i] = masked[max(start, 0):end]
+                end = start
         if not updates:
             return
         if "nack" in updates:
@@ -928,6 +991,13 @@ class ScentDiffuserDevice:
         if "has_battery" in updates:
             self._state.has_battery = updates["has_battery"]
             changed = True
+        for _flag in (
+            "has_weight", "has_lamp", "has_ota",
+            "has_oil_detect", "has_oil_percent", "oil_low",
+        ):
+            if _flag in updates:
+                setattr(self._state, _flag, updates[_flag])
+                changed = True
         if "rgb_on" in updates:
             self._state.rgb_on = updates["rgb_on"]
             changed = True
@@ -986,6 +1056,9 @@ class ScentDiffuserDevice:
         if "model_code" in updates:
             self._state.model_code = updates["model_code"]
             changed = True
+        # Entities copy device_info only when added.
+        if "model_code" in updates or "firmware_version" in updates:
+            self._update_device_entry()
         if "schedule_enabled" in updates:
             self._state.schedule_enabled = updates["schedule_enabled"]
             changed = True
@@ -1035,6 +1108,18 @@ class ScentDiffuserDevice:
             self._ble_last_update = datetime.now().astimezone()
 
             self._notify_state_changed()
+
+    def _update_device_entry(self) -> None:
+        """Write model and firmware to the device registry entry."""
+        if self._hass is None:
+            return
+        registry = dr.async_get(self._hass)
+        identifiers = self.device_info["identifiers"]
+        for dev_entry in dr.async_entries_for_config_entry(registry, self._entry_id):
+            if dev_entry.identifiers & identifiers:
+                registry.async_update_device(
+                    dev_entry.id, model=self.model_name, sw_version=self._state.firmware_version,
+                )
 
     def _recompute_oil_days(self) -> bool:
         """Derive estimated oil days-remaining the way the official app does.
@@ -1659,12 +1744,25 @@ class ScentDiffuserDevice:
                     if query:
                         await self._ble_send(query)
                         await asyncio.sleep(1.0)
+                    info_query = getattr(self._protocol, "build_device_info_query", None)
+                    if (
+                        info_query is not None
+                        and self._state.has_ota
+                        and not self._device_info_query_sent
+                    ):
+                        if await self._ble_send(info_query()):
+                            self._device_info_query_sent = True
+                            await asyncio.sleep(0.3)
                     # Some protocols expose extra read-registers that the
                     # device only reports on demand (e.g. Aroma-Link's oil
                     # level). Query them too when the protocol offers one.
                     oil_query = getattr(self._protocol, "build_oil_query", None)
-                    if oil_query is not None:
+                    if oil_query is not None and self.supports_oil_percent:
                         await self._ble_send(oil_query())
+                        await asyncio.sleep(0.3)
+                    detect_query = getattr(self._protocol, "build_oil_detect_query", None)
+                    if detect_query is not None and self.supports_oil_detect:
+                        await self._ble_send(detect_query())
                         await asyncio.sleep(0.3)
                     # Configured work/pause durations live in a separate
                     # per-weekday register on Aroma-Link (the status frame

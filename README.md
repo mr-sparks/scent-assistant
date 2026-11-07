@@ -143,6 +143,7 @@ The set of entities depends on which device family is connected.
 | Pause Duration | Number | Pause between sprays in seconds |
 | Time Sync | Button | Manually sync the device clock to current local time (BLE only) |
 | Oil remaining | Sensor | Liquid level percentage (Aroma-Link models that report it) |
+| Oil level | Sensor | Low-oil warning: ok / low (Aroma-Link models with an oil detector, BLE only) |
 | Diffuse Now | Button | One-shot diffusion: on, then auto-off after Momentary Duration (Aroma-Link) |
 | Momentary Duration | Number | Run time for Diffuse Now in seconds (Aroma-Link) |
 | Diffusion time remaining | Sensor | Seconds left in the current spray phase (Aroma-Link, BLE + Cloud) |

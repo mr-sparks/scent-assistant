@@ -113,6 +113,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cloud_device_id=cloud_device_id,
         sm_metadata=entry.data.get("sm_metadata"),
         gw_password=entry.data.get("gw_password"),
+        entry_id=entry.entry_id,
     )
 
     # Restore local configuration before setting up the device and platforms.
@@ -304,6 +305,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # An entity added after its platform unloads is orphaned until HA restarts.
+    for unsub in hass.data[DOMAIN][entry.entry_id]._capability_unsubs:
+        unsub()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:

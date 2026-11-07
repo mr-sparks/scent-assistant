@@ -353,6 +353,7 @@ AL_SUB_DEVICE_INFO = 0x0D
 AL_SUB_QUERY_SCHEDULES = 0x15   # READ_WEEK_WORK_TIME: 7 days (Mon..Sun) x 5 x 9-byte slots
 AL_SUB_WORK_INFO = 0x09         # READ_WORK_INFO / LISTEN_WORKING_MSG: phase + *remaining* times
 AL_SUB_WORK_FREQUENCY = 0x06    # READ_WORK_FREQUENCY <weekday>: 5 slots × (work u16, pause u16, flags)
+AL_SUB_OIL_DETECT = 0x1D        # getOjiDetectPackByDetection: 0 ok, 1 low oil
 # Reassembly cap for multi-notification frames. The longest reply the app
 # reads is READ_WEEK_WORK_TIME at ~320 bytes; anything past this is junk.
 AL_RX_BUFFER_MAX = 512
