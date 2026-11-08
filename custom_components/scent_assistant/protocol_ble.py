@@ -2804,6 +2804,34 @@ class AiDiffuserProtocol(BleProtocol):
         # 5-minute refresh, commands) only send what they need, which also
         # leaves fewer frames to lose on a weak link.
         self.full_read_needed = True
+        # Set when a week (09) / schedule table (06, 07) reply is decoded;
+        # cleared by begin_schedule_read() before a read-modify-write.
+        self._week_fresh = False
+        self._tables_fresh: set[int] = set()
+
+    def begin_schedule_read(self) -> list[bytes]:
+        """Start a fresh read of the day masks and the active table.
+
+        Returns the frames to send; schedule_fresh turns True once both
+        replies (and the status, if the mode isn't known yet) are decoded.
+        """
+        self._week_fresh = False
+        self._tables_fresh = set()
+        if self._gear_mode is None:
+            # Mode unknown: the status says which table is live, so read both.
+            return [
+                self._read(AI_DIFFUSER_CMD_STATUS), self.build_week_query(),
+                self._read(AI_DIFFUSER_CMD_CUSTOM), self._read(AI_DIFFUSER_CMD_GEAR),
+            ]
+        return [self.build_week_query(), self.build_table_query()]
+
+    @property
+    def schedule_fresh(self) -> bool:
+        """True once the reads from begin_schedule_read() have come back."""
+        if not self._week_fresh or self._gear_mode is None:
+            return False
+        active = AI_DIFFUSER_CMD_GEAR if self._gear_mode else AI_DIFFUSER_CMD_CUSTOM
+        return active in self._tables_fresh
 
     @property
     def schedule_known(self) -> bool:
@@ -3059,6 +3087,7 @@ class AiDiffuserProtocol(BleProtocol):
             return out
         if len(f) == 64 and kind == AI_DIFFUSER_CMD_WEEK:
             self._day_masks = [f[3 + i] for i in range(AI_DIFFUSER_SLOTS)]
+            self._week_fresh = True
             self._gears = [f[19 + i] for i in range(AI_DIFFUSER_SLOTS)]
             self._pumps = [f[27 + i] for i in range(AI_DIFFUSER_SLOTS)]
             return self._derived()
@@ -3074,6 +3103,7 @@ class AiDiffuserProtocol(BleProtocol):
                     enabled=not (disabled >> i) & 1,
                 ))
             self._tables[kind] = slots
+            self._tables_fresh.add(kind)
             out = self._derived()
             # Both tables end with a clock, but only the one for the
             # mode in use is live: the other repeats a stale time (seen

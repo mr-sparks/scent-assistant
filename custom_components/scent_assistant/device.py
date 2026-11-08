@@ -1570,6 +1570,8 @@ class ScentDiffuserDevice:
 
     async def set_work_duration(self, seconds: int) -> bool:
         """Set the spray work duration and write to device."""
+        if isinstance(self._protocol, AiDiffuserProtocol):
+            return await self._set_ai_diffuser_active_slot(run_seconds=seconds)
         self.require_schedule_read()
         self.require_app_mode()
         previous = self._state.work_seconds
@@ -1583,6 +1585,8 @@ class ScentDiffuserDevice:
 
     async def set_pause_duration(self, seconds: int) -> bool:
         """Set the pause duration and write to device."""
+        if isinstance(self._protocol, AiDiffuserProtocol):
+            return await self._set_ai_diffuser_active_slot(pause_seconds=seconds)
         self.require_schedule_read()
         self.require_app_mode()
         previous = self._state.pause_seconds
@@ -1603,6 +1607,11 @@ class ScentDiffuserDevice:
         Mon-Fri week into every day, and switched an AK unit running a
         Level from the device table to Custom.
         """
+        if isinstance(self._protocol, AiDiffuserProtocol):
+            return await self._set_ai_diffuser_active_slot(
+                start_minute=start_hour * 60 + start_minute,
+                stop_minute=end_hour * 60 + end_minute,
+            )
         self.require_schedule_read()
         self.require_app_mode()
         fields = ("start_hour", "start_minute", "end_hour", "end_minute")
@@ -1680,6 +1689,7 @@ class ScentDiffuserDevice:
         (Custom vs Level); callers that change Work/Pause pass True, and
         `set_intensity` passes False. Ignored on non-AK / V2 devices.
         """
+        requested_mask = weekday_mask
         if weekday_mask is None:
             weekday_mask = self._state.weekday_mask if self._state.weekday_mask is not None else 0x7F
         # Every family writes the slot to all days in the mask, so a
@@ -1768,13 +1778,21 @@ class ScentDiffuserDevice:
                 cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
 
             elif isinstance(self._protocol, AiDiffuserProtocol):
+                # The set_schedule service: every field of the slot is given
+                # except gear/pump (and the days, when not passed), so take
+                # those from a fresh read rather than the session's first.
+                if not await self._ble_connect() or not await self._read_ai_diffuser_schedule():
+                    raise HomeAssistantError(
+                        f"{self._ble_name}: couldn't read the current schedule back, "
+                        "so the edit wasn't written. Try again."
+                    )
                 self.require_schedule_read()
                 slot = ScheduleSlot(
                     start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
                 slot_frame, week_frame = self._protocol.build_schedule(
-                    slot, weekday_mask=weekday_mask,
+                    slot, weekday_mask=requested_mask,
                 )
                 # The app sends the day mask a second after the slot.
                 if await self._ble_execute(slot_frame) and await self._ble_execute(week_frame):
@@ -1857,24 +1875,70 @@ class ScentDiffuserDevice:
                     await self._teardown_ble_client(reason="write-failure")
                 return False
 
-    async def _set_ai_diffuser_slot(self, slot: int, **changes) -> bool:
-        """Change fields of one AI-Diffuser schedule slot (Schedule N entities).
+    async def _set_ai_diffuser_active_slot(self, **changes) -> bool:
+        """Edit the slot the unit is in (the single Start/End/Work/Pause entities).
 
-        Builds on the slot as last read (the read-back after every
-        connect keeps it current), writes the slot and its day mask the
-        way the app does, then reads both tables back.
+        Same read-modify-write as Schedule N, so only the edited field
+        changes. The slot is resolved after the read-back, which also
+        refreshes which slot is active.
         """
-        self.require_schedule_read()
-        timers = self._state.timer_slots or {}
-        if slot not in timers:
-            raise HomeAssistantError(
-                f"{self._ble_name}: schedule {slot} hasn't been read yet, press Refresh"
-            )
-        updated = timers[slot].with_changes(**changes)
-        if not (0 <= updated.start_minute <= 1439 and 0 <= updated.stop_minute <= 1439):
-            _LOGGER.warning("AI-Diffuser %s: times must be within one day", self._ble_name)
-            return False
+        return await self._set_ai_diffuser_slot(None, **changes)
+
+    async def _read_ai_diffuser_schedule(self) -> bool:
+        """Re-read the day masks and the active table, and wait for both.
+
+        The full read-back runs once per session, so the slots in state
+        may predate edits made in the app since; a slot write carries the
+        whole record and must start from what the device holds now.
+        Connection must be open.
+        """
+        proto = self._protocol
+        self._timers_received.clear()
+        for frame in proto.begin_schedule_read():
+            await self._ble_send(frame)
+            await asyncio.sleep(0.4)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + SCENT_TECH_REPLY_TIMEOUT
+        while not proto.schedule_fresh:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                _LOGGER.debug("AI-Diffuser %s: schedule read-back timed out", self._ble_name)
+                return False
+            self._timers_received.clear()
+            try:
+                await asyncio.wait_for(self._timers_received.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
+        return True
+
+    async def _set_ai_diffuser_slot(self, slot: int | None, **changes) -> bool:
+        """Change fields of one AI-Diffuser schedule slot.
+
+        Read-modify-write like Scent Tech: re-reads the day masks and the
+        active table first, so edits made in the app since HA started are
+        kept, then writes the slot and its day mask the way the app does
+        and reads both back.
+        """
         async with self._timer_write_lock:
+            if not await self._ble_connect():
+                raise HomeAssistantError(
+                    f"Could not reach {self._ble_name} over Bluetooth" + self._last_seen_hint()
+                )
+            if not await self._read_ai_diffuser_schedule():
+                raise HomeAssistantError(
+                    f"{self._ble_name}: couldn't read the current schedule back, "
+                    "so the edit wasn't written. Try again."
+                )
+            self.require_schedule_read()
+            if slot is None:
+                slot = self._protocol.active_slot
+            timers = self._state.timer_slots or {}
+            if slot not in timers:
+                raise HomeAssistantError(f"{self._ble_name}: schedule {slot} wasn't reported")
+            updated = timers[slot].with_changes(**changes)
+            if not (0 <= updated.start_minute <= 1439 and 0 <= updated.stop_minute <= 1439):
+                _LOGGER.warning("AI-Diffuser %s: times must be within one day", self._ble_name)
+                return False
             for frame in self._protocol.build_timer_frames(slot, updated):
                 if not await self._ble_execute(frame):
                     return False
