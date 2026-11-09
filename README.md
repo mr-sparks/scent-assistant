@@ -55,6 +55,7 @@
 | Scent Marketing diffusers (SA_* series) | Scent Marketing | BLE | V2 + V3 variants; Power, Fan, Program switch, intensity, schedule read-back |
 | Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
 | Aromely Aro Max | Aromely | BLE | Power, Fan, daily schedule (work/pause), HVAC scent diffuser |
+| ADS644BT | AI-Diffuser | BLE | Power, schedule window + work/pause of the active slot, all six slots (the app's "Modes") as Schedule 1–6 entities, time sync, oil level/capacity/consumption; detected by its `1F71` service UUID. Status and oil are polled every 5 min; the Refresh button re-reads everything. The clock is only set from Sync Time, because setting it makes the unit beep three times |
 
 ### Likely Compatible
 
@@ -349,6 +350,7 @@ This integration was built by reverse engineering the BLE protocols of both devi
 | Scent Marketing AK | `8F` login (PIN 8888) + `2A`/`4A` schedule | None (length-framed) | Power, Fan, Program, schedule read-back; V2 + V3 variants |
 | Aromely Aro Max | `55 <dir> <reg> <type> [len payload]` on FFE0/FFE1/FFE2 | Sum mod 256 | Power, fan, daily schedule (work/pause as u16 seconds) |
 | Scent Tech / ScentLab | `55 AA <len> <cmd> … <chk> 5A` on FFE1 (write + notify) | Negated sum | Power, five schedules (16-byte records), time sync, optional password |
+| AI-Diffuser | JSON envelope carrying a 24-byte `FE EF … EF FF` frame on Telink `2B10` (write + notify) | None (fixed length) | Power, active schedule slot, time sync, oil |
 
 ---
 

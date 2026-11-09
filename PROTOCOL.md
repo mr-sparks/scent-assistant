@@ -261,6 +261,97 @@ Phase: 0x00=idle, 0x01=spraying, 0x02=paused
 
 ---
 
+## AI-Diffuser Protocol (com.lm.aidiffuser)
+
+Decoded from the Android app (AI-Diffuser 1.5.36, package `com.lm.aidiffuser`)
+and verified on an **ADS644BT** (firmware `Ver:0.0.1`, Telink SoC).
+
+### Advertisement and GATT
+
+- Local name: whatever the user set in the app (default `dev<NNN>`).
+- 16-bit service UUID `1F71` in the advertisement. The app's scanner also
+  accepts `1F4A`–`1F4F`, `1F5A`, `1F5B`, `1F81`, `1F91`, `1FA1`, `1FB1`.
+- Data channel: service `00010203-0405-0607-0809-0a0b0c0d1910`,
+  characteristic `00010203-0405-0607-0809-0a0b0c0d2b10` (read, write, notify),
+  used in **both** directions. This is Telink's SPP characteristic; the OTA
+  one (`…2b12`) is not present.
+- The `AE30`/`AE3A`/`AE00` services are the module's generic UART profile
+  and are not used by the app (`AE03` only loops writes back on `AE05`).
+
+### Envelope
+
+Commands are UTF-8 JSON, no terminator:
+
+```json
+{"TYPE":4,"ID":"0","TO":"35459559661551","MSG":"order:FEEF0500000000000000000000000000000000000000EFFF"}
+```
+
+`TO` is the MAC address read as one hex number, in decimal. The device
+echoes every envelope back, then replies with:
+
+```json
+{"num":1,"duan":0,"ALL":"FE EF 05 05 00 FF 02 34 01 00 00 00 00 00 00 00 00 00 00 00 05 0A EF FF"}
+```
+
+64-byte replies come in two objects (`num` 2, `duan` 0 and 1) whose `ALL`
+strings are joined with a space. Notifications are cut at the ATT MTU, so
+the JSON has to be reassembled before parsing. There is no login: the app
+reads the password (`02`) and compares it locally.
+
+### Frames
+
+Every frame is 24 bytes: `FE EF <cmd> <payload…> 00… EF FF`. Reads put the
+register in byte 2; writes put `00` in byte 2 and the sub-command in byte 3.
+
+| Read | Reply | Content |
+|------|-------|---------|
+| `05` | 24 B | Status (heartbeat) |
+| `06` | 64 B | Six schedule slots, custom (work/pause) mode |
+| `07` | 64 B | Six schedule slots, gear (level) mode |
+| `08` | 64 B | Model string, chip type, hardware version |
+| `09` | 64 B | Per-slot day masks, gear and pump bytes |
+| `0A` | 24 B | Oil volume, capacity, consumption |
+| `FB` | 42 B | Device name |
+
+| Write | Payload after `FE EF 00` | Notes |
+|-------|--------------------------|-------|
+| Power | `0E <00 run / 01 stop>` | Verified |
+| Clock | `07 YYYY MM DD WD HH MM SS` | Year big-endian, weekday 1 = Mon … 7 = Sun. The unit beeps three times on every clock write; reads and connects are silent |
+| Slot | `18 <gear 00/01> <slot 1-6> HH MM HH MM WORK PAUSE 05 0A <off-bit> <gear> 00 00 00 <pump>` | WORK/PAUSE are u16 **big-endian**; off-bit is `00` when enabled, else `1 << (slot-1)` |
+| Day mask | `14 <gear 00/01> <slot> <mask>` | Sent ~1 s after the slot write; bit 0 = Monday … bit 6 = Sunday (`41` = Mon + Sun) |
+| Fan | `0B <00/01>` | From the app, not verified |
+
+Values are read back **little-endian** although the app writes them
+big-endian: writing pause `00 82` reads back as `82 00` = 130 s.
+
+### Status (`05`)
+
+| Byte | Meaning |
+|------|---------|
+| 3 | Flags: bit0 = stopped (Pump_Auto_Close), bit1 = gear mode, bit2 = fan rotate, bit4 = fan on |
+| 4 | Pump spraying (1) |
+| 5 | Active slot, 0-based; `FF` = outside every window |
+| 6 | Pump pressure |
+| 8 | Density |
+| 9-10 / 11-12 | Run / pause seconds (LE) of the active slot |
+| 13-14 / 15-16 | Active window start / end (HH MM) |
+| 17 / 18 / 19 | Wi-Fi strength / reset flag / error code |
+| 21 | Power |
+
+### Schedule tables (`06` / `07`)
+
+For slot *i* (0-5): start `HH = [3+i]`, `MM = [9+i]`; end `HH = [15+i]`,
+`MM = [21+i]`; work = `[27+2i]` + `[28+2i]`·256; pause = `[39+2i]` +
+`[40+2i]`·256; enabled when bit *i* of byte 60 is **0**. Bytes 51-58 hold the
+device clock (year BE, month, day, weekday, hour, minute, second); only the
+table for the mode in use carries a live clock.
+
+### Oil (`0A`)
+
+Little-endian: rate integer `[3-4]`, current volume `[5-6]` (`FFFF` until a
+fragrance is set in the app), capacity `[7-8]`, rate fraction `[9-10]` in
+1/10000 (so `03 00 … 80 25` = 3.96 mL/h), oil type `[15-16]`.
+
 ## Building Packets (Python)
 
 ```python

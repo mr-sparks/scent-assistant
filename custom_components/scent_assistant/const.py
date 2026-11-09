@@ -16,6 +16,7 @@ class DeviceType(StrEnum):
     SCENT_MARKETING_GW_XOR = "scent_marketing_gw_xor"  # Scent Marketing app, GW family with XOR-encrypted JSON payload
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
     SCENT_TECH = "scent_tech"                          # YooAI OEM, ScentLab / Scent Tech apps (FFE1, 55 AA … 5A frames)
+    AI_DIFFUSER = "ai_diffuser"                        # AI-Diffuser app (com.lm.aidiffuser), Telink 1910/2b10, JSON-wrapped FE EF frames
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,35 @@ AROMELY_ADV_SERVICE_UUID = "0000af30-0000-1000-8000-00805f9b34fb"
 # match is rejected for these local-name prefixes; the "AroMax" marker in
 # the manufacturer data still wins.
 AROMELY_AF30_EXCLUDED_NAME_PREFIXES = ("HLK-",)
+
+# AI-Diffuser app (com.lm.aidiffuser, Guangzhou Lanmei). Telink SoC; the app
+# writes and subscribes on the same "SPP" characteristic 2b10 of service
+# 1910 (the Telink OTA characteristic is 2b12, absent on tested units).
+# Every command is a UTF-8 JSON envelope whose MSG carries a 24-byte
+# "FE EF … EF FF" frame as hex; replies are JSON with the frame in "ALL",
+# split into num/duan parts when longer than one notification batch.
+AI_DIFFUSER_SERVICE_UUID = "00010203-0405-0607-0809-0a0b0c0d1910"
+AI_DIFFUSER_CHAR_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
+# 16-bit service UUIDs the app's scanner filters on (BluetoothCommon
+# BLE_BASE_SCAN_UUID*). 1f71 is confirmed on an ADS644BT.
+AI_DIFFUSER_ADV_SERVICE_UUIDS = frozenset(
+    f"0000{short}-0000-1000-8000-00805f9b34fb"
+    for short in (
+        "1f4a", "1f4b", "1f4c", "1f4d", "1f4e", "1f4f", "1f5a", "1f5b",
+        "1f71", "1f81", "1f91", "1fa1", "1fb1",
+    )
+)
+AI_DIFFUSER_CMD_STATUS = 0x05      # heartbeat: power, pump, active slot, times
+AI_DIFFUSER_CMD_GEAR = 0x07        # schedule table, gear (level) mode
+AI_DIFFUSER_CMD_CUSTOM = 0x06      # schedule table, custom work/pause mode
+AI_DIFFUSER_CMD_HARDWARE = 0x08    # model string + hardware version
+AI_DIFFUSER_CMD_WEEK = 0x09        # per-slot day masks, gear and pump
+AI_DIFFUSER_CMD_OIL = 0x0A         # oil volume / capacity / consumption
+AI_DIFFUSER_SUB_TIME = 0x07        # write: set device clock
+AI_DIFFUSER_SUB_POWER = 0x0E       # write: 00 = run, 01 = stop
+AI_DIFFUSER_SUB_SLOT = 0x18        # write: one schedule slot
+AI_DIFFUSER_SUB_WEEK = 0x14        # write: one slot's day mask
+AI_DIFFUSER_SLOTS = 6
 
 # Frame: 55 <dir> <reg> <type> [<len> <payload...>] <checksum>
 # checksum = sum of every byte after the 0x55 header, mod 256.

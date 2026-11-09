@@ -8,11 +8,23 @@ from __future__ import annotations
 
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import SCENT_TECH_TIMER_SLOTS
+from .const import AI_DIFFUSER_SLOTS, SCENT_TECH_TIMER_SLOTS, DeviceType
 from .device import ScentDiffuserDevice
 from .protocol_ble import ScentTechTimer
 
 TIMER_SLOTS = range(1, SCENT_TECH_TIMER_SLOTS + 1)
+# AI-Diffuser units hold six slots ("Mode 1-6" in the app) in the same
+# record shape, so they reuse these entities.
+AI_DIFFUSER_TIMER_SLOTS = range(1, AI_DIFFUSER_SLOTS + 1)
+
+
+def timer_slots_for(device: ScentDiffuserDevice) -> range:
+    """Per-slot schedule entities a device gets (empty when it has none)."""
+    if device.device_type == DeviceType.SCENT_TECH:
+        return TIMER_SLOTS
+    if device.device_type == DeviceType.AI_DIFFUSER:
+        return AI_DIFFUSER_TIMER_SLOTS
+    return range(0)
 
 
 class ScentTechTimerEntity:

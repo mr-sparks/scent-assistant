@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .capability_entity import add_when_present
 from .const import CONF_MOMENTARY_SECONDS, DOMAIN, DeviceType
 from .device import ScentDiffuserDevice
-from .timer_entity import TIMER_SLOTS, ScentTechTimerEntity
+from .timer_entity import TIMER_SLOTS, ScentTechTimerEntity, timer_slots_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +55,13 @@ async def async_setup_entry(
                 for field in ("work", "pause")
             ],
             lambda: device.radar_present,
+        )
+    # AI-Diffuser: durations of the slot in use, plus all six slots.
+    if device.device_type == DeviceType.AI_DIFFUSER:
+        entities.extend(
+            ScentTechTimerDuration(device, slot, field)
+            for slot in timer_slots_for(device)
+            for field in ("run_seconds", "pause_seconds")
         )
     async_add_entities(entities)
 
