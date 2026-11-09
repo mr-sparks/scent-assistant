@@ -1747,6 +1747,8 @@ class ScentDiffuserDevice:
         record and writes the whole record back, so the serial, timer id
         and anything the official app set stay intact. Reads the table
         again afterwards so HA shows what the device actually stored.
+        Success requires the full target record to match that read-back;
+        an acknowledgement alone does not confirm the stored values.
         """
         if not isinstance(self._protocol, ScentTechProtocol) or not self._ble_address:
             return False
@@ -1777,12 +1779,13 @@ class ScentDiffuserDevice:
                 except asyncio.TimeoutError:
                     _LOGGER.debug("Scent Tech %s: no 0x94 for timer %s", self._ble_name, slot)
                 await asyncio.sleep(0.25)
-                if await self._read_scent_tech_timers() is None:
-                    # No read-back: show what we sent rather than the old value.
-                    slots = dict(self._state.timer_slots or {})
-                    slots[slot] = updated
-                    self._state.timer_slots = slots
-                    self._notify_state_changed()
+                confirmed = await self._read_scent_tech_timers()
+                if confirmed is None or confirmed.get(slot) != updated:
+                    _LOGGER.warning(
+                        "Scent Tech %s: timer %s write not confirmed by read-back",
+                        self._ble_name, slot,
+                    )
+                    return False
                 return True
             except (BleakError, asyncio.TimeoutError, OSError) as err:
                 _LOGGER.warning("Scent Tech timer write failed on %s: %s", self._ble_name, err)

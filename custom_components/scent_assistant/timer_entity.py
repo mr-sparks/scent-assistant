@@ -6,6 +6,8 @@ field per slot; this base wires an entity to its slot's cached record.
 """
 from __future__ import annotations
 
+from homeassistant.exceptions import HomeAssistantError
+
 from .const import SCENT_TECH_TIMER_SLOTS
 from .device import ScentDiffuserDevice
 from .protocol_ble import ScentTechTimer
@@ -30,6 +32,14 @@ class ScentTechTimerEntity:
         if self.hass is None:
             return
         self.async_write_ha_state()
+
+    async def _async_set_timer_fields(self, **changes) -> None:
+        """Surface an unconfirmed write as a failed Home Assistant action."""
+        if not await self._device.set_timer_slot(self._slot, **changes):
+            raise HomeAssistantError(
+                f"Schedule {self._slot} write was not confirmed by the device. "
+                "Check the current schedule before making another change."
+            )
 
     @property
     def timer(self) -> ScentTechTimer | None:

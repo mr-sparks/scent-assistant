@@ -169,4 +169,4 @@ class ScentTechTimerDays(ScentTechTimerEntity, SelectEntity):
         mask = _OPTION_TO_MASK[option]
         # Bit 7 is the apps' "at least one day selected" marker.
         weekdays = mask | (SCENT_TECH_WEEKDAY_ANY if mask else 0)
-        await self._device.set_timer_slot(self._slot, weekdays=weekdays)
+        await self._async_set_timer_fields(weekdays=weekdays)

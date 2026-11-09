@@ -137,6 +137,4 @@ class ScentTechTimerTime(ScentTechTimerEntity, TimeEntity):
         return time(minute // 60 % 24, minute % 60)
 
     async def async_set_value(self, value: time) -> None:
-        await self._device.set_timer_slot(
-            self._slot, **{self._field: value.hour * 60 + value.minute}
-        )
+        await self._async_set_timer_fields(**{self._field: value.hour * 60 + value.minute})
