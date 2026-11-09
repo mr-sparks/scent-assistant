@@ -2807,28 +2807,30 @@ class AiDiffuserProtocol(BleProtocol):
         # Set when a week (09) / schedule table (06, 07) reply is decoded;
         # cleared by begin_schedule_read() before a read-modify-write.
         self._week_fresh = False
+        self._status_fresh = False
         self._tables_fresh: set[int] = set()
 
     def begin_schedule_read(self) -> list[bytes]:
         """Start a fresh read of the day masks and the active table.
 
-        Returns the frames to send; schedule_fresh turns True once both
-        replies (and the status, if the mode isn't known yet) are decoded.
+        Returns the frames to send; schedule_fresh turns True once the
+        status, the day masks and the live table have been decoded. The
+        status is always re-read: the mode may have been switched in the
+        app since the last poll, and a slot write carries the mode byte.
+        Which table is live is only known from that reply, so both are read.
         """
         self._week_fresh = False
+        self._status_fresh = False
         self._tables_fresh = set()
-        if self._gear_mode is None:
-            # Mode unknown: the status says which table is live, so read both.
-            return [
-                self._read(AI_DIFFUSER_CMD_STATUS), self.build_week_query(),
-                self._read(AI_DIFFUSER_CMD_CUSTOM), self._read(AI_DIFFUSER_CMD_GEAR),
-            ]
-        return [self.build_week_query(), self.build_table_query()]
+        return [
+            self._read(AI_DIFFUSER_CMD_STATUS), self.build_week_query(),
+            self._read(AI_DIFFUSER_CMD_CUSTOM), self._read(AI_DIFFUSER_CMD_GEAR),
+        ]
 
     @property
     def schedule_fresh(self) -> bool:
         """True once the reads from begin_schedule_read() have come back."""
-        if not self._week_fresh or self._gear_mode is None:
+        if not self._week_fresh or not self._status_fresh or self._gear_mode is None:
             return False
         active = AI_DIFFUSER_CMD_GEAR if self._gear_mode else AI_DIFFUSER_CMD_CUSTOM
         return active in self._tables_fresh
@@ -3127,6 +3129,7 @@ class AiDiffuserProtocol(BleProtocol):
         flags = f[3]
         power = not (flags & 0x01)            # Pump_Auto_Close
         self._gear_mode = bool(flags & 0x02)  # ModelType: 1 = gear (level) mode
+        self._status_fresh = True
         pump_running = f[4] == 1
         self._active_index = f[5] if f[5] < AI_DIFFUSER_SLOTS else None
         if not power:
