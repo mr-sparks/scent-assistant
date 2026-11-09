@@ -66,7 +66,41 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class DiffuserPowerSwitch(SwitchEntity):
+class _PendingSwitch(SwitchEntity):
+    """Switch that shows the requested position while the command runs.
+
+    A command first has to open a Bluetooth connection, which can take
+    longer than the 2 s the frontend waits before it snaps a toggle back
+    to the entity's state, so the switch flickered off, on, off. The
+    target is reported as the state until the command has finished; then
+    the device state takes over again, which also rolls the switch back
+    when the command failed.
+    """
+
+    _pending: bool | None = None
+
+    def _device_is_on(self) -> bool | None:
+        raise NotImplementedError
+
+    @property
+    def is_on(self) -> bool | None:
+        if self._pending is not None:
+            return self._pending
+        return self._device_is_on()
+
+    async def _async_switch(self, target: bool, command) -> None:
+        self._pending = target
+        if self.hass is not None:
+            self.async_write_ha_state()
+        try:
+            await command(target)
+        finally:
+            self._pending = None
+            if self.hass is not None:
+                self.async_write_ha_state()
+
+
+class DiffuserPowerSwitch(_PendingSwitch):
     """Power on/off switch for the diffuser."""
 
     _attr_has_entity_name = True
@@ -84,8 +118,7 @@ class DiffuserPowerSwitch(SwitchEntity):
             return
         self.async_write_ha_state()
 
-    @property
-    def is_on(self) -> bool | None:
+    def _device_is_on(self) -> bool | None:
         return self._device.state.power
 
     @property
@@ -93,13 +126,13 @@ class DiffuserPowerSwitch(SwitchEntity):
         return self._device.available
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._device.set_power(True)
+        await self._async_switch(True, self._device.set_power)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._device.set_power(False)
+        await self._async_switch(False, self._device.set_power)
 
 
-class DiffuserLockSwitch(SwitchEntity):
+class DiffuserLockSwitch(_PendingSwitch):
     """Child-lock switch (Scent Marketing devices)."""
 
     _attr_has_entity_name = True
@@ -117,8 +150,7 @@ class DiffuserLockSwitch(SwitchEntity):
             return
         self.async_write_ha_state()
 
-    @property
-    def is_on(self) -> bool | None:
+    def _device_is_on(self) -> bool | None:
         return self._device.state.lock
 
     @property
@@ -126,13 +158,13 @@ class DiffuserLockSwitch(SwitchEntity):
         return self._device.available
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._device.set_lock(True)
+        await self._async_switch(True, self._device.set_lock)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._device.set_lock(False)
+        await self._async_switch(False, self._device.set_lock)
 
 
-class DiffuserScheduleSwitch(SwitchEntity):
+class DiffuserScheduleSwitch(_PendingSwitch):
     """Program / schedule enabled switch (Scent Marketing AK V3 only).
 
     On V3 devices the program-enabled flag is independent of Power and
@@ -157,8 +189,7 @@ class DiffuserScheduleSwitch(SwitchEntity):
             return
         self.async_write_ha_state()
 
-    @property
-    def is_on(self) -> bool | None:
+    def _device_is_on(self) -> bool | None:
         return self._device.state.schedule_enabled
 
     @property
@@ -167,13 +198,13 @@ class DiffuserScheduleSwitch(SwitchEntity):
         return self._device.available and self._device.protocol_is_v3
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._device.set_schedule_enabled(True)
+        await self._async_switch(True, self._device.set_schedule_enabled)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._device.set_schedule_enabled(False)
+        await self._async_switch(False, self._device.set_schedule_enabled)
 
 
-class DiffuserLampSwitch(SwitchEntity):
+class DiffuserLampSwitch(_PendingSwitch):
     """Auxiliary LED / lamp switch (Scent Marketing AK family)."""
 
     _attr_has_entity_name = True
@@ -191,8 +222,7 @@ class DiffuserLampSwitch(SwitchEntity):
             return
         self.async_write_ha_state()
 
-    @property
-    def is_on(self) -> bool | None:
+    def _device_is_on(self) -> bool | None:
         return self._device.state.light_on
 
     @property
@@ -200,13 +230,13 @@ class DiffuserLampSwitch(SwitchEntity):
         return self._device.available
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._device.set_lamp(True)
+        await self._async_switch(True, self._device.set_lamp)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._device.set_lamp(False)
+        await self._async_switch(False, self._device.set_lamp)
 
 
-class DiffuserFanSwitch(SwitchEntity):
+class DiffuserFanSwitch(_PendingSwitch):
     """Fan on/off switch (Aroma-Link only, requires Bluetooth)."""
 
     _attr_has_entity_name = True
@@ -225,8 +255,7 @@ class DiffuserFanSwitch(SwitchEntity):
             return
         self.async_write_ha_state()
 
-    @property
-    def is_on(self) -> bool | None:
+    def _device_is_on(self) -> bool | None:
         return self._device.state.fan
 
     @property
@@ -242,13 +271,13 @@ class DiffuserFanSwitch(SwitchEntity):
         return {}
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._device.set_fan(True)
+        await self._async_switch(True, self._device.set_fan)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._device.set_fan(False)
+        await self._async_switch(False, self._device.set_fan)
 
 
-class ScentTechTimerSwitch(ScentTechTimerEntity, SwitchEntity):
+class ScentTechTimerSwitch(ScentTechTimerEntity, _PendingSwitch):
     """Enable / disable one Scent Tech timer slot."""
 
     _attr_icon = "mdi:calendar-clock"
@@ -256,12 +285,15 @@ class ScentTechTimerSwitch(ScentTechTimerEntity, SwitchEntity):
     def __init__(self, device: ScentDiffuserDevice, slot: int) -> None:
         super().__init__(device, slot, "enabled", "")
 
-    @property
-    def is_on(self) -> bool | None:
+    def _device_is_on(self) -> bool | None:
         return self.timer.enabled if self.timer else None
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._async_set_timer_fields(enabled=True)
+        await self._async_switch(
+            True, lambda on: self._async_set_timer_fields(enabled=on)
+        )
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._async_set_timer_fields(enabled=False)
+        await self._async_switch(
+            False, lambda on: self._async_set_timer_fields(enabled=on)
+        )
