@@ -646,6 +646,11 @@ class AromaLinkBleProtocol(BleProtocol):
         """Drop a partial frame left from the previous link."""
         self._rx_buffer.clear()
 
+    @property
+    def rx_pending(self) -> bool:
+        """Whether a fragmented Aroma-Link reply is still being assembled."""
+        return bool(self._rx_buffer)
+
     def parse_notification(self, data: bytes) -> dict:
         """Parse Aroma-Link notification packets."""
         result: dict = {}

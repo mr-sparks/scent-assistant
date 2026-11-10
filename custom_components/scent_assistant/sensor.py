@@ -228,7 +228,11 @@ class DiffuserOilSensor(SensorEntity):
         # number" is a fair question. Answer it with a timestamp rather
         # than by flipping the entity unavailable — an oil level doesn't
         # move in minutes, and the last known value beats a gap.
-        last = self._device.ble_last_update
+        last = (
+            self._device.oil_remaining_last_update
+            if self._device.device_type == DeviceType.AROMA_LINK
+            else self._device.ble_last_update
+        )
         if last is None:
             return None
         return {"last_device_update": last.isoformat()}
@@ -267,7 +271,7 @@ class DiffuserOilLevelSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict | None:
-        last = self._device.ble_last_update
+        last = self._device.oil_level_last_update
         if last is None:
             return None
         return {"last_device_update": last.isoformat()}
