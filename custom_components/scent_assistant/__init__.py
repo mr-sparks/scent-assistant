@@ -25,6 +25,7 @@ from .const import (
     CONF_CONNECTION_MODE,
     CONF_MOMENTARY_SECONDS,
     CONF_REFRESH_INTERVAL,
+    CONF_STAY_CONNECTED,
     BLE_REFRESH_INTERVAL_SECONDS,
     BLE_REFRESH_INTERVAL_MIN_SECONDS,
     BLE_INITIAL_REFRESH_RETRY_SECONDS,
@@ -130,6 +131,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     if device.supports_periodic_refresh:
         device.refresh_interval = _refresh_interval(entry)
+        device.set_stay_connected(entry.options.get(CONF_STAY_CONNECTED, False))
 
     # Initial state query (BLE: connects briefly then disconnects; Cloud: polls API)
     try:
@@ -214,6 +216,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # An update during unload must not re-arm the unloaded device.
             if hass.data[DOMAIN].get(entry.entry_id) is not device:
                 return
+            device.set_stay_connected(entry.options.get(CONF_STAY_CONNECTED, False))
             interval = _refresh_interval(entry)
             if interval == device.refresh_interval:
                 return

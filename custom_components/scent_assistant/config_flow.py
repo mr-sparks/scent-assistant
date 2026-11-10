@@ -28,6 +28,7 @@ from .const import (
     CONF_CONNECTION_MODE,
     CONF_GW_PASSWORD,
     CONF_REFRESH_INTERVAL,
+    CONF_STAY_CONNECTED,
     BLE_REFRESH_INTERVAL_SECONDS,
     BLE_REFRESH_INTERVAL_MIN_SECONDS,
     DeviceType,
@@ -472,25 +473,36 @@ class ScentDiffuserOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Set the BLE refresh interval."""
+        """Set the BLE refresh interval and Stay connected."""
+        stay_supported = (
+            self._entry.data.get(CONF_CONNECTION_MODE, "ble") == "ble"
+            and self._entry.data.get(CONF_DEVICE_TYPE, "aroma_link") == DeviceType.AROMA_LINK
+        )
         if user_input is not None:
             options = dict(self._entry.options)
             options.pop(CONF_REFRESH_INTERVAL, None)
+            options.pop(CONF_STAY_CONNECTED, None)
             interval = user_input[CONF_REFRESH_INTERVAL]
             if interval != BLE_REFRESH_INTERVAL_SECONDS:
                 options[CONF_REFRESH_INTERVAL] = interval
+            if stay_supported and user_input.get(CONF_STAY_CONNECTED, False):
+                options[CONF_STAY_CONNECTED] = True
             return self.async_create_entry(data=options)
 
         current = self._entry.options.get(
             CONF_REFRESH_INTERVAL, BLE_REFRESH_INTERVAL_SECONDS
         )
         current = max(BLE_REFRESH_INTERVAL_MIN_SECONDS, int(current))
+        stay = self._entry.options.get(CONF_STAY_CONNECTED, False)
+        schema = {
+            vol.Required(CONF_REFRESH_INTERVAL, default=current): vol.All(
+                vol.Coerce(int),
+                vol.Range(min=BLE_REFRESH_INTERVAL_MIN_SECONDS, max=3600),
+            ),
+        }
+        if stay_supported:
+            schema[vol.Required(CONF_STAY_CONNECTED, default=stay)] = bool
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({
-                vol.Required(CONF_REFRESH_INTERVAL, default=current): vol.All(
-                    vol.Coerce(int),
-                    vol.Range(min=BLE_REFRESH_INTERVAL_MIN_SECONDS, max=3600),
-                ),
-            }),
+            data_schema=vol.Schema(schema),
         )

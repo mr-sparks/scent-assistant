@@ -120,14 +120,15 @@ Control your diffuser via the Aroma-Link cloud service. No Bluetooth required.
 
 > **Note:** Requires an Aroma-Link account and internet connection. Fan control is only available via Bluetooth.
 
-### Refresh interval (Aroma-Link, Bluetooth)
+### Refresh interval and Stay connected (Aroma-Link, Bluetooth)
 
-Home Assistant reads an Aroma-Link diffuser added over Bluetooth every 300 seconds. To change this, select **Configure** on its entry under **Settings > Devices & Services > Scent Assistant** and set **Refresh interval** (60-3600 seconds).
+Home Assistant reads an Aroma-Link diffuser added over Bluetooth every 300 seconds. To change this, select **Configure** on its entry under **Settings > Devices & Services > Scent Assistant** and set **Refresh interval** (60-3600 seconds) or turn on **Stay connected**.
 
-- Each read is one Bluetooth connect, held for about 10 seconds. During that time the phone app cannot connect and the Bluetooth adapter or ESPHome proxy has one of its connection slots (3 by default on a proxy) in use. Reads below 300 seconds connect the same way.
+- Without Stay connected, each read is one Bluetooth connect, held for about 10 seconds. During that time the phone app cannot connect and the Bluetooth adapter or ESPHome proxy has one of its connection slots (3 by default on a proxy) in use. Reads below 300 seconds connect the same way.
 - Below 300 seconds, a read may skip Oil remaining, Work Duration and Pause Duration, which are still read at least every 300 seconds.
 - Below 300 seconds, reads pause for 60 seconds after a Bluetooth connect or write fails.
-- Each read can add recorder rows for the remaining-time sensors and, on units that report it, Oil remaining, so short intervals add more rows.
+- Stay connected (off by default, Aroma-Link Bluetooth only) holds one Bluetooth connection to the diffuser and reads its status every 20 seconds, pausing while a full read or fragmented reply completes. While it is on, the phone app cannot connect and the Bluetooth adapter or ESPHome proxy keeps one connection slot in use. Commands and Diffuse Now use the same connection. The connection opens with the next read at the refresh interval or the next command, and reopens the same way after a drop or a status-read failure; the status reader never reconnects by itself. Turning the option off restores idle disconnection.
+- With Stay connected, changing remaining-time sensors can add recorder rows at the 20-second status cadence (and on normal full reads or device pushes), rather than acting as ticking timers. Aroma-Link Oil remaining and Oil level timestamps advance only on an actual oil reply, including an unchanged measurement, not on status clock/countdowns. Global BLE freshness in diagnostics still advances on status replies. Full reads can therefore add oil recorder rows at the configured refresh cadence.
 - Cloud entries are polled every 60 seconds and have no option.
 
 ---

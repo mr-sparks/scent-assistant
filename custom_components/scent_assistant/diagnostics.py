@@ -119,6 +119,16 @@ async def async_get_config_entry_diagnostics(
                 if device and device.ble_last_update else None
             ),
             "periodic_refresh": device.supports_periodic_refresh if device else None,
+            # Configuration, worker lifecycle and live link are different facts.
+            "stay_connected": device._stay_connected if device else None,
+            "status_reader_running": (
+                bool(device._status_task and not device._status_task.done()) if device else None
+            ),
+            "ble_connected": (
+                bool(device._ble_connected and device._ble_client and device._ble_client.is_connected)
+                if device else None
+            ),
+            "ble_notify_subscribed": device._ble_notify_subscribed if device else None,
             "initial_state_pending": device.needs_initial_refresh if device else None,
             "silent_state_reads": device.silent_state_reads if device else None,
             "ak_cy_variant": device.ak_cy_variant if device else None,

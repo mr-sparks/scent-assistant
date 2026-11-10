@@ -64,6 +64,10 @@ SCENT_TECH_REPLY_TIMEOUT = 4.0
 
 # Disconnect BLE after this many seconds of inactivity
 BLE_IDLE_DISCONNECT_SECONDS = 10
+# Stay connected: seconds between 52 0A reads over the held link.
+BLE_STATUS_READ_SECONDS = 20
+# Bound the wait for Aroma-Link's fragmented replies, including 52 15.
+AL_REPLY_TIMEOUT = 5.0
 # Cooldown after a failed connect / write before we try again, so a
 # stuck device gets a chance to recover instead of being hammered.
 BLE_FAILURE_COOLDOWN_SECONDS = 3.0
@@ -182,6 +186,9 @@ class ScentDiffuserDevice:
         # state. Lets a user tell a fresh reading from a stale one
         # without the entity flapping to unavailable (#32).
         self._ble_last_update: datetime | None = None
+        # Oil freshness is independent of Aroma-Link's clock/countdown reads.
+        self._oil_remaining_last_update: datetime | None = None
+        self._oil_level_last_update: datetime | None = None
         # Whether a BLE state read has completed since setup, and when
         # the last advertisement-triggered retry of it was started.
         # Set by the first notification that carries state, not by sending
@@ -209,6 +216,20 @@ class ScentDiffuserDevice:
         self._ble_full_refresh_ts: float | None = None
         # The last full read ended with no state read since setup.
         self._ble_full_refresh_unanswered = False
+        # Stay connected: no idle disconnect, status reads in _status_task.
+        self._stay_connected = False
+        self._status_task: asyncio.Task | None = None
+        self._status_wake = asyncio.Event()
+        self._shutting_down = False
+        # Only Aroma-Link uses this gate; every refresh caller owns it until
+        # replies finish (or the bounded wait expires), not just timed reads.
+        self._al_refresh_lock = asyncio.Lock()
+        self._al_refresh_tasks: set[asyncio.Task] = set()
+        self._al_week_received = asyncio.Event()
+        self._al_status_received = asyncio.Event()
+        self._al_rx_idle = asyncio.Event()
+        self._al_rx_idle.set()
+        self._al_rx_pending_since: float | None = None
 
         # Scent Tech timer writes are read-modify-write on one record, so
         # they must not interleave; the events let a write wait for the
@@ -272,6 +293,16 @@ class ScentDiffuserDevice:
     def ble_last_update(self) -> datetime | None:
         """When the device last pushed a state-changing notification."""
         return self._ble_last_update
+
+    @property
+    def oil_remaining_last_update(self) -> datetime | None:
+        """When Aroma-Link last reported its oil percentage, even unchanged."""
+        return self._oil_remaining_last_update
+
+    @property
+    def oil_level_last_update(self) -> datetime | None:
+        """When Aroma-Link last reported its low-oil warning, even unchanged."""
+        return self._oil_level_last_update
 
     @property
     def supports_periodic_refresh(self) -> bool:
@@ -515,15 +546,25 @@ class ScentDiffuserDevice:
     # ------------------------------------------------------------------
 
     async def _ble_connect(self) -> bool:
-        """Connect to BLE if not already connected. Auto-disconnects after idle."""
-        if not self._ble_address:
+        """Connect to BLE if not already connected.
+
+        The link idles out unless Stay connected holds it.
+        """
+        if not self._ble_address or self._shutting_down:
             return False
 
-        # Cancel pending disconnect
-        if self._ble_disconnect_task and not self._ble_disconnect_task.done():
+        # Never cancel a teardown already holding the lock. Wait for it before
+        # reusing/replacing its client, even if is_connected is still true.
+        if (
+            not self._ble_lock.locked()
+            and self._ble_disconnect_task and not self._ble_disconnect_task.done()
+        ):
             self._ble_disconnect_task.cancel()
 
-        if self._ble_connected and self._ble_client and self._ble_client.is_connected:
+        if (
+            not self._ble_lock.locked()
+            and self._ble_connected and self._ble_client and self._ble_client.is_connected
+        ):
             self._schedule_disconnect()
             return True
 
@@ -541,6 +582,8 @@ class ScentDiffuserDevice:
             return False
 
         async with self._ble_lock:
+            if self._shutting_down:
+                return False
             # Double-check after acquiring lock
             if self._ble_connected and self._ble_client and self._ble_client.is_connected:
                 self._schedule_disconnect()
@@ -590,6 +633,9 @@ class ScentDiffuserDevice:
                     self._ble_name or self._ble_address,
                     max_attempts=BLE_CONNECT_MAX_ATTEMPTS,
                 )
+                if self._shutting_down:
+                    await self._teardown_ble_client(reason="shutdown")
+                    return False
                 self._ble_connected = True
                 await self._check_gatt_services()
                 if isinstance(self._protocol, (AromaLinkBleProtocol, AiDiffuserProtocol)):
@@ -788,6 +834,9 @@ class ScentDiffuserDevice:
                     except Exception as err:
                         _LOGGER.debug("Scent Marketing GW: password send failed: %s", err)
 
+                if self._shutting_down:
+                    await self._teardown_ble_client(reason="shutdown")
+                    return False
                 self._schedule_disconnect()
                 return True
 
@@ -882,9 +931,18 @@ class ScentDiffuserDevice:
         return f" (last advertisement {age:.0f} s ago via {info.source}, RSSI {info.rssi} dBm)"
 
     def _schedule_disconnect(self) -> None:
-        """Schedule BLE disconnect after idle period."""
+        """Schedule the idle disconnect; Stay connected keeps the link."""
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
             self._ble_disconnect_task.cancel()
+        if self._shutting_down:
+            return
+        # Preference alone must not hold a link if the reader is gone or the
+        # notification subscription failed.
+        if (
+            self._stay_connected and self._ble_notify_subscribed
+            and self._status_task is not None and not self._status_task.done()
+        ):
+            return
         self._ble_disconnect_task = asyncio.ensure_future(self._delayed_disconnect())
 
     async def _delayed_disconnect(self) -> None:
@@ -907,28 +965,49 @@ class ScentDiffuserDevice:
         the connect / delayed-disconnect paths (which already do).
         """
         client = self._ble_client
-        if client is not None and self._ble_notify_subscribed:
+        aroma_link = isinstance(self._protocol, AromaLinkBleProtocol)
+        try:
+            if client is not None and self._ble_notify_subscribed:
+                try:
+                    stop = client.stop_notify(self._protocol.notify_char_uuid)
+                    if aroma_link:
+                        await asyncio.wait_for(stop, AL_REPLY_TIMEOUT)
+                    else:
+                        await stop
+                except Exception as err:
+                    _LOGGER.debug(
+                        "BLE stop_notify on %s failed during teardown (%s): %s",
+                        self._ble_name, reason, err,
+                    )
+        finally:
+            # Cancellation during unsubscribe must still disconnect this
+            # client, without swallowing the owner's CancelledError.
+            self._ble_notify_subscribed = False
             try:
-                await client.stop_notify(self._protocol.notify_char_uuid)
-            except Exception as err:
-                _LOGGER.debug(
-                    "BLE stop_notify on %s failed during teardown (%s): %s",
-                    self._ble_name, reason, err,
-                )
-        self._ble_notify_subscribed = False
-        if client is not None:
-            try:
-                if client.is_connected:
-                    await client.disconnect()
-                    _LOGGER.debug("BLE disconnected (%s): %s", reason, self._ble_name)
-            except Exception as err:
-                _LOGGER.debug(
-                    "BLE disconnect on %s failed during teardown (%s): %s",
-                    self._ble_name, reason, err,
-                )
-        self._ble_client = None
-        self._ble_connected = False
-        self._ble_write_response = None
+                if client is not None:
+                    try:
+                        if client.is_connected:
+                            close = client.disconnect()
+                            if aroma_link:
+                                await asyncio.wait_for(close, AL_REPLY_TIMEOUT)
+                            else:
+                                await close
+                            _LOGGER.debug("BLE disconnected (%s): %s", reason, self._ble_name)
+                    except Exception as err:
+                        _LOGGER.debug(
+                            "BLE disconnect on %s failed during teardown (%s): %s",
+                            self._ble_name, reason, err,
+                        )
+            finally:
+                self._ble_client = None
+                self._ble_connected = False
+                self._ble_write_response = None
+                if isinstance(self._protocol, AromaLinkBleProtocol):
+                    self._protocol.reset_rx()
+                    self._al_rx_pending_since = None
+                    self._al_rx_idle.set()
+                if client is not None:
+                    self._notify_state_changed()
 
     def _write_needs_response(self) -> bool:
         """Decide whether writes to this device need a GATT response.
@@ -983,8 +1062,11 @@ class ScentDiffuserDevice:
         leaving a half-broken handle around made V3 firmwares unable
         to be reached by *any* client until a power cycle.
         """
-        if not self._ble_client or not self._ble_client.is_connected:
+        if self._shutting_down or not self._ble_client or not self._ble_client.is_connected:
             return False
+        if isinstance(self._protocol, AromaLinkBleProtocol) and data[4:5] == b"\x52":
+            # Full-read subqueries must not reset an earlier fragmented reply.
+            await self._wait_for_al_rx()
         chunks = self._protocol.wire_chunks(data) if data else []
         if chunks:
             self._recent_commands.append(data.hex())
@@ -1035,6 +1117,24 @@ class ScentDiffuserDevice:
             del self._recent_notifications[0]
         self._log_frame("<-", raw_hex)
         updates = self._protocol.parse_notification(raw)
+        if isinstance(self._protocol, AromaLinkBleProtocol):
+            if self._protocol.rx_pending:
+                if self._al_rx_pending_since is None:
+                    self._al_rx_pending_since = asyncio.get_running_loop().time()
+                self._al_rx_idle.clear()
+            else:
+                self._al_rx_pending_since = None
+                self._al_rx_idle.set()
+            if "week_slots" in updates:
+                self._al_week_received.set()
+            if "device_clock" in updates:
+                self._al_status_received.set()
+            # Only an actual oil reply refreshes that measurement's metadata.
+            # Global BLE liveness still advances for clock/countdowns below.
+            if "oil_remaining" in updates:
+                self._oil_remaining_last_update = datetime.now().astimezone()
+            if "oil_low" in updates:
+                self._oil_level_last_update = datetime.now().astimezone()
         masked = updates.get("masked_frame_hex")
         if masked:
             # The frame's chunks are the newest ring entries.
@@ -2005,6 +2105,106 @@ class ScentDiffuserDevice:
             if self._periodic_refresh_ts == started:
                 self._periodic_refresh_ts = None
 
+    def set_stay_connected(self, on: bool) -> None:
+        """Hold the BLE link open with status reads, or drop it when idle."""
+        if self._shutting_down or not (
+            self.supports_periodic_refresh and isinstance(self._protocol, AromaLinkBleProtocol)
+        ):
+            return
+        self._stay_connected = on
+        if on:
+            self._status_wake.set()
+            if self._status_task is None or self._status_task.done():
+                # One retained worker, even across rapid toggles. Disabling
+                # does not interrupt a write/teardown or lose its task handle.
+                if self._hass is not None:
+                    self._status_task = self._hass.async_create_background_task(
+                        self._status_reads(), f"scent_assistant status {self.unique_id}"
+                    )
+                else:
+                    self._status_task = asyncio.create_task(self._status_reads())
+                self._status_task.add_done_callback(self._status_reader_done)
+        else:
+            self._status_wake.clear()
+        # A connect in progress applies this when it ends; a teardown in
+        # progress must not be cancelled.
+        if self._ble_lock.locked():
+            return
+        if self._ble_connected and self._ble_client and self._ble_client.is_connected:
+            self._schedule_disconnect()
+
+    async def _status_reads(self) -> None:
+        """Send 52 0A over the held link; never connect."""
+        protocol = self._protocol
+        assert isinstance(protocol, AromaLinkBleProtocol)
+        while not self._shutting_down:
+            await self._status_wake.wait()
+            await asyncio.sleep(BLE_STATUS_READ_SECONDS)
+            if (
+                not self._stay_connected or self._shutting_down
+                or self._ble_lock.locked() or self._al_refresh_lock.locked()
+            ):
+                continue
+            async with self._al_refresh_lock:
+                # The same read gate also protects a short reply from a full
+                # read starting in the opposite order, even before its header.
+                query_started = False
+                try:
+                    async with self._ble_lock:
+                        # Own the client through send and failure cleanup; a
+                        # concurrent connect cannot replace it mid-teardown.
+                        try:
+                            client = self._ble_client
+                            if not (self._ble_notify_subscribed and self._ble_connected and client):
+                                continue
+                            if not client.is_connected:
+                                raise BleakError("status link was lost")
+                            if protocol.rx_pending:
+                                since = self._al_rx_pending_since
+                                if (
+                                    since is not None
+                                    and asyncio.get_running_loop().time() - since < AL_REPLY_TIMEOUT
+                                ):
+                                    continue
+                                protocol.reset_rx()
+                                self._al_rx_pending_since = None
+                                self._al_rx_idle.set()
+                            query_started = True
+                            self._al_status_received.clear()
+                            if not await asyncio.wait_for(
+                                self._ble_send(protocol.build_query()), AL_REPLY_TIMEOUT
+                            ):
+                                raise BleakError("status link was lost")
+                        except Exception as err:
+                            # Includes EOFError, but not CancelledError.
+                            _LOGGER.debug("BLE status read failed on %s: %s", self._ble_name, err)
+                            self._ble_last_failure_ts = asyncio.get_running_loop().time()
+                            await self._teardown_ble_client(reason="status-failure")
+                            continue
+                    try:
+                        await asyncio.wait_for(self._al_status_received.wait(), AL_REPLY_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        pass
+                finally:
+                    if query_started:
+                        protocol.reset_rx()
+                        self._al_rx_pending_since = None
+                        self._al_rx_idle.set()
+                    # Apply an option changed during send/teardown.
+                    if not self._stay_connected and self._ble_client is not None:
+                        self._schedule_disconnect()
+
+    def _status_reader_done(self, task: asyncio.Task) -> None:
+        """Observe termination, and never hold a link with a dead reader."""
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                _LOGGER.error("BLE status reader stopped on %s: %s", self._ble_name, error)
+        if self._status_task is task:
+            self._status_task = None
+            if not self._shutting_down and self._ble_client is not None:
+                self._schedule_disconnect()
+
     @property
     def needs_initial_refresh(self) -> bool:
         """True for a BLE device whose state hasn't been read since setup."""
@@ -2054,6 +2254,43 @@ class ScentDiffuserDevice:
             _LOGGER.debug("Initial BLE state retry failed on %s: %s", self._ble_name, err)
 
     async def refresh_state(self, *, timed: bool = False) -> None:
+        """Refresh state; protect Aroma-Link replies for every caller."""
+        if self._shutting_down:
+            return
+        if self._ble_address and isinstance(self._protocol, AromaLinkBleProtocol):
+            task = asyncio.current_task()
+            assert task is not None
+            self._al_refresh_tasks.add(task)
+            try:
+                async with self._al_refresh_lock:
+                    try:
+                        await self._wait_for_al_rx()
+                        await self._refresh_state(timed=timed)
+                        await self._wait_for_al_rx()
+                    finally:
+                        # Timeout/cancellation must not leave a partial frame
+                        # blocking the reader forever. Late bare tails are ignored.
+                        self._protocol.reset_rx()
+                        self._al_rx_pending_since = None
+                        self._al_rx_idle.set()
+            finally:
+                self._al_refresh_tasks.discard(task)
+            return
+        await self._refresh_state(timed=timed)
+
+    async def _wait_for_al_rx(self) -> None:
+        """Allow an in-flight fragmented reply to drain, with a hard bound."""
+        protocol = self._protocol
+        assert isinstance(protocol, AromaLinkBleProtocol)
+        if protocol.rx_pending:
+            try:
+                await asyncio.wait_for(self._al_rx_idle.wait(), AL_REPLY_TIMEOUT)
+            except asyncio.TimeoutError:
+                protocol.reset_rx()
+                self._al_rx_pending_since = None
+                self._al_rx_idle.set()
+
+    async def _refresh_state(self, *, timed: bool = False) -> None:
         """Refresh device state."""
         if self._ble_address:
             started = asyncio.get_event_loop().time()
@@ -2130,8 +2367,16 @@ class ScentDiffuserDevice:
                     ):
                         if self._week_query_attempts < AL_WEEK_QUERY_MAX_ATTEMPTS:
                             self._week_query_attempts += 1
+                            self._al_week_received.clear()
                             if await self._ble_send(week_query()):
-                                await asyncio.sleep(0.3)
+                                # Sending isn't completion: the week table can
+                                # arrive well after the last write/sleep ends.
+                                try:
+                                    await asyncio.wait_for(
+                                        self._al_week_received.wait(), AL_REPLY_TIMEOUT
+                                    )
+                                except asyncio.TimeoutError:
+                                    self._protocol.reset_rx()
                         else:
                             self._durations_unreported = True
                             _LOGGER.warning(
@@ -2299,15 +2544,19 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
-        if self._momentary_task and not self._momentary_task.done():
-            self._momentary_task.cancel()
-        if self._ble_disconnect_task and not self._ble_disconnect_task.done():
-            self._ble_disconnect_task.cancel()
-        if self._ble_client:
-            try:
-                if self._ble_client.is_connected:
-                    await self._ble_client.disconnect()
-            except Exception:
-                pass
+        # A connect still running after unload must not hold the link.
+        self._shutting_down = True
+        self._stay_connected = False
+        tasks = [task for task in (
+            self._status_task, self._momentary_task, self._ble_disconnect_task,
+            *self._al_refresh_tasks,
+        ) if task is not None and task is not asyncio.current_task()]
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._ble_lock:
+            await self._teardown_ble_client(reason="shutdown")
         if self._cloud and hasattr(self._cloud, "close"):
             await self._cloud.close()
