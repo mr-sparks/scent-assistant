@@ -182,6 +182,11 @@ class ScentDiffuserDevice:
         # state. Lets a user tell a fresh reading from a stale one
         # without the entity flapping to unavailable (#32).
         self._ble_last_update: datetime | None = None
+        # Device reports can arrive while a command awaits its acknowledgement.
+        # Revisions keep command-side optimistic state from overwriting newer
+        # power/phase evidence from that notification.
+        self._power_revision = 0
+        self._phase_revision = 0
         # Whether a BLE state read has completed since setup, and when
         # the last advertisement-triggered retry of it was started.
         # Set by the first notification that carries state, not by sending
@@ -1065,6 +1070,7 @@ class ScentDiffuserDevice:
         changed = False
         if "power" in updates:
             self._state.power = updates["power"]
+            self._power_revision += 1
             changed = True
         if "fan" in updates:
             self._state.fan = updates["fan"]
@@ -1072,6 +1078,7 @@ class ScentDiffuserDevice:
         # Aroma-Link 53 09 status 0 reads "idle" even while the unit is off.
         if "phase" in updates and not (updates["phase"] == "idle" and self._state.power is False):
             self._state.phase = updates["phase"]
+            self._phase_revision += 1
             changed = True
         if "work_seconds" in updates:
             self._state.work_seconds = updates["work_seconds"]
@@ -1297,11 +1304,15 @@ class ScentDiffuserDevice:
         """Turn device on or off."""
         # Try BLE
         if self._ble_address:
+            power_revision = self._power_revision
+            phase_revision = self._phase_revision
             cmd = self._protocol.build_power(on)
             if await self._ble_execute(cmd):
-                self._state.power = on
-                # A phase the unit already reported wins over an assumed idle.
-                if not on or self._state.phase in ("off", "unknown"):
+                if self._power_revision == power_revision:
+                    self._state.power = on
+                # A report received during the command wins over this guess,
+                # including an off/unknown report that disagrees with it.
+                if self._phase_revision == phase_revision:
                     self._state.phase = "idle" if on else "off"
                 self._notify_state_changed()
                 return True
