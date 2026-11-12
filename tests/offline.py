@@ -55,14 +55,25 @@ def load_modules():
     module("homeassistant.components.bluetooth")
     for name, entity_name in (
         ("number", "NumberEntity"), ("select", "SelectEntity"),
-        ("switch", "SwitchEntity"), ("time", "TimeEntity"),
+        ("sensor", "SensorEntity"), ("switch", "SwitchEntity"),
+        ("time", "TimeEntity"),
     ):
         module(f"homeassistant.components.{name}", **{entity_name: Entity})
     stubs["homeassistant.components.number"].NumberMode = SimpleNamespace(
         BOX="box", SLIDER="slider"
     )
+    stubs["homeassistant.components.sensor"].SensorDeviceClass = SimpleNamespace(
+        BATTERY="battery", DURATION="duration", ENUM="enum"
+    )
+    stubs["homeassistant.components.sensor"].SensorStateClass = SimpleNamespace(
+        MEASUREMENT="measurement"
+    )
     module("homeassistant.config_entries", ConfigEntry=object)
-    module("homeassistant.const", EntityCategory=SimpleNamespace(CONFIG="config"))
+    module(
+        "homeassistant.const",
+        EntityCategory=SimpleNamespace(CONFIG="config", DIAGNOSTIC="diagnostic"),
+        PERCENTAGE="%", UnitOfTime=SimpleNamespace(SECONDS="s"),
+    )
     module("homeassistant.core", HomeAssistant=object, CoreState=object)
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
     module("homeassistant.helpers")
@@ -79,7 +90,7 @@ def load_modules():
     root.__path__ = [str(source)]
     stubs[package] = root
     names = ("const", "protocol_ble", "device", "timer_entity",
-             "number", "select", "switch", "time")
+             "number", "select", "sensor", "switch", "time")
     with patch.dict(sys.modules, stubs):
         return SimpleNamespace(**{
             name: import_module(f"{package}.{name}") for name in names

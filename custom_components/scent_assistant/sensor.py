@@ -388,15 +388,22 @@ class DiffuserWorkRemainSensor(SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        return self._device.state.work_remaining
+        state = self._device.state
+        if state.power is not True or state.phase != "spraying":
+            return None
+        return state.work_remaining
 
     @property
     def available(self) -> bool:
-        return self._device.available and self._device.state.work_remaining is not None
+        return self._device.available and self.native_value is not None
 
 
 class DiffuserPauseRemainSensor(SensorEntity):
-    """Remaining seconds of the current pause phase (Aroma-Link 52 0A)."""
+    """Remaining seconds of the current pause phase (Aroma-Link 52 0A).
+
+    The firmware retains both counters outside their corresponding phase, so
+    only expose this snapshot while the same status frame reports a live pause.
+    """
 
     _attr_has_entity_name = True
     _attr_name = "Pause time remaining"
@@ -418,11 +425,14 @@ class DiffuserPauseRemainSensor(SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        return self._device.state.pause_remaining
+        state = self._device.state
+        if state.power is not True or state.phase != "paused":
+            return None
+        return state.pause_remaining
 
     @property
     def available(self) -> bool:
-        return self._device.available and self._device.state.pause_remaining is not None
+        return self._device.available and self.native_value is not None
 
 
 class DiffuserRadarLevelSensor(SensorEntity):
