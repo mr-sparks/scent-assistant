@@ -21,6 +21,16 @@ SCENT_MARKETING_TYPES = {
     DeviceType.SCENT_MARKETING_GW_XOR,
 }
 
+# Families whose lamp we can drive over BLE. AK exposes the lamp as a bit
+# of the 0x2D control bitmask; the GW family as DP 11 (light). Both protocol
+# classes build the command and parse the reported state — only the entity
+# was missing for GW.
+LAMP_SWITCH_TYPES = {
+    DeviceType.SCENT_MARKETING_AK,
+    DeviceType.SCENT_MARKETING_GW,
+    DeviceType.SCENT_MARKETING_GW_XOR,
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -43,13 +53,14 @@ async def async_setup_entry(
     # Scent Marketing devices expose extra controls when running on BLE.
     if device.device_type in SCENT_MARKETING_TYPES and not is_cloud:
         entities.append(DiffuserLockSwitch(device, entry))
-        if device.device_type == DeviceType.SCENT_MARKETING_AK:
-            # The AK control bitmask carries a lamp bit we can drive
-            # without any extra protocol work. (The fan switch is already
-            # added above via `device.fan_present`, which is True for AK;
-            # appending it here too would register a second entity with the
-            # same `_fan` unique_id and HA would reject the duplicate.)
+        if device.device_type in LAMP_SWITCH_TYPES:
+            # AK: the control bitmask carries a lamp bit. GW: DP-11 (light).
+            # (The fan switch is already added above via `device.fan_present`,
+            # which is True for AK; appending it here too would register a
+            # second entity with the same `_fan` unique_id and HA would
+            # reject the duplicate.)
             entities.append(DiffuserLampSwitch(device, entry))
+        if device.device_type == DeviceType.SCENT_MARKETING_AK:
             # V3 AK devices have a separate program-enabled toggle that
             # is distinct from Power. We register the entity for every
             # AK device but make it unavailable on V2 (where it would
@@ -205,7 +216,7 @@ class DiffuserScheduleSwitch(_PendingSwitch):
 
 
 class DiffuserLampSwitch(_PendingSwitch):
-    """Auxiliary LED / lamp switch (Scent Marketing AK family)."""
+    """Auxiliary LED / lamp switch (Scent Marketing AK lamp-bit, GW DP-11 light)."""
 
     _attr_has_entity_name = True
     _attr_name = "Lamp"

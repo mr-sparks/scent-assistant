@@ -352,6 +352,33 @@ Little-endian: rate integer `[3-4]`, current volume `[5-6]` (`FFFF` until a
 fragrance is set in the app), capacity `[7-8]`, rate fraction `[9-10]` in
 1/10000 (so `03 00 … 80 25` = 3.96 mL/h), oil type `[15-16]`.
 
+## Scent Marketing — GW family (EE01 service, framed DP protocol)
+
+Detected by manufacturer ID `0x460C` / `0xF001` (WiFi/cellular variants lead
+with `01/02/03` or `B1/B2` and wrap every payload in XOR-encrypted JSON).
+
+Frames inside the chunked transport: `FF <dp_count>` then per DP either an
+inline value (`<dp_id:u16> <value>`, power/lock) or a composite
+(`<dp_id:u16> AF|BF <len:u16> <payload>`). On the wire each frame is chopped
+into 18-byte chunks prefixed with `(nonce, seq)`; a short (< 20 byte) final
+chunk ends the frame.
+
+Relevant DPs: 1 power (bool), 2 fan, 3 lock, 4 mode/tasks, 8 oil,
+**11 light**, 12 battery, 13 password, 15 customize gear.
+
+**Lamp ON (DP 11, light_type 1):**
+```
+FF 01 00 0B AF 00 02 01 01
+```
+**Lamp OFF:**
+```
+FF 01 00 0B AF 00 02 01 00
+```
+Device reports carry the same DP 11 payload (`[light_type, status]`);
+light_type 1 = on/off (status 1 = on), 3/7 = colour wheel (status 1 or 2 = on).
+
+---
+
 ## Building Packets (Python)
 
 ```python

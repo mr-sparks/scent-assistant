@@ -31,6 +31,10 @@ class Entity:
     hass = None
     async_write_ha_state = forbidden_io
 
+    @property
+    def unique_id(self):
+        return getattr(self, "_attr_unique_id", None)
+
 
 def load_modules():
     """Import complete production files without starting the integration."""

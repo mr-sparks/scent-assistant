@@ -2463,6 +2463,15 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
         dp_json = self._dp_to_json(SM_GW_DP_LOCK, 1 if on else 0, SM_GW_TYPE_LOCK)
         return self.encrypt(self._wrap_for_wire(dp_json))
 
+    def build_light(self, on: bool, light_type: int = 1) -> bytes:
+        # DP-11 light, same 2-byte payload as the plain GW binary frame
+        # ([light_type, on/off]) — in the app's JSON write path a composite
+        # (0xAF) value travels as a hex string (mirrors writeDeviceProperty();
+        # not yet verified on XOR hardware).
+        payload = bytes([light_type & 0xFF, 0x01 if on else 0x00])
+        dp_json = self._dp_to_json(SM_GW_DP_LIGHT, payload.hex(), SM_GW_TYPE_BINARY)
+        return self.encrypt(self._wrap_for_wire(dp_json))
+
     def build_query(self) -> bytes:
         # The device emits state automatically; an explicit query is not
         # part of the WiFi-XOR protocol. We still send something to nudge
@@ -2512,6 +2521,23 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
                 result["phase"] = "idle" if result["power"] else "off"
             elif dp_id == SM_GW_DP_LOCK:
                 result["lock"] = bool(int(value)) if value not in (None, "") else False
+            elif dp_id == SM_GW_DP_LIGHT:
+                raw = value
+                if isinstance(raw, str):
+                    try:
+                        raw = bytes.fromhex(raw)
+                    except ValueError:
+                        raw = b""
+                if isinstance(raw, (list, tuple)):
+                    raw = bytes(raw)
+                if isinstance(raw, (bytes, bytearray)) and len(raw) >= 2:
+                    light_type, light_status = raw[0] & 0xFF, raw[1] & 0xFF
+                    if light_type == 1:
+                        result["light_on"] = light_status == 1
+                    elif light_type in (3, 7):
+                        result["light_on"] = light_status in (1, 2)
+                    else:
+                        result["light_on"] = False
             elif dp_id == SM_GW_DP_BATTERY:
                 try:
                     result["battery"] = int(value, 16) if isinstance(value, str) else int(value)
