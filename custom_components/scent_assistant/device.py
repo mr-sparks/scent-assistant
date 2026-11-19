@@ -1524,8 +1524,12 @@ class ScentDiffuserDevice:
         """
         if isinstance(self._protocol, ScentMarketingGwProtocol):
             # Grade 0 means Custom mode on GW, so the fixed-gear range
-            # starts at 1; the firmware ceiling is 20 (#50).
-            clamped = max(1, min(20, int(intensity)))
+            # starts at 1. The ceiling is the device's DP 14 gear-table
+            # length when reported (5 on a PID-13), else the firmware
+            # ceiling of 20 (#50).
+            table = self._state.grade_table
+            max_value = len(table) if table else 20
+            clamped = max(1, min(max_value, int(intensity)))
             self._state.intensity = clamped
             self._notify_state_changed()
             if self._ble_address:
@@ -1571,14 +1575,19 @@ class ScentDiffuserDevice:
         return False
 
     async def set_schedule_mode(self, custom: bool) -> bool:
-        """Explicitly select the AK V3 schedule mode (Custom vs Level).
+        """Explicitly select the schedule mode (Custom vs Level/grade).
 
-        Mirrors the official app's mode toggle. Custom honours the Work/Pause
-        Duration; Level uses the device's grade table (Intensity selects the
-        grade). The implicit mode-follows-control behaviour stays — this just
-        lets the user pin the mode directly without nudging a duration or the
-        intensity (@Mins95's UX request, #8).
+        AK V3 mirrors the official app's mode toggle (@Mins95's UX request,
+        #8). GW: Custom writes grade 0 into the DP 4 task (Work/Pause
+        Duration timing applies); Level keeps the current grade from the
+        DP 14 gear table.
         """
+        if isinstance(self._protocol, ScentMarketingGwProtocol):
+            self._state.schedule_custom_mode = custom
+            self._notify_state_changed()
+            if self._ble_address:
+                return await self._write_schedule_to_device(custom_mode=custom)
+            return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         if not self._protocol.is_v3:

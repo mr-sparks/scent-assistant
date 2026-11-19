@@ -118,6 +118,19 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         task = dp4_task(self.sent[0])
         self.assertEqual(task[6], 3)
 
+    async def test_set_intensity_clamped_to_gear_table(self):
+        # PID-13 reports a 5-row DP 14 gear table (Low..Max).
+        self.device.state.grade_table = [(5, 240), (15, 200), (20, 160), (25, 100), (25, 60)]
+        self.assertTrue(await self.device.set_intensity(9))
+        self.assertEqual(self.device.state.intensity, 5)
+        self.assertEqual(dp4_task(self.sent[0])[6], 5)
+
+    async def test_set_schedule_mode_custom_writes_grade_zero(self):
+        self.assertTrue(await self.device.set_schedule_mode(True))
+        self.assertIs(self.device.state.schedule_custom_mode, True)
+        task = dp4_task(self.sent[0])
+        self.assertEqual(task[6], 0)  # custom grade
+
     async def test_set_schedule_enabled_sets_task_flag(self):
         self.assertTrue(await self.device.set_schedule_enabled(True))
         self.assertIs(self.device.state.schedule_enabled, True)
@@ -147,16 +160,37 @@ class GwEntitySetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Program", by_name)
         self.assertTrue(by_name["Program"].available)
 
-    async def test_gw_gets_intensity_number(self):
+    async def test_gw_gets_level_select_not_intensity_number(self):
         device = gw_device("02:00:00:00:00:03")
-        added = await self._collect(MODULES.number, device)
+        added = await self._collect(MODULES.select, device)
         by_name = {e._attr_name: e for e in added}
-        self.assertIn("Intensity", by_name)
-        self.assertEqual(by_name["Intensity"]._attr_native_min_value, 1)
-        self.assertEqual(by_name["Intensity"]._attr_native_max_value, 20)
+        self.assertIn("Level", by_name)
+        level = by_name["Level"]
+        self.assertEqual(level._attr_options,
+                         ["Custom", "Low", "Mild", "Medium", "High", "Max"])
+        # No raw intensity number for GW anymore.
+        numbers = await self._collect(MODULES.number, device)
+        self.assertNotIn("Intensity", {e._attr_name for e in numbers})
         # Work/Pause durations were already generic — still there.
-        self.assertIn("Work Duration", by_name)
-        self.assertIn("Pause Duration", by_name)
+        self.assertIn("Work Duration", {e._attr_name for e in numbers})
+        self.assertIn("Pause Duration", {e._attr_name for e in numbers})
+
+    async def test_level_select_maps_names_to_grades(self):
+        device = gw_device("02:00:00:00:00:05")
+        added = await self._collect(MODULES.select, device)
+        level = next(e for e in added if e._attr_name == "Level")
+        device.set_intensity = AsyncMock(return_value=True)
+        device.set_schedule_mode = AsyncMock(return_value=True)
+        await level.async_select_option("High")
+        device.set_intensity.assert_awaited_with(4)
+        await level.async_select_option("Custom")
+        device.set_schedule_mode.assert_awaited_with(True)
+        # current_option follows the reported state
+        device.state.intensity = 2
+        device.state.schedule_custom_mode = False
+        self.assertEqual(level.current_option, "Mild")
+        device.state.schedule_custom_mode = True
+        self.assertEqual(level.current_option, "Custom")
 
     async def test_ak_program_switch_still_v3_gated(self):
         device = Device(ble_address="02:00:00:00:00:04", ble_name="AK",
