@@ -45,6 +45,7 @@ from .const import (
     SM_GW_MODE_INTERVAL, SM_GW_MODE_NONE, SM_GW_MODE_QUICK,
     SM_GW_DP_POWER, SM_GW_DP_FAN, SM_GW_DP_LOCK, SM_GW_DP_MODE_TASKS,
     SM_GW_DP_VERSION, SM_GW_DP_NAME, SM_GW_DP_OIL, SM_GW_DP_LIGHT,
+    SM_GW_DP_MULTI_NOZZLE,
     SM_GW_DP_BATTERY, SM_GW_DP_PASSWORD, SM_GW_DP_FIXED_GEAR,
     SM_GW_DP_CUSTOMIZE_GEAR, SM_GW_DP_REMARK,
     SM_GW_PASSWORD_MARKER, SM_GW_PASSWORD_OK_BYTE,
@@ -1964,6 +1965,10 @@ class ScentMarketingGwProtocol(BleProtocol):
         self._tasks: list[bytes] = []
         self._task_trailer: bytes | None = None
         self._gear_limits: tuple[int, int, int, int] | None = None
+        # Last DP 23 (multi-nozzle) block as reported. On multi-nozzle GW
+        # units byte 9 of this block is the active level shown on the
+        # device display (0 = LO/custom, 1-5 = the fixed-gear grades).
+        self._nozzle_block: bytes | None = None
 
     # ------------------------------------------------------------------
     # Frame builders
@@ -2039,6 +2044,84 @@ class ScentMarketingGwProtocol(BleProtocol):
             payload = bytes([light_type & 0xFF, 0x01 if on else 0x00])
         return self._build_frame([self._build_composite_dp(SM_GW_DP_LIGHT, payload)])
 
+    @property
+    def nozzle_block(self) -> bytes | None:
+        """Last DP 23 (multi-nozzle) block reported by the device."""
+        return self._nozzle_block
+
+    def _nozzle_level_payloads(self, grade: int) -> list[bytes]:
+        """Raw DP-23 payloads for a level change on multi-nozzle GW units.
+
+        Captured from the official app (Android HCI snoop, PID-13): a
+        level change is TWO DP-23 frames sharing one 22-byte block layout
+        ``hdr(4) + rec_c1(6) + rec_be(6) + tail(6)`` where
+        ``rec_c1 = c1 09 00 17 3b <level>`` and
+        ``rec_be = be 08 00 16 00 <level>``:
+
+          frame 1: hdr + rec_c1(new) + rec_be(prev) + tail
+          frame 2: hdr + rec_be(new) + rec_c1(new) + tail
+
+        Echoing the last reported block with only byte 9 rewritten is
+        ACKed but NOT applied by the firmware (the display keeps showing
+        the old level) — the app's two-frame sequence is what moves the
+        display. `hdr`/`tail` are taken from the last reported block so
+        firmware variations in those bytes are preserved. Returns an
+        empty list until the device has reported a block.
+        """
+        block = self._nozzle_block
+        if block is None or len(block) < 10:
+            return []
+        level = max(0, min(20, int(grade))) & 0xFF
+        prev = block[9] & 0xFF
+        if len(block) >= 22:
+            hdr, tail = bytes(block[0:4]), bytes(block[16:22])
+            rec_a, rec_b = bytes(block[4:10]), bytes(block[10:16])
+            if rec_a[0] == 0xC1 and rec_b[0] == 0xBE:
+                rec_c1, rec_be = rec_a, rec_b
+            elif rec_b[0] == 0xC1 and rec_a[0] == 0xBE:
+                rec_c1, rec_be = rec_b, rec_a
+            else:
+                rec_c1 = rec_be = None
+        else:
+            hdr = tail = None
+            rec_c1 = rec_be = None
+        if rec_c1 is None:
+            # Unknown block layout: fall back to a single byte-9 write.
+            blk = bytearray(block)
+            blk[9] = level
+            return [bytes(blk)]
+        c1_new = rec_c1[:5] + bytes([level])
+        be_new = rec_be[:5] + bytes([level])
+        be_prev = rec_be[:5] + bytes([prev])
+        frame1 = hdr + c1_new + be_prev + tail
+        frame2 = hdr + be_new + c1_new + tail
+        return [frame1, frame2]
+
+    def build_nozzle_level_frames(self, grade: int) -> list[bytes]:
+        """Build the DP-23 write frame(s) that set the active level.
+
+        Multi-nozzle GW units (PID 13) take the displayed intensity from
+        the DP 23 block, not from the DP 4 task grade — observed: an
+        app-side level change flipped block byte 9 (02 -> 01) while DP 4
+        grade writes left it untouched. Returns [] until the device has
+        reported a block, so we never write a made-up one.
+
+        The official app sends both frames per change (transition, then
+        commit) and the unit beeps once per DP-23 frame — the two beeps on
+        a level change are normal device behaviour, confirmed against the
+        app itself. We therefore replicate the app's full two-frame
+        sequence.
+        """
+        return [
+            self._build_frame([self._build_composite_dp(SM_GW_DP_MULTI_NOZZLE, payload)])
+            for payload in self._nozzle_level_payloads(grade)
+        ]
+
+    def build_nozzle_level(self, grade: int) -> bytes | None:
+        """First DP-23 level frame (see `build_nozzle_level_frames`)."""
+        frames = self.build_nozzle_level_frames(grade)
+        return frames[0] if frames else None
+
     def build_device_name(self, name: str) -> bytes:
         """Build a DP-6 device-name write. Always 19 bytes zero-padded."""
         return self._build_frame([
@@ -2112,7 +2195,8 @@ class ScentMarketingGwProtocol(BleProtocol):
 
     def build_schedule(self, slots: list["ScheduleSlot"],
                        weekday_mask: int = 0x7F,
-                       custom_mode: bool | None = True) -> bytes:
+                       custom_mode: bool | None = True,
+                       intensity: int | None = None) -> bytes:
         """Port of `GwBleCtrl.handleTasksAndPower()` for single-nozzle
         devices (modelNode != 23).
 
@@ -2132,12 +2216,18 @@ class ScentMarketingGwProtocol(BleProtocol):
 
         `slots` replace the device's first tasks; any further tasks it
         reported are written back unchanged. `custom_mode=True` writes
-        grade 0 so the device runs the slot's work/pause; None keeps the
-        grade the task was read with (0 when unknown).
+        grade 0 so the device runs the slot's work/pause; `intensity`
+        (with `custom_mode=False`) writes that grade from the device's
+        fixed gear table (DP 14); None keeps the grade the task was read
+        with (0 when unknown).
         """
         tasks = list(self._tasks)
         for i, slot in enumerate(slots):
-            if custom_mode or i >= len(tasks):
+            if custom_mode:
+                grade = SM_GW_GRADE_CUSTOM
+            elif intensity is not None:
+                grade = max(1, min(20, int(intensity)))
+            elif i >= len(tasks):
                 grade = SM_GW_GRADE_CUSTOM
             else:
                 grade = tasks[i][6]
@@ -2331,12 +2421,28 @@ class ScentMarketingGwProtocol(BleProtocol):
             text = payload.rstrip(b"\x00").decode("utf-8", errors="replace").strip()
             if text:
                 result["remark"] = text
-        elif dp_id == SM_GW_DP_BATTERY and len(payload) >= 3:
+        elif dp_id == SM_GW_DP_BATTERY and len(payload) >= 2:
+            # PID-13 pushes a 2-byte payload `00 64` (100 %); longer
+            # variants keep the same value at offset 1.
             result["battery"] = payload[1] & 0xFF
         elif dp_id == SM_GW_DP_OIL and len(payload) >= 1:
             first = payload[0] & 0xFF
             if 113 <= first <= 127 and len(payload) >= 7:
-                result["oil_remaining"] = (payload[5] << 8) | payload[6]
+                # Weight-sensor variant (marker 0x71-0x7F): the payload
+                # carries gram readings as u16 BE, not a percentage. A
+                # PID-13 push with a full bottle reads
+                #   71 0078 0078 0078 06a4 …  = 120 g of 120 g = 100 %.
+                # Take the two u16s at [1:3] and [3:5] as (capacity, current)
+                # in either order and derive the percentage; fall back to
+                # the legacy [5:7] value (clamped) when they don't form a
+                # sane ratio.
+                a = (payload[1] << 8) | payload[2]
+                b = (payload[3] << 8) | payload[4]
+                if a and b:
+                    cur, cap = (b, a) if b <= a else (a, b)
+                    result["oil_remaining"] = max(0, min(100, round(cur * 100 / cap)))
+                else:
+                    result["oil_remaining"] = min(100, (payload[5] << 8) | payload[6])
             elif len(payload) >= 2:
                 pct_byte = payload[1] & 0xFF
                 if pct_byte not in (0xE0,):
@@ -2355,6 +2461,34 @@ class ScentMarketingGwProtocol(BleProtocol):
         elif dp_id == SM_GW_DP_FAN and len(payload) >= 3:
             # [size, max_level, current_level] — surface current_level only.
             result["fan"] = (payload[2] & 0xFF) > 0
+        elif dp_id == SM_GW_DP_MULTI_NOZZLE and len(payload) >= 10:
+            # Nozzle/state block. Byte 9 is the active level on PID-13
+            # multi-nozzle units: 0 = LO (custom), 1-5 = fixed grades.
+            # Observed in real pushes: 02 before, 01 after an app-side
+            # change to Low; unchanged by DP 4 grade writes.
+            self._nozzle_block = bytes(payload)
+            level = payload[9] & 0xFF
+            if level == 0:
+                result["schedule_custom_mode"] = True
+            else:
+                result["schedule_custom_mode"] = False
+                result["intensity"] = level
+        elif dp_id == SM_GW_DP_FIXED_GEAR and len(payload) >= 5:
+            # Fixed grade table: [count] then count x (work u16 BE, pause u16 BE).
+            # Seen in a PID-13 state push: 05 | (5,240) (15,200) (20,160)
+            # (25,100) (25,60). Index = grade - 1 in the DP 4 task byte.
+            count = payload[0] & 0xFF
+            table = []
+            for i in range(count):
+                o = 1 + i * 4
+                if o + 4 > len(payload):
+                    break
+                table.append((
+                    (payload[o] << 8) | payload[o + 1],
+                    (payload[o + 2] << 8) | payload[o + 3],
+                ))
+            if table:
+                result["grade_table"] = table
         elif dp_id == SM_GW_DP_MODE_TASKS:
             self._absorb_tasks(payload, result)
         elif dp_id == SM_GW_DP_CUSTOMIZE_GEAR:
@@ -2463,6 +2597,29 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
         dp_json = self._dp_to_json(SM_GW_DP_LOCK, 1 if on else 0, SM_GW_TYPE_LOCK)
         return self.encrypt(self._wrap_for_wire(dp_json))
 
+    def build_light(self, on: bool, light_type: int = 1) -> bytes:
+        # DP-11 light, same 2-byte payload as the plain GW binary frame
+        # ([light_type, on/off]) — in the app's JSON write path a composite
+        # (0xAF) value travels as a hex string (mirrors writeDeviceProperty();
+        # not yet verified on XOR hardware).
+        payload = bytes([light_type & 0xFF, 0x01 if on else 0x00])
+        dp_json = self._dp_to_json(SM_GW_DP_LIGHT, payload.hex(), SM_GW_TYPE_BINARY)
+        return self.encrypt(self._wrap_for_wire(dp_json))
+
+    def build_nozzle_level_frames(self, grade: int) -> list[bytes]:
+        # Same DP-23 block payloads as the plain GW frame (two-frame level
+        # sequence, see ScentMarketingGwProtocol._nozzle_level_payloads),
+        # each as a hex-string composite in the encrypted JSON envelope.
+        out = []
+        for payload in self._nozzle_level_payloads(grade):
+            dp_json = self._dp_to_json(SM_GW_DP_MULTI_NOZZLE, payload.hex(), SM_GW_TYPE_BINARY)
+            out.append(self.encrypt(self._wrap_for_wire(dp_json)))
+        return out
+
+    def build_nozzle_level(self, grade: int) -> bytes | None:
+        frames = self.build_nozzle_level_frames(grade)
+        return frames[0] if frames else None
+
     def build_query(self) -> bytes:
         # The device emits state automatically; an explicit query is not
         # part of the WiFi-XOR protocol. We still send something to nudge
@@ -2512,6 +2669,40 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
                 result["phase"] = "idle" if result["power"] else "off"
             elif dp_id == SM_GW_DP_LOCK:
                 result["lock"] = bool(int(value)) if value not in (None, "") else False
+            elif dp_id == SM_GW_DP_LIGHT:
+                raw = value
+                if isinstance(raw, str):
+                    try:
+                        raw = bytes.fromhex(raw)
+                    except ValueError:
+                        raw = b""
+                if isinstance(raw, (list, tuple)):
+                    raw = bytes(raw)
+                if isinstance(raw, (bytes, bytearray)) and len(raw) >= 2:
+                    light_type, light_status = raw[0] & 0xFF, raw[1] & 0xFF
+                    if light_type == 1:
+                        result["light_on"] = light_status == 1
+                    elif light_type in (3, 7):
+                        result["light_on"] = light_status in (1, 2)
+                    else:
+                        result["light_on"] = False
+            elif dp_id == SM_GW_DP_MULTI_NOZZLE:
+                raw = value
+                if isinstance(raw, str):
+                    try:
+                        raw = bytes.fromhex(raw)
+                    except ValueError:
+                        raw = b""
+                if isinstance(raw, (list, tuple)):
+                    raw = bytes(raw)
+                if isinstance(raw, (bytes, bytearray)) and len(raw) >= 10:
+                    self._nozzle_block = bytes(raw)
+                    level = raw[9] & 0xFF
+                    if level == 0:
+                        result["schedule_custom_mode"] = True
+                    else:
+                        result["schedule_custom_mode"] = False
+                        result["intensity"] = level
             elif dp_id == SM_GW_DP_BATTERY:
                 try:
                     result["battery"] = int(value, 16) if isinstance(value, str) else int(value)

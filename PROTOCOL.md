@@ -352,6 +352,79 @@ Little-endian: rate integer `[3-4]`, current volume `[5-6]` (`FFFF` until a
 fragrance is set in the app), capacity `[7-8]`, rate fraction `[9-10]` in
 1/10000 (so `03 00 … 80 25` = 3.96 mL/h), oil type `[15-16]`.
 
+## Scent Marketing — GW family (EE01 service, framed DP protocol)
+
+Detected by manufacturer ID `0x460C` / `0xF001` (WiFi/cellular variants lead
+with `01/02/03` or `B1/B2` and wrap every payload in XOR-encrypted JSON).
+
+Frames inside the chunked transport: `FF <dp_count>` then per DP either an
+inline value (`<dp_id:u16> <value>`, power/lock) or a composite
+(`<dp_id:u16> AF|BF <len:u16> <payload>`). On the wire each frame is chopped
+into 18-byte chunks prefixed with `(nonce, seq)`; a short (< 20 byte) final
+chunk ends the frame.
+
+Relevant DPs: 1 power (bool), 2 fan, 3 lock, 4 mode/tasks, 8 oil,
+**11 light**, 12 battery, 13 password, **14 fixed gear table**, 15 customize gear.
+
+**DP 14 fixed gear table** (reported in the state push): `[count]` followed by
+`count` × (work u16 BE, pause u16 BE). The DP 4 task grade byte (1-20) picks
+row `grade-1`; grade 0 = Custom mode, which uses the DP 15 work/pause values.
+Example from a PID-13 unit: `05 | (5,240) (15,200) (20,160) (25,100) (25,60)`.
+
+**Program enable** = DP 4 task flags byte bit 7 (`enabled<<7 | weekday_mask`).
+
+**Intensity (grade)** = DP 4 task byte 6: write the DP 4 frame with
+`custom_mode=False` semantics — grade 1-20, no DP 15 block appended.
+
+**Active level on multi-nozzle units (DP 23 present, e.g. PID 13)**: the
+device display reads the level from **byte 9 of the DP 23 block**
+(`0` = LO/custom, `1-5` = fixed grades) — observed flipping `02 -> 01`
+when the app set Low, while DP 4 grade writes left it unchanged.
+
+The block is 22 bytes: `hdr(4) + rec_c1(6) + rec_be(6) + tail(6)` with
+`rec_c1 = C1 09 00 17 3B <level>` and `rec_be = BE 08 00 16 00 <level>`
+(the two records may arrive in either order in a state push). Captured
+from the official app via Android HCI snoop (PID-13): a level change to
+`L` (previous level `P`) is **two** DP-23 frames, each
+`FF 01 00 17 AF 00 16 <block>` chunked like every GW frame:
+
+```
+frame 1: hdr + C1 09 00 17 3B <L> + BE 08 00 16 00 <P> + tail
+frame 2: hdr + BE 08 00 16 00 <L> + C1 09 00 17 3B <L> + tail
+```
+
+E.g. 5 -> 1 on the captured unit (`hdr=01010002`, `tail=01008003012c`):
+```
+FF 01 00 17 AF 00 16 01010002 C10900173B01 BE0800160005 01008003012C
+FF 01 00 17 AF 00 16 01010002 BE0800160001 C10900173B01 01008003012C
+```
+
+Writing the block back with only byte 9 changed is ACKed but **not**
+applied by the firmware (display stays on the old level) — the two-frame
+sequence is what moves the display. `hdr`/`tail` are echoed from the last
+reported block. DP 23 is reported in the state push, so the block is
+always read before it is written.
+
+On these units a level change goes out as the two DP 23 frames **only** —
+the official app does not send a DP 4 schedule write alongside
+(snoop-verified). The unit beeps once per DP-23 frame, so a level change
+always sounds two beeps — confirmed identical in the official app. Byte 9
+= 0 selects Custom mode, so the mode switch rides along in the same
+frames.
+
+**Lamp ON (DP 11, light_type 1):**
+```
+FF 01 00 0B AF 00 02 01 01
+```
+**Lamp OFF:**
+```
+FF 01 00 0B AF 00 02 01 00
+```
+Device reports carry the same DP 11 payload (`[light_type, status]`);
+light_type 1 = on/off (status 1 = on), 3/7 = colour wheel (status 1 or 2 = on).
+
+---
+
 ## Building Packets (Python)
 
 ```python

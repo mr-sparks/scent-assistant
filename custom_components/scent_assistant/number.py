@@ -45,6 +45,8 @@ async def async_setup_entry(
     ]
     if device.device_type == DeviceType.SCENT_MARKETING_AK:
         entities.append(ScentMarketingIntensityNumber(device, entry))
+    # GW intensity is the app's five fixed-gear levels — exposed as the
+    # "Level" select in select.py, not as a raw number here.
     if device.device_type == DeviceType.AROMA_LINK:
         entities.append(MomentaryDurationNumber(device, entry))
         add_when_present(

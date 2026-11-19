@@ -1477,19 +1477,30 @@ class ScentDiffuserDevice:
         return False
 
     async def set_schedule_enabled(self, enabled: bool) -> bool:
-        """Enable or disable the active V3 schedule/program.
+        """Enable or disable the active schedule/program.
 
-        On V3 devices the program-enabled flag is a separate control
+        On AK V3 devices the program-enabled flag is a separate control
         from Power: a V3 diffuser can be powered on with the program
         disabled, in which case it won't spray. We re-apply the
         currently cached schedule with the enabled bit flipped — same
         approach as `set_intensity`, since there's no standalone
         program-enable opcode in @Mins95's captures.
 
-        On V2 this method delegates to `set_power`, because V2's
+        On AK V2 this method delegates to `set_power`, because V2's
         firmware treats the schedule-enabled bit and the power
         concept as the same toggle.
+
+        On GW devices the enabled flag is bit 7 of the DP 4 task flags
+        byte; we rewrite the current task list with that bit flipped.
         """
+        if isinstance(self._protocol, ScentMarketingGwProtocol):
+            self._state.schedule_enabled = enabled
+            self._notify_state_changed()
+            if self._ble_address:
+                return await self._write_schedule_to_device(
+                    enabled=enabled, custom_mode=None,
+                )
+            return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         if not self._protocol.is_v3:
@@ -1501,15 +1512,47 @@ class ScentDiffuserDevice:
         return True
 
     async def set_intensity(self, intensity: int) -> bool:
-        """Set Scent Marketing AK spray intensity.
+        """Set spray intensity.
 
-        The AK protocol bundles intensity into schedule frames (no
-        dedicated opcode is known), so this stores the value locally and
-        the next schedule write will pick it up. The Number entity also
-        triggers a schedule re-write so the change takes effect
-        immediately even when the user doesn't separately touch a Start
-        Time / End Time entity.
+        AK: the intensity is bundled into the schedule frames (no
+        dedicated opcode), so the value is stored locally and the Number
+        entity triggers a schedule re-write to apply it immediately.
+
+        GW: the intensity is the grade byte of the DP 4 task (1-20 picks
+        a row of the device's fixed gear table from DP 14; 0 = Custom
+        mode, which is what Work/Pause Duration edits select). On
+        multi-nozzle units (DP 23 block reported) the level instead goes
+        out as the app's two DP 23 frames and the DP 4 write is skipped.
         """
+        if isinstance(self._protocol, ScentMarketingGwProtocol):
+            # Grade 0 means Custom mode on GW, so the fixed-gear range
+            # starts at 1. The ceiling is the device's DP 14 gear-table
+            # length when reported (5 on a PID-13), else the firmware
+            # ceiling of 20 (#50).
+            table = self._state.grade_table
+            max_value = len(table) if table else 20
+            clamped = max(1, min(max_value, int(intensity)))
+            self._state.intensity = clamped
+            # Set the mode in the same state update: a level choice is
+            # Level mode, and notifying twice (intensity first, mode later)
+            # made the Level select icon flicker Custom -> level.
+            self._state.schedule_custom_mode = False
+            self._notify_state_changed()
+            if self._ble_address:
+                if getattr(self._protocol, "nozzle_block", None) is not None:
+                    # Multi-nozzle units (PID 13): the official app changes
+                    # the level with ONLY the two DP 23 frames (HCI snoop) —
+                    # no DP 4 write. Sending both made the unit beep twice
+                    # per change; DP 23 byte 9 also carries the custom/level
+                    # mode, so the schedule write is redundant here.
+                    await self._write_gw_nozzle_level(clamped)
+                    return True
+                ok = await self._write_schedule_to_device(custom_mode=False)
+                # Single-nozzle units take the level from the DP 4 task
+                # grade; multi-nozzle ones additionally get the DP 23 write.
+                await self._write_gw_nozzle_level(clamped)
+                return ok
+            return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         # Clamp to the firmware-accepted range. V2 caps at 10, V3 at 20.
@@ -1549,15 +1592,55 @@ class ScentDiffuserDevice:
             return True
         return False
 
-    async def set_schedule_mode(self, custom: bool) -> bool:
-        """Explicitly select the AK V3 schedule mode (Custom vs Level).
+    async def _write_gw_nozzle_level(self, grade: int) -> None:
+        """Best-effort DP 23 level write for multi-nozzle GW units.
 
-        Mirrors the official app's mode toggle. Custom honours the Work/Pause
-        Duration; Level uses the device's grade table (Intensity selects the
-        grade). The implicit mode-follows-control behaviour stays — this just
-        lets the user pin the mode directly without nudging a duration or the
-        intensity (@Mins95's UX request, #8).
+        These units take the displayed intensity from the DP 23 block, not
+        from the DP 4 task grade — so a level change writes both. The
+        official app sends TWO DP 23 frames per level change (captured via
+        HCI snoop); a single byte-9 rewrite is ACKed but not applied, so we
+        replicate the two-frame sequence. Skipped silently when the device
+        hasn't reported a block yet.
         """
+        proto = self._protocol
+        frames_builder = getattr(proto, "build_nozzle_level_frames", None)
+        if frames_builder is not None:
+            for frame in frames_builder(grade):
+                await self._ble_execute(frame)
+            return
+        builder = getattr(proto, "build_nozzle_level", None)
+        if builder is None or getattr(proto, "nozzle_block", None) is None:
+            return
+        frame = builder(grade)
+        if frame:
+            await self._ble_execute(frame)
+
+    async def set_schedule_mode(self, custom: bool) -> bool:
+        """Explicitly select the schedule mode (Custom vs Level/grade).
+
+        AK V3 mirrors the official app's mode toggle (@Mins95's UX request,
+        #8). GW: Custom writes grade 0 into the DP 4 task (Work/Pause
+        Duration timing applies); Level keeps the current grade from the
+        DP 14 gear table.
+        """
+        if isinstance(self._protocol, ScentMarketingGwProtocol):
+            self._state.schedule_custom_mode = custom
+            self._notify_state_changed()
+            if self._ble_address:
+                if getattr(self._protocol, "nozzle_block", None) is not None:
+                    # Multi-nozzle units: mode + level travel in the DP 23
+                    # block alone (byte 9: 0 = Custom, 1-5 = level), same
+                    # as the official app — skip the DP 4 write here.
+                    await self._write_gw_nozzle_level(
+                        0 if custom else (self._state.intensity or 1)
+                    )
+                    return True
+                ok = await self._write_schedule_to_device(custom_mode=custom)
+                await self._write_gw_nozzle_level(
+                    0 if custom else (self._state.intensity or 1)
+                )
+                return ok
+            return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         if not self._protocol.is_v3:
@@ -1737,11 +1820,18 @@ class ScentDiffuserDevice:
                     start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
-                # Work/Pause edits switch the task to the custom grade; any
-                # other edit keeps the grade the device reported (#50).
+                # Work/Pause edits switch the task to the custom grade; an
+                # intensity edit (custom_mode=False) writes that grade from
+                # the device's fixed gear table; any other edit keeps the
+                # grade the device reported (#50).
                 cmd = self._protocol.build_schedule(
                     [slot], weekday_mask=weekday_mask, custom_mode=custom_mode,
+                    intensity=self._state.intensity if custom_mode is False else None,
                 )
+                # Keep the mode flag in sync so the Level select doesn't snap
+                # back to Custom after an intensity change (and vice versa).
+                if custom_mode is not None:
+                    self._state.schedule_custom_mode = custom_mode
             elif isinstance(self._protocol, ScentMarketingAkProtocol):
                 slot = ScheduleSlot(
                     start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,

@@ -21,6 +21,19 @@ SCENT_MARKETING_TYPES = {
     DeviceType.SCENT_MARKETING_GW_XOR,
 }
 
+# Families whose lamp we can drive over BLE. AK exposes the lamp as a bit
+# of the 0x2D control bitmask; the GW family as DP 11 (light). Both protocol
+# classes build the command and parse the reported state — only the entity
+# was missing for GW.
+LAMP_SWITCH_TYPES = {
+    DeviceType.SCENT_MARKETING_AK,
+    DeviceType.SCENT_MARKETING_GW,
+    DeviceType.SCENT_MARKETING_GW_XOR,
+}
+
+# GW family: plain BLE and the XOR-encrypted WiFi/cellular variants.
+GW_TYPES = {DeviceType.SCENT_MARKETING_GW, DeviceType.SCENT_MARKETING_GW_XOR}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -43,18 +56,22 @@ async def async_setup_entry(
     # Scent Marketing devices expose extra controls when running on BLE.
     if device.device_type in SCENT_MARKETING_TYPES and not is_cloud:
         entities.append(DiffuserLockSwitch(device, entry))
-        if device.device_type == DeviceType.SCENT_MARKETING_AK:
-            # The AK control bitmask carries a lamp bit we can drive
-            # without any extra protocol work. (The fan switch is already
-            # added above via `device.fan_present`, which is True for AK;
-            # appending it here too would register a second entity with the
-            # same `_fan` unique_id and HA would reject the duplicate.)
+        if device.device_type in LAMP_SWITCH_TYPES:
+            # AK: the control bitmask carries a lamp bit. GW: DP-11 (light).
+            # (The fan switch is already added above via `device.fan_present`,
+            # which is True for AK; appending it here too would register a
+            # second entity with the same `_fan` unique_id and HA would
+            # reject the duplicate.)
             entities.append(DiffuserLampSwitch(device, entry))
+        if device.device_type == DeviceType.SCENT_MARKETING_AK:
             # V3 AK devices have a separate program-enabled toggle that
             # is distinct from Power. We register the entity for every
             # AK device but make it unavailable on V2 (where it would
             # just duplicate Power) — `available` checks `protocol.is_v3`
             # which only resolves after the first BLE login.
+            entities.append(DiffuserScheduleSwitch(device, entry))
+        elif device.device_type in GW_TYPES:
+            # GW: the enabled flag is bit 7 of the DP 4 task flags byte.
             entities.append(DiffuserScheduleSwitch(device, entry))
 
     if device.device_type == DeviceType.SCENT_TECH:
@@ -165,11 +182,11 @@ class DiffuserLockSwitch(_PendingSwitch):
 
 
 class DiffuserScheduleSwitch(_PendingSwitch):
-    """Program / schedule enabled switch (Scent Marketing AK V3 only).
+    """Program / schedule enabled switch (Scent Marketing AK V3 + GW).
 
-    On V3 devices the program-enabled flag is independent of Power and
-    Fan — a diffuser can be powered on with the program disabled, in
-    which case it won't spray. On V2 devices the equivalent state is
+    On AK V3 and GW devices the program-enabled flag is independent of
+    Power — a diffuser can be powered on with the program disabled, in
+    which case it won't spray. On AK V2 devices the equivalent state is
     already covered by the Power switch, so this entity stays
     unavailable on V2 hardware.
     """
@@ -194,7 +211,9 @@ class DiffuserScheduleSwitch(_PendingSwitch):
 
     @property
     def available(self) -> bool:
-        # V3-only: V2 devices have no separate program toggle.
+        # AK V2 devices have no separate program toggle; GW always does.
+        if self._device.device_type in GW_TYPES:
+            return self._device.available
         return self._device.available and self._device.protocol_is_v3
 
     async def async_turn_on(self, **kwargs) -> None:
@@ -205,7 +224,7 @@ class DiffuserScheduleSwitch(_PendingSwitch):
 
 
 class DiffuserLampSwitch(_PendingSwitch):
-    """Auxiliary LED / lamp switch (Scent Marketing AK family)."""
+    """Auxiliary LED / lamp switch (Scent Marketing AK lamp-bit, GW DP-11 light)."""
 
     _attr_has_entity_name = True
     _attr_name = "Lamp"

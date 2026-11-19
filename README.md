@@ -190,6 +190,23 @@ The set of entities depends on which device family is connected.
 | Oil remaining (ml) / Oil capacity | Sensor | Current and total fragrance volume (V3) |
 | Oil consumption / Oil days remaining | Sensor | Usage rate and estimated days left (V3; days computed in Custom mode) |
 
+### Scent Marketing GW family
+
+Detected by manufacturer data (IDs `0x460C` / `0xF001`), e.g. Jcloud JC-A311. Entities over BLE:
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Lamp | Switch | Auxiliary LED lamp (DP 11 light) |
+| Child Lock | Switch | Lock physical buttons (DP 3) |
+| Program | Switch | Schedule/program enabled (bit 7 of the DP 4 task flags) |
+| Level | Select | The app's levels **Custom / Low / Mild / Medium / High / Max** — on multi-nozzle units the display level is the DP 23 block (byte 9); the app's two-frame DP 23 write sequence is sent alongside the DP 4 task grade. Low..Max map to rows of the DP 14 gear table; Custom uses Work/Pause Duration (DP 15) |
+| Start Time / End Time | Time | Daily schedule window (DP 4) |
+| Work / Pause Duration | Number | Custom spray timing (DP 15 customize gear) |
+| Oil remaining / Battery | Sensor | DP 8 / DP 12 reports |
+| Detection diagnostic | Sensor | Advertisement metadata (PID, WiFi flag, …) |
+
+Schedules can also be written with the `scent_assistant.set_schedule` service (DP 4 tasks + DP 15 customize gear).
+
 ### Scent Tech / ScentLab (`Scent-…`)
 
 These diffusers hold five independent schedules; each one gets its own set of entities (N = 1–5).
