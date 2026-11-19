@@ -2112,7 +2112,8 @@ class ScentMarketingGwProtocol(BleProtocol):
 
     def build_schedule(self, slots: list["ScheduleSlot"],
                        weekday_mask: int = 0x7F,
-                       custom_mode: bool | None = True) -> bytes:
+                       custom_mode: bool | None = True,
+                       intensity: int | None = None) -> bytes:
         """Port of `GwBleCtrl.handleTasksAndPower()` for single-nozzle
         devices (modelNode != 23).
 
@@ -2132,12 +2133,18 @@ class ScentMarketingGwProtocol(BleProtocol):
 
         `slots` replace the device's first tasks; any further tasks it
         reported are written back unchanged. `custom_mode=True` writes
-        grade 0 so the device runs the slot's work/pause; None keeps the
-        grade the task was read with (0 when unknown).
+        grade 0 so the device runs the slot's work/pause; `intensity`
+        (with `custom_mode=False`) writes that grade from the device's
+        fixed gear table (DP 14); None keeps the grade the task was read
+        with (0 when unknown).
         """
         tasks = list(self._tasks)
         for i, slot in enumerate(slots):
-            if custom_mode or i >= len(tasks):
+            if custom_mode:
+                grade = SM_GW_GRADE_CUSTOM
+            elif intensity is not None:
+                grade = max(1, min(20, int(intensity)))
+            elif i >= len(tasks):
                 grade = SM_GW_GRADE_CUSTOM
             else:
                 grade = tasks[i][6]
@@ -2355,6 +2362,22 @@ class ScentMarketingGwProtocol(BleProtocol):
         elif dp_id == SM_GW_DP_FAN and len(payload) >= 3:
             # [size, max_level, current_level] — surface current_level only.
             result["fan"] = (payload[2] & 0xFF) > 0
+        elif dp_id == SM_GW_DP_FIXED_GEAR and len(payload) >= 5:
+            # Fixed grade table: [count] then count x (work u16 BE, pause u16 BE).
+            # Seen in a PID-13 state push: 05 | (5,240) (15,200) (20,160)
+            # (25,100) (25,60). Index = grade - 1 in the DP 4 task byte.
+            count = payload[0] & 0xFF
+            table = []
+            for i in range(count):
+                o = 1 + i * 4
+                if o + 4 > len(payload):
+                    break
+                table.append((
+                    (payload[o] << 8) | payload[o + 1],
+                    (payload[o + 2] << 8) | payload[o + 3],
+                ))
+            if table:
+                result["grade_table"] = table
         elif dp_id == SM_GW_DP_MODE_TASKS:
             self._absorb_tasks(payload, result)
         elif dp_id == SM_GW_DP_CUSTOMIZE_GEAR:

@@ -18,6 +18,9 @@ _LOGGER = logging.getLogger(__name__)
 
 RADAR_LEVEL_NAMES = {1: "Min", 2: "Low", 3: "Med", 4: "High", 5: "Max"}
 
+# GW family: plain BLE and the XOR-encrypted WiFi/cellular variants.
+GW_TYPES = {DeviceType.SCENT_MARKETING_GW, DeviceType.SCENT_MARKETING_GW_XOR}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -45,6 +48,8 @@ async def async_setup_entry(
     ]
     if device.device_type == DeviceType.SCENT_MARKETING_AK:
         entities.append(ScentMarketingIntensityNumber(device, entry))
+    if device.device_type in GW_TYPES:
+        entities.append(GwIntensityNumber(device, entry))
     if device.device_type == DeviceType.AROMA_LINK:
         entities.append(MomentaryDurationNumber(device, entry))
         add_when_present(
@@ -289,6 +294,17 @@ class ScentMarketingIntensityNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._device.set_intensity(int(value))
+
+
+class GwIntensityNumber(ScentMarketingIntensityNumber):
+    """Fixed-gear intensity for Scent Marketing GW devices.
+
+    The value is the grade byte of the DP 4 task: 1-20 picks a row of the
+    device's fixed gear table (DP 14). Grade 0 means Custom mode — selected
+    by the Work/Pause Duration numbers — so the GW range starts at 1.
+    """
+
+    _attr_native_min_value = 1
 
 
 class ScentimentLevelNumber(NumberEntity):

@@ -1477,19 +1477,30 @@ class ScentDiffuserDevice:
         return False
 
     async def set_schedule_enabled(self, enabled: bool) -> bool:
-        """Enable or disable the active V3 schedule/program.
+        """Enable or disable the active schedule/program.
 
-        On V3 devices the program-enabled flag is a separate control
+        On AK V3 devices the program-enabled flag is a separate control
         from Power: a V3 diffuser can be powered on with the program
         disabled, in which case it won't spray. We re-apply the
         currently cached schedule with the enabled bit flipped — same
         approach as `set_intensity`, since there's no standalone
         program-enable opcode in @Mins95's captures.
 
-        On V2 this method delegates to `set_power`, because V2's
+        On AK V2 this method delegates to `set_power`, because V2's
         firmware treats the schedule-enabled bit and the power
         concept as the same toggle.
+
+        On GW devices the enabled flag is bit 7 of the DP 4 task flags
+        byte; we rewrite the current task list with that bit flipped.
         """
+        if isinstance(self._protocol, ScentMarketingGwProtocol):
+            self._state.schedule_enabled = enabled
+            self._notify_state_changed()
+            if self._ble_address:
+                return await self._write_schedule_to_device(
+                    enabled=enabled, custom_mode=None,
+                )
+            return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         if not self._protocol.is_v3:
@@ -1501,15 +1512,25 @@ class ScentDiffuserDevice:
         return True
 
     async def set_intensity(self, intensity: int) -> bool:
-        """Set Scent Marketing AK spray intensity.
+        """Set spray intensity.
 
-        The AK protocol bundles intensity into schedule frames (no
-        dedicated opcode is known), so this stores the value locally and
-        the next schedule write will pick it up. The Number entity also
-        triggers a schedule re-write so the change takes effect
-        immediately even when the user doesn't separately touch a Start
-        Time / End Time entity.
+        AK: the intensity is bundled into the schedule frames (no
+        dedicated opcode), so the value is stored locally and the Number
+        entity triggers a schedule re-write to apply it immediately.
+
+        GW: the intensity is the grade byte of the DP 4 task (1-20 picks
+        a row of the device's fixed gear table from DP 14; 0 = Custom
+        mode, which is what Work/Pause Duration edits select).
         """
+        if isinstance(self._protocol, ScentMarketingGwProtocol):
+            # Grade 0 means Custom mode on GW, so the fixed-gear range
+            # starts at 1; the firmware ceiling is 20 (#50).
+            clamped = max(1, min(20, int(intensity)))
+            self._state.intensity = clamped
+            self._notify_state_changed()
+            if self._ble_address:
+                return await self._write_schedule_to_device(custom_mode=False)
+            return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
         # Clamp to the firmware-accepted range. V2 caps at 10, V3 at 20.
@@ -1737,10 +1758,13 @@ class ScentDiffuserDevice:
                     start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
-                # Work/Pause edits switch the task to the custom grade; any
-                # other edit keeps the grade the device reported (#50).
+                # Work/Pause edits switch the task to the custom grade; an
+                # intensity edit (custom_mode=False) writes that grade from
+                # the device's fixed gear table; any other edit keeps the
+                # grade the device reported (#50).
                 cmd = self._protocol.build_schedule(
                     [slot], weekday_mask=weekday_mask, custom_mode=custom_mode,
+                    intensity=self._state.intensity if custom_mode is False else None,
                 )
             elif isinstance(self._protocol, ScentMarketingAkProtocol):
                 slot = ScheduleSlot(

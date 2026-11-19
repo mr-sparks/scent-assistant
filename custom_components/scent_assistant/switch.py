@@ -31,6 +31,9 @@ LAMP_SWITCH_TYPES = {
     DeviceType.SCENT_MARKETING_GW_XOR,
 }
 
+# GW family: plain BLE and the XOR-encrypted WiFi/cellular variants.
+GW_TYPES = {DeviceType.SCENT_MARKETING_GW, DeviceType.SCENT_MARKETING_GW_XOR}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -66,6 +69,9 @@ async def async_setup_entry(
             # AK device but make it unavailable on V2 (where it would
             # just duplicate Power) — `available` checks `protocol.is_v3`
             # which only resolves after the first BLE login.
+            entities.append(DiffuserScheduleSwitch(device, entry))
+        elif device.device_type in GW_TYPES:
+            # GW: the enabled flag is bit 7 of the DP 4 task flags byte.
             entities.append(DiffuserScheduleSwitch(device, entry))
 
     if device.device_type == DeviceType.SCENT_TECH:
@@ -176,11 +182,11 @@ class DiffuserLockSwitch(_PendingSwitch):
 
 
 class DiffuserScheduleSwitch(_PendingSwitch):
-    """Program / schedule enabled switch (Scent Marketing AK V3 only).
+    """Program / schedule enabled switch (Scent Marketing AK V3 + GW).
 
-    On V3 devices the program-enabled flag is independent of Power and
-    Fan — a diffuser can be powered on with the program disabled, in
-    which case it won't spray. On V2 devices the equivalent state is
+    On AK V3 and GW devices the program-enabled flag is independent of
+    Power — a diffuser can be powered on with the program disabled, in
+    which case it won't spray. On AK V2 devices the equivalent state is
     already covered by the Power switch, so this entity stays
     unavailable on V2 hardware.
     """
@@ -205,7 +211,9 @@ class DiffuserScheduleSwitch(_PendingSwitch):
 
     @property
     def available(self) -> bool:
-        # V3-only: V2 devices have no separate program toggle.
+        # AK V2 devices have no separate program toggle; GW always does.
+        if self._device.device_type in GW_TYPES:
+            return self._device.available
         return self._device.available and self._device.protocol_is_v3
 
     async def async_turn_on(self, **kwargs) -> None:

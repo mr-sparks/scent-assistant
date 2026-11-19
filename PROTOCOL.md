@@ -364,7 +364,17 @@ into 18-byte chunks prefixed with `(nonce, seq)`; a short (< 20 byte) final
 chunk ends the frame.
 
 Relevant DPs: 1 power (bool), 2 fan, 3 lock, 4 mode/tasks, 8 oil,
-**11 light**, 12 battery, 13 password, 15 customize gear.
+**11 light**, 12 battery, 13 password, **14 fixed gear table**, 15 customize gear.
+
+**DP 14 fixed gear table** (reported in the state push): `[count]` followed by
+`count` × (work u16 BE, pause u16 BE). The DP 4 task grade byte (1-20) picks
+row `grade-1`; grade 0 = Custom mode, which uses the DP 15 work/pause values.
+Example from a PID-13 unit: `05 | (5,240) (15,200) (20,160) (25,100) (25,60)`.
+
+**Program enable** = DP 4 task flags byte bit 7 (`enabled<<7 | weekday_mask`).
+
+**Intensity (grade)** = DP 4 task byte 6: write the DP 4 frame with
+`custom_mode=False` semantics — grade 1-20, no DP 15 block appended.
 
 **Lamp ON (DP 11, light_type 1):**
 ```
