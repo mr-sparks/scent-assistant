@@ -405,6 +405,12 @@ sequence is what moves the display. `hdr`/`tail` are echoed from the last
 reported block. DP 23 is reported in the state push, so the block is
 always read before it is written.
 
+On these multi-nozzle units a level change goes out as the two DP 23
+frames **only** — the official app does not send a DP 4 schedule write
+alongside (snoop-verified), and sending both made the unit beep twice
+per change (the DP 4 write beeps as well). Byte 9 = 0 selects Custom
+mode, so the mode switch rides along in the same frames.
+
 **Lamp ON (DP 11, light_type 1):**
 ```
 FF 01 00 0B AF 00 02 01 01

@@ -1520,7 +1520,9 @@ class ScentDiffuserDevice:
 
         GW: the intensity is the grade byte of the DP 4 task (1-20 picks
         a row of the device's fixed gear table from DP 14; 0 = Custom
-        mode, which is what Work/Pause Duration edits select).
+        mode, which is what Work/Pause Duration edits select). On
+        multi-nozzle units (DP 23 block reported) the level instead goes
+        out as the app's two DP 23 frames and the DP 4 write is skipped.
         """
         if isinstance(self._protocol, ScentMarketingGwProtocol):
             # Grade 0 means Custom mode on GW, so the fixed-gear range
@@ -1537,9 +1539,17 @@ class ScentDiffuserDevice:
             self._state.schedule_custom_mode = False
             self._notify_state_changed()
             if self._ble_address:
+                if getattr(self._protocol, "nozzle_block", None) is not None:
+                    # Multi-nozzle units (PID 13): the official app changes
+                    # the level with ONLY the two DP 23 frames (HCI snoop) —
+                    # no DP 4 write. Sending both made the unit beep twice
+                    # per change; DP 23 byte 9 also carries the custom/level
+                    # mode, so the schedule write is redundant here.
+                    await self._write_gw_nozzle_level(clamped)
+                    return True
                 ok = await self._write_schedule_to_device(custom_mode=False)
-                # Multi-nozzle units display the level from DP 23 byte 8,
-                # so write that too (no-op on single-nozzle units).
+                # Single-nozzle units take the level from the DP 4 task
+                # grade; multi-nozzle ones additionally get the DP 23 write.
                 await self._write_gw_nozzle_level(clamped)
                 return ok
             return True
@@ -1617,6 +1627,14 @@ class ScentDiffuserDevice:
             self._state.schedule_custom_mode = custom
             self._notify_state_changed()
             if self._ble_address:
+                if getattr(self._protocol, "nozzle_block", None) is not None:
+                    # Multi-nozzle units: mode + level travel in the DP 23
+                    # block alone (byte 9: 0 = Custom, 1-5 = level), same
+                    # as the official app — skip the DP 4 write here.
+                    await self._write_gw_nozzle_level(
+                        0 if custom else (self._state.intensity or 1)
+                    )
+                    return True
                 ok = await self._write_schedule_to_device(custom_mode=custom)
                 await self._write_gw_nozzle_level(
                     0 if custom else (self._state.intensity or 1)

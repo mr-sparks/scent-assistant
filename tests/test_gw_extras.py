@@ -292,18 +292,34 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await self.device.set_intensity(5))
         self.assertEqual(self.device.state.intensity, 5)
-        # Three frames sent: DP 4 schedule (grade 5) + the app's two-frame
-        # DP 23 level sequence (rec_c1 byte 9 = 05 in both).
-        self.assertEqual(len(self.sent), 3)
-        self.assertEqual(dp4_task(self.sent[0])[6], 5)
-        for dp23_frame in self.sent[1:3]:
+        # Multi-nozzle unit: like the official app, ONLY the two-frame DP 23
+        # sequence is sent — no DP 4 schedule write (that made the unit
+        # beep twice per level change).
+        self.assertEqual(len(self.sent), 2)
+        for dp23_frame in self.sent:
             self.assertEqual(dp23_frame[2:4], b"\x00\x17")
             self.assertEqual(dp23_frame[7 + 9], 5)
         # Frame 1: rec_c1=new(05), rec_be=prev(02); frame 2: both new.
-        self.assertEqual(self.sent[1][7:7 + 22].hex(),
+        self.assertEqual(self.sent[0][7:7 + 22].hex(),
                          "01010002c10900173b05be0800160002" "01008001012c")
-        self.assertEqual(self.sent[2][7:7 + 22].hex(),
+        self.assertEqual(self.sent[1][7:7 + 22].hex(),
                          "01010002be0800160005c10900173b05" "01008001012c")
+
+    async def test_set_schedule_mode_multi_nozzle_skips_dp4(self):
+        proto = self.device._protocol
+        proto._nozzle_block = bytes.fromhex(
+            "01010002c10900173b02be080016000201008001012c"
+        )
+        self.device.state.intensity = 2
+        self.assertTrue(await self.device.set_schedule_mode(False))
+        self.assertEqual(len(self.sent), 2)  # two DP 23 frames, no DP 4
+        self.assertTrue(all(f[2:4] == b"\x00\x17" for f in self.sent))
+        self.assertTrue(await self.device.set_schedule_mode(True))
+        # Custom mode: DP 23 byte 9 = 0 in both frames.
+        self.assertEqual(len(self.sent), 4)
+        for f in self.sent[2:4]:
+            self.assertEqual(f[2:4], b"\x00\x17")
+            self.assertEqual(f[7 + 9], 0)
 
     async def test_set_intensity_without_nozzle_block_sends_dp4_only(self):
         self.assertTrue(await self.device.set_intensity(3))
