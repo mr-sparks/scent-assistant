@@ -2098,17 +2098,26 @@ class ScentMarketingGwProtocol(BleProtocol):
         return [frame1, frame2]
 
     def build_nozzle_level_frames(self, grade: int) -> list[bytes]:
-        """Build the DP-23 write frames that set the active level.
+        """Build the DP-23 write frame(s) that set the active level.
 
         Multi-nozzle GW units (PID 13) take the displayed intensity from
         the DP 23 block, not from the DP 4 task grade — observed: an
         app-side level change flipped block byte 9 (02 -> 01) while DP 4
         grade writes left it untouched. Returns [] until the device has
         reported a block, so we never write a made-up one.
+
+        The official app sends two frames per change (a transition frame,
+        then the commit frame), but the unit beeps once per DP-23 frame,
+        so we send only the commit frame — the same shape as the
+        steady-state block the device itself pushes (both records = new
+        level).
         """
+        payloads = self._nozzle_level_payloads(grade)
+        if payloads:
+            payloads = [payloads[-1]]  # commit frame: rec_be(new) + rec_c1(new)
         return [
             self._build_frame([self._build_composite_dp(SM_GW_DP_MULTI_NOZZLE, payload)])
-            for payload in self._nozzle_level_payloads(grade)
+            for payload in payloads
         ]
 
     def build_nozzle_level(self, grade: int) -> bytes | None:
