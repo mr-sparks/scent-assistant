@@ -179,6 +179,22 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         task = dp4_task(self.sent[0])
         self.assertEqual(task[6], 0)  # custom grade
 
+    async def test_intensity_clears_stale_custom_mode(self):
+        # Device reported custom mode earlier (grade 0 read-back): picking
+        # a level must flip the mode flag, or the Level select snaps back.
+        self.device.state.schedule_custom_mode = True
+        self.assertTrue(await self.device.set_intensity(5))
+        self.assertIs(self.device.state.schedule_custom_mode, False)
+        self.assertEqual(self.device.state.intensity, 5)
+        self.assertEqual(dp4_task(self.sent[0])[6], 5)
+
+    async def test_work_duration_sets_custom_mode(self):
+        self.device.state.schedule_custom_mode = False
+        self.device.state.intensity = 4
+        self.assertTrue(await self.device.set_work_duration(30))
+        self.assertIs(self.device.state.schedule_custom_mode, True)
+        self.assertEqual(dp4_task(self.sent[0])[6], 0)
+
     async def test_set_schedule_enabled_sets_task_flag(self):
         self.assertTrue(await self.device.set_schedule_enabled(True))
         self.assertIs(self.device.state.schedule_enabled, True)

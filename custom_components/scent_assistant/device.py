@@ -1775,6 +1775,10 @@ class ScentDiffuserDevice:
                     [slot], weekday_mask=weekday_mask, custom_mode=custom_mode,
                     intensity=self._state.intensity if custom_mode is False else None,
                 )
+                # Keep the mode flag in sync so the Level select doesn't snap
+                # back to Custom after an intensity change (and vice versa).
+                if custom_mode is not None:
+                    self._state.schedule_custom_mode = custom_mode
             elif isinstance(self._protocol, ScentMarketingAkProtocol):
                 slot = ScheduleSlot(
                     start_hour=s_h, start_minute=s_m, end_hour=e_h, end_minute=e_m,
