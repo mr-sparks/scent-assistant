@@ -199,7 +199,7 @@ Detected by manufacturer data (IDs `0x460C` / `0xF001`), e.g. Jcloud JC-A311. En
 | Lamp | Switch | Auxiliary LED lamp (DP 11 light) |
 | Child Lock | Switch | Lock physical buttons (DP 3) |
 | Program | Switch | Schedule/program enabled (bit 7 of the DP 4 task flags) |
-| Level | Select | The app's levels **Custom / Low / Mild / Medium / High / Max** — on multi-nozzle units the display level is DP 23 byte 9 (0 = Custom/"LO", 1–5 = grades); the DP 4 task grade is written alongside. Low..Max map to rows of the DP 14 gear table; Custom uses Work/Pause Duration (DP 15) |
+| Level | Select | The app's levels **Custom / Low / Mild / Medium / High / Max** — on multi-nozzle units the display level is the DP 23 block (byte 9); the app's two-frame DP 23 write sequence is sent alongside the DP 4 task grade. Low..Max map to rows of the DP 14 gear table; Custom uses Work/Pause Duration (DP 15) |
 | Start Time / End Time | Time | Daily schedule window (DP 4) |
 | Work / Pause Duration | Number | Custom spray timing (DP 15 customize gear) |
 | Oil remaining / Battery | Sensor | DP 8 / DP 12 reports |

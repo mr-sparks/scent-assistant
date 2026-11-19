@@ -1585,11 +1585,19 @@ class ScentDiffuserDevice:
     async def _write_gw_nozzle_level(self, grade: int) -> None:
         """Best-effort DP 23 level write for multi-nozzle GW units.
 
-        These units take the displayed intensity from byte 9 of the DP 23
-        block, not from the DP 4 task grade — so a level change writes both.
-        Skipped silently when the device hasn't reported a block yet.
+        These units take the displayed intensity from the DP 23 block, not
+        from the DP 4 task grade — so a level change writes both. The
+        official app sends TWO DP 23 frames per level change (captured via
+        HCI snoop); a single byte-9 rewrite is ACKed but not applied, so we
+        replicate the two-frame sequence. Skipped silently when the device
+        hasn't reported a block yet.
         """
         proto = self._protocol
+        frames_builder = getattr(proto, "build_nozzle_level_frames", None)
+        if frames_builder is not None:
+            for frame in frames_builder(grade):
+                await self._ble_execute(frame)
+            return
         builder = getattr(proto, "build_nozzle_level", None)
         if builder is None or getattr(proto, "nozzle_block", None) is None:
             return

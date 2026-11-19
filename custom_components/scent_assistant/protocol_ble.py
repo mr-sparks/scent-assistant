@@ -2049,22 +2049,72 @@ class ScentMarketingGwProtocol(BleProtocol):
         """Last DP 23 (multi-nozzle) block reported by the device."""
         return self._nozzle_block
 
-    def build_nozzle_level(self, grade: int) -> bytes | None:
-        """Build a DP-23 write that sets the active level (block byte 9).
+    def _nozzle_level_payloads(self, grade: int) -> list[bytes]:
+        """Raw DP-23 payloads for a level change on multi-nozzle GW units.
+
+        Captured from the official app (Android HCI snoop, PID-13): a
+        level change is TWO DP-23 frames sharing one 22-byte block layout
+        ``hdr(4) + rec_c1(6) + rec_be(6) + tail(6)`` where
+        ``rec_c1 = c1 09 00 17 3b <level>`` and
+        ``rec_be = be 08 00 16 00 <level>``:
+
+          frame 1: hdr + rec_c1(new) + rec_be(prev) + tail
+          frame 2: hdr + rec_be(new) + rec_c1(new) + tail
+
+        Echoing the last reported block with only byte 9 rewritten is
+        ACKed but NOT applied by the firmware (the display keeps showing
+        the old level) — the app's two-frame sequence is what moves the
+        display. `hdr`/`tail` are taken from the last reported block so
+        firmware variations in those bytes are preserved. Returns an
+        empty list until the device has reported a block.
+        """
+        block = self._nozzle_block
+        if block is None or len(block) < 10:
+            return []
+        level = max(0, min(20, int(grade))) & 0xFF
+        prev = block[9] & 0xFF
+        if len(block) >= 22:
+            hdr, tail = bytes(block[0:4]), bytes(block[16:22])
+            rec_a, rec_b = bytes(block[4:10]), bytes(block[10:16])
+            if rec_a[0] == 0xC1 and rec_b[0] == 0xBE:
+                rec_c1, rec_be = rec_a, rec_b
+            elif rec_b[0] == 0xC1 and rec_a[0] == 0xBE:
+                rec_c1, rec_be = rec_b, rec_a
+            else:
+                rec_c1 = rec_be = None
+        else:
+            hdr = tail = None
+            rec_c1 = rec_be = None
+        if rec_c1 is None:
+            # Unknown block layout: fall back to a single byte-9 write.
+            blk = bytearray(block)
+            blk[9] = level
+            return [bytes(blk)]
+        c1_new = rec_c1[:5] + bytes([level])
+        be_new = rec_be[:5] + bytes([level])
+        be_prev = rec_be[:5] + bytes([prev])
+        frame1 = hdr + c1_new + be_prev + tail
+        frame2 = hdr + be_new + c1_new + tail
+        return [frame1, frame2]
+
+    def build_nozzle_level_frames(self, grade: int) -> list[bytes]:
+        """Build the DP-23 write frames that set the active level.
 
         Multi-nozzle GW units (PID 13) take the displayed intensity from
         the DP 23 block, not from the DP 4 task grade — observed: an
         app-side level change flipped block byte 9 (02 -> 01) while DP 4
-        grade writes left it untouched. Returns None until the device has
+        grade writes left it untouched. Returns [] until the device has
         reported a block, so we never write a made-up one.
         """
-        if self._nozzle_block is None or len(self._nozzle_block) < 10:
-            return None
-        block = bytearray(self._nozzle_block)
-        block[9] = max(0, min(20, int(grade))) & 0xFF
-        return self._build_frame([
-            self._build_composite_dp(SM_GW_DP_MULTI_NOZZLE, bytes(block)),
-        ])
+        return [
+            self._build_frame([self._build_composite_dp(SM_GW_DP_MULTI_NOZZLE, payload)])
+            for payload in self._nozzle_level_payloads(grade)
+        ]
+
+    def build_nozzle_level(self, grade: int) -> bytes | None:
+        """First DP-23 level frame (see `build_nozzle_level_frames`)."""
+        frames = self.build_nozzle_level_frames(grade)
+        return frames[0] if frames else None
 
     def build_device_name(self, name: str) -> bytes:
         """Build a DP-6 device-name write. Always 19 bytes zero-padded."""
@@ -2550,15 +2600,19 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
         dp_json = self._dp_to_json(SM_GW_DP_LIGHT, payload.hex(), SM_GW_TYPE_BINARY)
         return self.encrypt(self._wrap_for_wire(dp_json))
 
+    def build_nozzle_level_frames(self, grade: int) -> list[bytes]:
+        # Same DP-23 block payloads as the plain GW frame (two-frame level
+        # sequence, see ScentMarketingGwProtocol._nozzle_level_payloads),
+        # each as a hex-string composite in the encrypted JSON envelope.
+        out = []
+        for payload in self._nozzle_level_payloads(grade):
+            dp_json = self._dp_to_json(SM_GW_DP_MULTI_NOZZLE, payload.hex(), SM_GW_TYPE_BINARY)
+            out.append(self.encrypt(self._wrap_for_wire(dp_json)))
+        return out
+
     def build_nozzle_level(self, grade: int) -> bytes | None:
-        # Same DP-23 block as the plain GW frame, as a hex-string composite
-        # in the encrypted JSON envelope (mirrors build_light).
-        if self._nozzle_block is None or len(self._nozzle_block) < 10:
-            return None
-        block = bytearray(self._nozzle_block)
-        block[9] = max(0, min(20, int(grade))) & 0xFF
-        dp_json = self._dp_to_json(SM_GW_DP_MULTI_NOZZLE, bytes(block).hex(), SM_GW_TYPE_BINARY)
-        return self.encrypt(self._wrap_for_wire(dp_json))
+        frames = self.build_nozzle_level_frames(grade)
+        return frames[0] if frames else None
 
     def build_query(self) -> bytes:
         # The device emits state automatically; an explicit query is not

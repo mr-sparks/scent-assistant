@@ -379,10 +379,31 @@ Example from a PID-13 unit: `05 | (5,240) (15,200) (20,160) (25,100) (25,60)`.
 **Active level on multi-nozzle units (DP 23 present, e.g. PID 13)**: the
 device display reads the level from **byte 9 of the DP 23 block**
 (`0` = LO/custom, `1-5` = fixed grades) — observed flipping `02 -> 01`
-when the app set Low, while DP 4 grade writes left it unchanged. Write the
-whole DP 23 block back with byte 9 set: `FF 01 00 17 AF 00 16 <block>`
-(chunked like every GW frame). DP 23 is reported in the state push, so the
-block is always read before it is written.
+when the app set Low, while DP 4 grade writes left it unchanged.
+
+The block is 22 bytes: `hdr(4) + rec_c1(6) + rec_be(6) + tail(6)` with
+`rec_c1 = C1 09 00 17 3B <level>` and `rec_be = BE 08 00 16 00 <level>`
+(the two records may arrive in either order in a state push). Captured
+from the official app via Android HCI snoop (PID-13): a level change to
+`L` (previous level `P`) is **two** DP-23 frames, each
+`FF 01 00 17 AF 00 16 <block>` chunked like every GW frame:
+
+```
+frame 1: hdr + C1 09 00 17 3B <L> + BE 08 00 16 00 <P> + tail
+frame 2: hdr + BE 08 00 16 00 <L> + C1 09 00 17 3B <L> + tail
+```
+
+E.g. 5 -> 1 on the captured unit (`hdr=01010002`, `tail=01008003012c`):
+```
+FF 01 00 17 AF 00 16 01010002 C10900173B01 BE0800160005 01008003012C
+FF 01 00 17 AF 00 16 01010002 BE0800160001 C10900173B01 01008003012C
+```
+
+Writing the block back with only byte 9 changed is ACKed but **not**
+applied by the firmware (display stays on the old level) — the two-frame
+sequence is what moves the display. `hdr`/`tail` are echoed from the last
+reported block. DP 23 is reported in the state push, so the block is
+always read before it is written.
 
 **Lamp ON (DP 11, light_type 1):**
 ```

@@ -123,18 +123,53 @@ class NozzleBlockLevelTests(unittest.TestCase):
         self.assertIs(result["schedule_custom_mode"], True)
         self.assertNotIn("intensity", result)
 
-    def test_build_nozzle_level_rewrites_byte9(self):
-        proto, _ = self._feed_dp23(self.DP23_LOW)
-        frame = proto.build_nozzle_level(5)
-        self.assertIsNotNone(frame)
-        # FF 01 | 00 17 AF 00 16 | block with byte 8 = 05
-        self.assertEqual(frame[0:2], b"\xff\x01")
-        self.assertEqual(frame[2:4], b"\x00\x17")
-        block = frame[7:]
-        self.assertEqual(len(block), 22)
-        self.assertEqual(block[9], 5)
-        self.assertEqual(block[:9], self.DP23_LOW[:9])   # rest preserved
-        self.assertEqual(block[10:], self.DP23_LOW[10:])
+    def test_build_nozzle_level_two_frames_app_sequence(self):
+        # From the official app's HCI snoop: a level change is two DP-23
+        # frames — first rec_c1=new/rec_be=prev, then rec_be=new/rec_c1=new.
+        proto, _ = self._feed_dp23(self.DP23_LOW)  # byte9 = 01 (prev level)
+        frames = proto.build_nozzle_level_frames(5)
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0].hex(),
+                         "ff010017af00" "1601010002c10900173b05be0800160001" "01008001012c")
+        self.assertEqual(frames[1].hex(),
+                         "ff010017af00" "1601010002be0800160005c10900173b05" "01008001012c")
+        # Single-frame helper returns the first frame.
+        self.assertEqual(proto.build_nozzle_level(5), frames[0])
+
+    # Real frames captured from the official Scent Marketing app
+    # (Android btsnoop_hci.log, PID-13, 2026-11-19 20:13): setting the
+    # level to Low (1) while the device was on 5, then to Max (5).
+    DP23_PUSH_MAX = bytes.fromhex("01010002be0800160005c10900173b0501008003012c")
+    DP23_ECHO_LOW = bytes.fromhex("01010002be0800160001c10900173b0101008003012c")
+    APP_SET_LOW = [
+        "ff010017af001601010002c10900173b01be080016000501008003012c",
+        "ff010017af001601010002be0800160001c10900173b0101008003012c",
+    ]
+    APP_SET_MAX = [
+        "ff010017af001601010002c10900173b05be080016000101008003012c",
+        "ff010017af001601010002be0800160005c10900173b0501008003012c",
+    ]
+
+    def test_build_nozzle_level_matches_app_snoop_low(self):
+        proto, _ = self._feed_dp23(self.DP23_PUSH_MAX)  # current level 5
+        frames = proto.build_nozzle_level_frames(1)
+        self.assertEqual([f.hex() for f in frames], self.APP_SET_LOW)
+
+    def test_build_nozzle_level_matches_app_snoop_max(self):
+        proto, _ = self._feed_dp23(self.DP23_ECHO_LOW)  # current level 1
+        frames = proto.build_nozzle_level_frames(5)
+        self.assertEqual([f.hex() for f in frames], self.APP_SET_MAX)
+
+    def test_nozzle_frames_chunk_like_the_app(self):
+        # The app writes each 29-byte frame as [nonce,1]+18B then
+        # [nonce,2]+11B transport chunks.
+        proto, _ = self._feed_dp23(self.DP23_PUSH_MAX)
+        frame = proto.build_nozzle_level_frames(1)[0]
+        chunks = protocol_ble.ScentMarketingGwProtocol.chunk_for_transport(frame, nonce=0x42)
+        self.assertEqual([len(c) for c in chunks], [20, 13])
+        self.assertEqual(chunks[0][:2], b"\x42\x01")
+        self.assertEqual(chunks[1][:2], b"\x42\x02")
+        self.assertEqual(b"".join(c[2:] for c in chunks), frame)
 
     def test_build_nozzle_level_none_without_block(self):
         proto = protocol_ble.ScentMarketingGwProtocol()
@@ -250,19 +285,25 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dp4_task(self.sent[0])[6], 0)
 
     async def test_set_intensity_also_writes_dp23_nozzle_level(self):
-        # Simulate the DP 23 block the device pushed (byte 8 = current level).
+        # Simulate the DP 23 block the device pushed (byte 9 = current level).
         proto = self.device._protocol
         proto._nozzle_block = bytes.fromhex(
             "01010002c10900173b02be080016000201008001012c"
         )
         self.assertTrue(await self.device.set_intensity(5))
         self.assertEqual(self.device.state.intensity, 5)
-        # Two frames sent: DP 4 schedule (grade 5) + DP 23 block (byte9=05)
-        self.assertEqual(len(self.sent), 2)
+        # Three frames sent: DP 4 schedule (grade 5) + the app's two-frame
+        # DP 23 level sequence (rec_c1 byte 9 = 05 in both).
+        self.assertEqual(len(self.sent), 3)
         self.assertEqual(dp4_task(self.sent[0])[6], 5)
-        dp23_frame = self.sent[1]
-        self.assertEqual(dp23_frame[2:4], b"\x00\x17")
-        self.assertEqual(dp23_frame[7 + 9], 5)
+        for dp23_frame in self.sent[1:3]:
+            self.assertEqual(dp23_frame[2:4], b"\x00\x17")
+            self.assertEqual(dp23_frame[7 + 9], 5)
+        # Frame 1: rec_c1=new(05), rec_be=prev(02); frame 2: both new.
+        self.assertEqual(self.sent[1][7:7 + 22].hex(),
+                         "01010002c10900173b05be0800160002" "01008001012c")
+        self.assertEqual(self.sent[2][7:7 + 22].hex(),
+                         "01010002be0800160005c10900173b05" "01008001012c")
 
     async def test_set_intensity_without_nozzle_block_sends_dp4_only(self):
         self.assertTrue(await self.device.set_intensity(3))
