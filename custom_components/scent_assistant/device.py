@@ -1531,6 +1531,10 @@ class ScentDiffuserDevice:
             max_value = len(table) if table else 20
             clamped = max(1, min(max_value, int(intensity)))
             self._state.intensity = clamped
+            # Set the mode in the same state update: a level choice is
+            # Level mode, and notifying twice (intensity first, mode later)
+            # made the Level select icon flicker Custom -> level.
+            self._state.schedule_custom_mode = False
             self._notify_state_changed()
             if self._ble_address:
                 ok = await self._write_schedule_to_device(custom_mode=False)
