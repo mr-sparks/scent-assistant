@@ -376,6 +376,14 @@ Example from a PID-13 unit: `05 | (5,240) (15,200) (20,160) (25,100) (25,60)`.
 **Intensity (grade)** = DP 4 task byte 6: write the DP 4 frame with
 `custom_mode=False` semantics — grade 1-20, no DP 15 block appended.
 
+**Active level on multi-nozzle units (DP 23 present, e.g. PID 13)**: the
+device display reads the level from **byte 9 of the DP 23 block**
+(`0` = LO/custom, `1-5` = fixed grades) — observed flipping `02 -> 01`
+when the app set Low, while DP 4 grade writes left it unchanged. Write the
+whole DP 23 block back with byte 9 set: `FF 01 00 17 AF 00 16 <block>`
+(chunked like every GW frame). DP 23 is reported in the state push, so the
+block is always read before it is written.
+
 **Lamp ON (DP 11, light_type 1):**
 ```
 FF 01 00 0B AF 00 02 01 01

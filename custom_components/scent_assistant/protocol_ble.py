@@ -45,6 +45,7 @@ from .const import (
     SM_GW_MODE_INTERVAL, SM_GW_MODE_NONE, SM_GW_MODE_QUICK,
     SM_GW_DP_POWER, SM_GW_DP_FAN, SM_GW_DP_LOCK, SM_GW_DP_MODE_TASKS,
     SM_GW_DP_VERSION, SM_GW_DP_NAME, SM_GW_DP_OIL, SM_GW_DP_LIGHT,
+    SM_GW_DP_MULTI_NOZZLE,
     SM_GW_DP_BATTERY, SM_GW_DP_PASSWORD, SM_GW_DP_FIXED_GEAR,
     SM_GW_DP_CUSTOMIZE_GEAR, SM_GW_DP_REMARK,
     SM_GW_PASSWORD_MARKER, SM_GW_PASSWORD_OK_BYTE,
@@ -1964,6 +1965,10 @@ class ScentMarketingGwProtocol(BleProtocol):
         self._tasks: list[bytes] = []
         self._task_trailer: bytes | None = None
         self._gear_limits: tuple[int, int, int, int] | None = None
+        # Last DP 23 (multi-nozzle) block as reported. On multi-nozzle GW
+        # units byte 9 of this block is the active level shown on the
+        # device display (0 = LO/custom, 1-5 = the fixed-gear grades).
+        self._nozzle_block: bytes | None = None
 
     # ------------------------------------------------------------------
     # Frame builders
@@ -2038,6 +2043,28 @@ class ScentMarketingGwProtocol(BleProtocol):
         else:
             payload = bytes([light_type & 0xFF, 0x01 if on else 0x00])
         return self._build_frame([self._build_composite_dp(SM_GW_DP_LIGHT, payload)])
+
+    @property
+    def nozzle_block(self) -> bytes | None:
+        """Last DP 23 (multi-nozzle) block reported by the device."""
+        return self._nozzle_block
+
+    def build_nozzle_level(self, grade: int) -> bytes | None:
+        """Build a DP-23 write that sets the active level (block byte 9).
+
+        Multi-nozzle GW units (PID 13) take the displayed intensity from
+        the DP 23 block, not from the DP 4 task grade — observed: an
+        app-side level change flipped block byte 9 (02 -> 01) while DP 4
+        grade writes left it untouched. Returns None until the device has
+        reported a block, so we never write a made-up one.
+        """
+        if self._nozzle_block is None or len(self._nozzle_block) < 10:
+            return None
+        block = bytearray(self._nozzle_block)
+        block[9] = max(0, min(20, int(grade))) & 0xFF
+        return self._build_frame([
+            self._build_composite_dp(SM_GW_DP_MULTI_NOZZLE, bytes(block)),
+        ])
 
     def build_device_name(self, name: str) -> bytes:
         """Build a DP-6 device-name write. Always 19 bytes zero-padded."""
@@ -2378,6 +2405,18 @@ class ScentMarketingGwProtocol(BleProtocol):
         elif dp_id == SM_GW_DP_FAN and len(payload) >= 3:
             # [size, max_level, current_level] — surface current_level only.
             result["fan"] = (payload[2] & 0xFF) > 0
+        elif dp_id == SM_GW_DP_MULTI_NOZZLE and len(payload) >= 10:
+            # Nozzle/state block. Byte 9 is the active level on PID-13
+            # multi-nozzle units: 0 = LO (custom), 1-5 = fixed grades.
+            # Observed in real pushes: 02 before, 01 after an app-side
+            # change to Low; unchanged by DP 4 grade writes.
+            self._nozzle_block = bytes(payload)
+            level = payload[9] & 0xFF
+            if level == 0:
+                result["schedule_custom_mode"] = True
+            else:
+                result["schedule_custom_mode"] = False
+                result["intensity"] = level
         elif dp_id == SM_GW_DP_FIXED_GEAR and len(payload) >= 5:
             # Fixed grade table: [count] then count x (work u16 BE, pause u16 BE).
             # Seen in a PID-13 state push: 05 | (5,240) (15,200) (20,160)
@@ -2511,6 +2550,16 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
         dp_json = self._dp_to_json(SM_GW_DP_LIGHT, payload.hex(), SM_GW_TYPE_BINARY)
         return self.encrypt(self._wrap_for_wire(dp_json))
 
+    def build_nozzle_level(self, grade: int) -> bytes | None:
+        # Same DP-23 block as the plain GW frame, as a hex-string composite
+        # in the encrypted JSON envelope (mirrors build_light).
+        if self._nozzle_block is None or len(self._nozzle_block) < 10:
+            return None
+        block = bytearray(self._nozzle_block)
+        block[9] = max(0, min(20, int(grade))) & 0xFF
+        dp_json = self._dp_to_json(SM_GW_DP_MULTI_NOZZLE, bytes(block).hex(), SM_GW_TYPE_BINARY)
+        return self.encrypt(self._wrap_for_wire(dp_json))
+
     def build_query(self) -> bytes:
         # The device emits state automatically; an explicit query is not
         # part of the WiFi-XOR protocol. We still send something to nudge
@@ -2577,6 +2626,23 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
                         result["light_on"] = light_status in (1, 2)
                     else:
                         result["light_on"] = False
+            elif dp_id == SM_GW_DP_MULTI_NOZZLE:
+                raw = value
+                if isinstance(raw, str):
+                    try:
+                        raw = bytes.fromhex(raw)
+                    except ValueError:
+                        raw = b""
+                if isinstance(raw, (list, tuple)):
+                    raw = bytes(raw)
+                if isinstance(raw, (bytes, bytearray)) and len(raw) >= 10:
+                    self._nozzle_block = bytes(raw)
+                    level = raw[9] & 0xFF
+                    if level == 0:
+                        result["schedule_custom_mode"] = True
+                    else:
+                        result["schedule_custom_mode"] = False
+                        result["intensity"] = level
             elif dp_id == SM_GW_DP_BATTERY:
                 try:
                     result["battery"] = int(value, 16) if isinstance(value, str) else int(value)

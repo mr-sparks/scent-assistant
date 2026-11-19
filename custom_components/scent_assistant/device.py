@@ -1533,7 +1533,11 @@ class ScentDiffuserDevice:
             self._state.intensity = clamped
             self._notify_state_changed()
             if self._ble_address:
-                return await self._write_schedule_to_device(custom_mode=False)
+                ok = await self._write_schedule_to_device(custom_mode=False)
+                # Multi-nozzle units display the level from DP 23 byte 8,
+                # so write that too (no-op on single-nozzle units).
+                await self._write_gw_nozzle_level(clamped)
+                return ok
             return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False
@@ -1574,6 +1578,21 @@ class ScentDiffuserDevice:
             return True
         return False
 
+    async def _write_gw_nozzle_level(self, grade: int) -> None:
+        """Best-effort DP 23 level write for multi-nozzle GW units.
+
+        These units take the displayed intensity from byte 9 of the DP 23
+        block, not from the DP 4 task grade — so a level change writes both.
+        Skipped silently when the device hasn't reported a block yet.
+        """
+        proto = self._protocol
+        builder = getattr(proto, "build_nozzle_level", None)
+        if builder is None or getattr(proto, "nozzle_block", None) is None:
+            return
+        frame = builder(grade)
+        if frame:
+            await self._ble_execute(frame)
+
     async def set_schedule_mode(self, custom: bool) -> bool:
         """Explicitly select the schedule mode (Custom vs Level/grade).
 
@@ -1586,7 +1605,11 @@ class ScentDiffuserDevice:
             self._state.schedule_custom_mode = custom
             self._notify_state_changed()
             if self._ble_address:
-                return await self._write_schedule_to_device(custom_mode=custom)
+                ok = await self._write_schedule_to_device(custom_mode=custom)
+                await self._write_gw_nozzle_level(
+                    0 if custom else (self._state.intensity or 1)
+                )
+                return ok
             return True
         if not isinstance(self._protocol, ScentMarketingAkProtocol):
             return False

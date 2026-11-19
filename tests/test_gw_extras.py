@@ -6,6 +6,7 @@ flag (DP 4 task bit 7), and the entity registration for the GW family.
 Frames are built from the decoded protocol layout and, where noted,
 from the PID-13 state push captured in the wild.
 """
+import json
 import socket
 import unittest
 from types import SimpleNamespace
@@ -94,6 +95,59 @@ class Pid13StatePushTests(unittest.TestCase):
             + len(payload).to_bytes(2, "big") + payload
         result = feed_frame(proto, frame)
         self.assertEqual(result["oil_remaining"], 50)
+
+
+class NozzleBlockLevelTests(unittest.TestCase):
+    """DP 23 (multi-nozzle) byte 9 carries the active level on PID-13."""
+
+    DP23_LOW = bytes.fromhex("01010002c10900173b01be080016000201008001012c")  # byte9=01, app set Low
+    DP23_MED = bytes.fromhex("01010002c10900173b02be080016000201008001012c")  # byte9=02
+
+    def _feed_dp23(self, payload: bytes):
+        proto = protocol_ble.ScentMarketingGwProtocol()
+        frame = bytes([0xFF, 0x01]) + (23).to_bytes(2, "big") + bytes([0xAF]) \
+            + len(payload).to_bytes(2, "big") + payload
+        return proto, feed_frame(proto, frame)
+
+    def test_dp23_byte9_is_intensity(self):
+        _, result = self._feed_dp23(self.DP23_LOW)
+        self.assertEqual(result["intensity"], 1)
+        self.assertIs(result["schedule_custom_mode"], False)
+        _, result = self._feed_dp23(self.DP23_MED)
+        self.assertEqual(result["intensity"], 2)
+
+    def test_dp23_byte9_zero_is_custom(self):
+        block = bytearray(self.DP23_MED)
+        block[9] = 0
+        _, result = self._feed_dp23(bytes(block))
+        self.assertIs(result["schedule_custom_mode"], True)
+        self.assertNotIn("intensity", result)
+
+    def test_build_nozzle_level_rewrites_byte9(self):
+        proto, _ = self._feed_dp23(self.DP23_LOW)
+        frame = proto.build_nozzle_level(5)
+        self.assertIsNotNone(frame)
+        # FF 01 | 00 17 AF 00 16 | block with byte 8 = 05
+        self.assertEqual(frame[0:2], b"\xff\x01")
+        self.assertEqual(frame[2:4], b"\x00\x17")
+        block = frame[7:]
+        self.assertEqual(len(block), 22)
+        self.assertEqual(block[9], 5)
+        self.assertEqual(block[:9], self.DP23_LOW[:9])   # rest preserved
+        self.assertEqual(block[10:], self.DP23_LOW[10:])
+
+    def test_build_nozzle_level_none_without_block(self):
+        proto = protocol_ble.ScentMarketingGwProtocol()
+        self.assertIsNone(proto.build_nozzle_level(3))
+
+    def test_xor_build_nozzle_level_encrypted(self):
+        proto = protocol_ble.ScentMarketingGwXorProtocol(mac="A1B2C3D4E5F6")
+        proto._nozzle_block = self.DP23_LOW
+        frame = proto.build_nozzle_level(4)
+        obj = json.loads(proto.decrypt(frame).decode("utf-8"))
+        dp = obj["data"]["23"]
+        self.assertEqual(dp["type"], const.SM_GW_TYPE_BINARY)
+        self.assertEqual(bytes.fromhex(dp["value"])[9], 4)
 
 
 class GradeTableParseTests(unittest.TestCase):
@@ -194,6 +248,26 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.device.set_work_duration(30))
         self.assertIs(self.device.state.schedule_custom_mode, True)
         self.assertEqual(dp4_task(self.sent[0])[6], 0)
+
+    async def test_set_intensity_also_writes_dp23_nozzle_level(self):
+        # Simulate the DP 23 block the device pushed (byte 8 = current level).
+        proto = self.device._protocol
+        proto._nozzle_block = bytes.fromhex(
+            "01010002c10900173b02be080016000201008001012c"
+        )
+        self.assertTrue(await self.device.set_intensity(5))
+        self.assertEqual(self.device.state.intensity, 5)
+        # Two frames sent: DP 4 schedule (grade 5) + DP 23 block (byte9=05)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(dp4_task(self.sent[0])[6], 5)
+        dp23_frame = self.sent[1]
+        self.assertEqual(dp23_frame[2:4], b"\x00\x17")
+        self.assertEqual(dp23_frame[7 + 9], 5)
+
+    async def test_set_intensity_without_nozzle_block_sends_dp4_only(self):
+        self.assertTrue(await self.device.set_intensity(3))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(dp4_task(self.sent[0])[6], 3)
 
     async def test_set_schedule_enabled_sets_task_flag(self):
         self.assertTrue(await self.device.set_schedule_enabled(True))
