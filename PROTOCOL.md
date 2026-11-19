@@ -405,13 +405,12 @@ sequence is what moves the display. `hdr`/`tail` are echoed from the last
 reported block. DP 23 is reported in the state push, so the block is
 always read before it is written.
 
-On these units a level change goes out as DP 23 frames **only** — the
-official app does not send a DP 4 schedule write alongside
-(snoop-verified). The app sends two frames per change (transition, then
-commit), but the unit beeps once per DP-23 frame, so we send only the
-commit frame `hdr + rec_be(new) + rec_c1(new) + tail` — the same shape as
-the steady-state block the device itself pushes. Byte 9 = 0 selects
-Custom mode, so the mode switch rides along in the same frame.
+On these units a level change goes out as the two DP 23 frames **only** —
+the official app does not send a DP 4 schedule write alongside
+(snoop-verified). The unit beeps once per DP-23 frame, so a level change
+always sounds two beeps — confirmed identical in the official app. Byte 9
+= 0 selects Custom mode, so the mode switch rides along in the same
+frames.
 
 **Lamp ON (DP 11, light_type 1):**
 ```

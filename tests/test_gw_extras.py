@@ -123,14 +123,16 @@ class NozzleBlockLevelTests(unittest.TestCase):
         self.assertIs(result["schedule_custom_mode"], True)
         self.assertNotIn("intensity", result)
 
-    def test_build_nozzle_level_sends_single_commit_frame(self):
-        # The app sends two DP-23 frames per change, but the unit beeps per
-        # frame — we send only the commit frame (both records = new level,
-        # the same shape as the device's own steady-state push).
+    def test_build_nozzle_level_sends_both_app_frames(self):
+        # The app sends two DP-23 frames per change and the unit beeps once
+        # per frame (confirmed: the official app also beeps twice) — we
+        # replicate the full sequence: transition frame, then commit frame.
         proto, _ = self._feed_dp23(self.DP23_LOW)  # byte9 = 01 (prev level)
         frames = proto.build_nozzle_level_frames(5)
-        self.assertEqual(len(frames), 1)
+        self.assertEqual(len(frames), 2)
         self.assertEqual(frames[0].hex(),
+                         "ff010017af00" "1601010002c10900173b05be0800160001" "01008001012c")
+        self.assertEqual(frames[1].hex(),
                          "ff010017af00" "1601010002be0800160005c10900173b05" "01008001012c")
         self.assertEqual(proto.build_nozzle_level(5), frames[0])
 
@@ -151,26 +153,12 @@ class NozzleBlockLevelTests(unittest.TestCase):
     def test_build_nozzle_level_matches_app_snoop_low(self):
         proto, _ = self._feed_dp23(self.DP23_PUSH_MAX)  # current level 5
         frames = proto.build_nozzle_level_frames(1)
-        # We send only the app's second (commit) frame.
-        self.assertEqual([f.hex() for f in frames], self.APP_SET_LOW[1:])
+        self.assertEqual([f.hex() for f in frames], self.APP_SET_LOW)
 
     def test_build_nozzle_level_matches_app_snoop_max(self):
         proto, _ = self._feed_dp23(self.DP23_ECHO_LOW)  # current level 1
         frames = proto.build_nozzle_level_frames(5)
-        self.assertEqual([f.hex() for f in frames], self.APP_SET_MAX[1:])
-
-    def test_nozzle_level_payloads_still_builds_both_app_frames(self):
-        # The full two-frame app sequence stays available (and snoop-verified)
-        # via _nozzle_level_payloads; only the wire write uses the commit frame.
-        proto, _ = self._feed_dp23(self.DP23_PUSH_MAX)
-        payloads = proto._nozzle_level_payloads(1)
-        self.assertEqual(len(payloads), 2)
-        f1 = bytes([0xFF, 0x01]) + (23).to_bytes(2, "big") + bytes([0xAF]) \
-            + len(payloads[0]).to_bytes(2, "big") + payloads[0]
-        f2 = bytes([0xFF, 0x01]) + (23).to_bytes(2, "big") + bytes([0xAF]) \
-            + len(payloads[1]).to_bytes(2, "big") + payloads[1]
-        self.assertEqual(f1.hex(), self.APP_SET_LOW[0])
-        self.assertEqual(f2.hex(), self.APP_SET_LOW[1])
+        self.assertEqual([f.hex() for f in frames], self.APP_SET_MAX)
 
     def test_nozzle_frames_chunk_like_the_app(self):
         # The app writes each 29-byte frame as [nonce,1]+18B then
@@ -304,13 +292,16 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await self.device.set_intensity(5))
         self.assertEqual(self.device.state.intensity, 5)
-        # DP 23 unit: a single commit DP-23 frame is sent — no DP 4
-        # schedule write (that made the unit beep twice per level change).
-        self.assertEqual(len(self.sent), 1)
-        dp23_frame = self.sent[0]
-        self.assertEqual(dp23_frame[2:4], b"\x00\x17")
-        # Commit frame: rec_be(new=05) + rec_c1(new=05).
-        self.assertEqual(dp23_frame[7:7 + 22].hex(),
+        # DP 23 unit: the app's two-frame DP 23 sequence is sent — no DP 4
+        # schedule write alongside (snoop-verified app behaviour).
+        self.assertEqual(len(self.sent), 2)
+        for dp23_frame in self.sent:
+            self.assertEqual(dp23_frame[2:4], b"\x00\x17")
+            self.assertEqual(dp23_frame[7 + 9], 5)
+        # Frame 1: rec_c1=new(05), rec_be=prev(02); frame 2: both new.
+        self.assertEqual(self.sent[0][7:7 + 22].hex(),
+                         "01010002c10900173b05be0800160002" "01008001012c")
+        self.assertEqual(self.sent[1][7:7 + 22].hex(),
                          "01010002be0800160005c10900173b05" "01008001012c")
 
     async def test_set_schedule_mode_multi_nozzle_skips_dp4(self):
@@ -320,13 +311,14 @@ class GwDeviceControlTests(unittest.IsolatedAsyncioTestCase):
         )
         self.device.state.intensity = 2
         self.assertTrue(await self.device.set_schedule_mode(False))
-        self.assertEqual(len(self.sent), 1)  # one DP 23 frame, no DP 4
-        self.assertEqual(self.sent[0][2:4], b"\x00\x17")
+        self.assertEqual(len(self.sent), 2)  # two DP 23 frames, no DP 4
+        self.assertTrue(all(f[2:4] == b"\x00\x17" for f in self.sent))
         self.assertTrue(await self.device.set_schedule_mode(True))
-        # Custom mode: DP 23 byte 9 = 0.
-        self.assertEqual(len(self.sent), 2)
-        self.assertEqual(self.sent[1][2:4], b"\x00\x17")
-        self.assertEqual(self.sent[1][7 + 9], 0)
+        # Custom mode: DP 23 byte 9 = 0 in both frames.
+        self.assertEqual(len(self.sent), 4)
+        for f in self.sent[2:4]:
+            self.assertEqual(f[2:4], b"\x00\x17")
+            self.assertEqual(f[7 + 9], 0)
 
     async def test_set_intensity_without_nozzle_block_sends_dp4_only(self):
         self.assertTrue(await self.device.set_intensity(3))

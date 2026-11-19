@@ -2106,18 +2106,15 @@ class ScentMarketingGwProtocol(BleProtocol):
         grade writes left it untouched. Returns [] until the device has
         reported a block, so we never write a made-up one.
 
-        The official app sends two frames per change (a transition frame,
-        then the commit frame), but the unit beeps once per DP-23 frame,
-        so we send only the commit frame — the same shape as the
-        steady-state block the device itself pushes (both records = new
-        level).
+        The official app sends both frames per change (transition, then
+        commit) and the unit beeps once per DP-23 frame — the two beeps on
+        a level change are normal device behaviour, confirmed against the
+        app itself. We therefore replicate the app's full two-frame
+        sequence.
         """
-        payloads = self._nozzle_level_payloads(grade)
-        if payloads:
-            payloads = [payloads[-1]]  # commit frame: rec_be(new) + rec_c1(new)
         return [
             self._build_frame([self._build_composite_dp(SM_GW_DP_MULTI_NOZZLE, payload)])
-            for payload in payloads
+            for payload in self._nozzle_level_payloads(grade)
         ]
 
     def build_nozzle_level(self, grade: int) -> bytes | None:
