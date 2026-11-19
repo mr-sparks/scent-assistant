@@ -48,6 +48,54 @@ def dp4_task(frame: bytes) -> bytes:
     return payload[4:11]
 
 
+# The full state push of a real PID-13 unit (from its diagnostics dump;
+# addresses are redacted upstream of these frames). Sent after the DP 10
+# time-sync; the final 3b chunk is the lamp-on echo.
+PID13_PUSH = [
+    "3a01000b000101010005bf001230302e31332e30",
+    "3a0230203031332e30302e30350006bf00134c69",
+    "3a0376696e6720526f6f6d000000000000000000",
+    "3a0407af000501000000000008af000d71007800",
+    "3a0578007806a400000000000baf00020100000c",
+    "3a06af00020064000eaf001505000500f0000f00",
+    "3a07c8001400a0001900640019003c0014af0010",
+    "3a08000000000000000000000000000000000017",
+    "3a09af001601010002c10900173b02be08001600",
+    "3a0a0201008001012c0018af0016010005002300",
+    "3a0b3c012c020005003c0005003c0005003c",
+    "3b010001000baf00020101",
+]
+
+
+class Pid13StatePushTests(unittest.TestCase):
+    """Regression: parse the exact state push a PID-13 unit emits."""
+
+    def test_full_push_parses(self):
+        proto = protocol_ble.ScentMarketingGwProtocol()
+        result = {}
+        for chunk_hex in PID13_PUSH:
+            result.update(proto.parse_notification(bytes.fromhex(chunk_hex)))
+        self.assertIs(result["power"], True)
+        self.assertEqual(result["firmware_version"], "00.13.00 013.00.05")
+        self.assertEqual(result["device_name"], "Living Room")
+        self.assertEqual(result["battery"], 100)
+        # 71 0078 0078 … = 120 g of 120 g -> full -> 100 % (app says "vol")
+        self.assertEqual(result["oil_remaining"], 100)
+        self.assertEqual(result["grade_table"], [
+            (5, 240), (15, 200), (20, 160), (25, 100), (25, 60),
+        ])
+        self.assertIs(result["light_on"], True)  # last frame = lamp-on echo
+
+    def test_oil_weight_ratio(self):
+        proto = protocol_ble.ScentMarketingGwProtocol()
+        # 60 g of 120 g -> 50 %
+        payload = bytes.fromhex("7100780 03c0078 06a4 0000 0000".replace(" ", ""))
+        frame = bytes([0xFF, 0x01]) + (8).to_bytes(2, "big") + bytes([0xAF]) \
+            + len(payload).to_bytes(2, "big") + payload
+        result = feed_frame(proto, frame)
+        self.assertEqual(result["oil_remaining"], 50)
+
+
 class GradeTableParseTests(unittest.TestCase):
     def test_dp14_fixed_gear_table(self):
         proto = protocol_ble.ScentMarketingGwProtocol()

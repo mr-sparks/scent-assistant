@@ -2338,12 +2338,28 @@ class ScentMarketingGwProtocol(BleProtocol):
             text = payload.rstrip(b"\x00").decode("utf-8", errors="replace").strip()
             if text:
                 result["remark"] = text
-        elif dp_id == SM_GW_DP_BATTERY and len(payload) >= 3:
+        elif dp_id == SM_GW_DP_BATTERY and len(payload) >= 2:
+            # PID-13 pushes a 2-byte payload `00 64` (100 %); longer
+            # variants keep the same value at offset 1.
             result["battery"] = payload[1] & 0xFF
         elif dp_id == SM_GW_DP_OIL and len(payload) >= 1:
             first = payload[0] & 0xFF
             if 113 <= first <= 127 and len(payload) >= 7:
-                result["oil_remaining"] = (payload[5] << 8) | payload[6]
+                # Weight-sensor variant (marker 0x71-0x7F): the payload
+                # carries gram readings as u16 BE, not a percentage. A
+                # PID-13 push with a full bottle reads
+                #   71 0078 0078 0078 06a4 …  = 120 g of 120 g = 100 %.
+                # Take the two u16s at [1:3] and [3:5] as (capacity, current)
+                # in either order and derive the percentage; fall back to
+                # the legacy [5:7] value (clamped) when they don't form a
+                # sane ratio.
+                a = (payload[1] << 8) | payload[2]
+                b = (payload[3] << 8) | payload[4]
+                if a and b:
+                    cur, cap = (b, a) if b <= a else (a, b)
+                    result["oil_remaining"] = max(0, min(100, round(cur * 100 / cap)))
+                else:
+                    result["oil_remaining"] = min(100, (payload[5] << 8) | payload[6])
             elif len(payload) >= 2:
                 pct_byte = payload[1] & 0xFF
                 if pct_byte not in (0xE0,):
