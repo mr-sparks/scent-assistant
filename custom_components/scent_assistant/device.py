@@ -11,6 +11,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from bleak import BleakClient, BleakScanner, BleakError
 from bleak_retry_connector import establish_connection
@@ -56,6 +57,9 @@ from .protocol_ble import (
     detect_device_type,
 )
 from .protocol_cloud import AromaLinkCloudClient
+
+if TYPE_CHECKING:
+    from .estimated_oil import OilEstimator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -218,6 +222,7 @@ class ScentDiffuserDevice:
         self._ai_read_sent = False
         self._timers_received = asyncio.Event()
         self._timer_write_acked = asyncio.Event()
+        self.oil_estimator: OilEstimator | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -509,6 +514,25 @@ class ScentDiffuserDevice:
                 cb()
             except Exception:
                 _LOGGER.exception("Error in state callback")
+
+    async def _advance_oil_estimate(self) -> None:
+        """Account for oil consumed up to now before mutating state."""
+        if self.oil_estimator is not None:
+            await self.oil_estimator.async_advance()
+
+    def _schedule_oil_advance(self) -> None:
+        """Schedule an oil estimate update from a synchronous BLE callback."""
+        if self.oil_estimator is None or not self.oil_estimator.enabled:
+            return
+        if self._hass is not None:
+            self._hass.async_create_task(self.oil_estimator.async_advance())
+        else:
+            try:
+                asyncio.get_running_loop().create_task(
+                    self.oil_estimator.async_advance()
+                )
+            except RuntimeError:
+                pass
 
     # ------------------------------------------------------------------
     # BLE connect-on-demand
@@ -1063,7 +1087,10 @@ class ScentDiffuserDevice:
             self._ble_nacks[updates["nack"]] = self._ble_nack_seq
 
         changed = False
+        oil_state_changed = False
         if "power" in updates:
+            if self._state.power != updates["power"]:
+                oil_state_changed = True
             self._state.power = updates["power"]
             changed = True
         if "fan" in updates:
@@ -1074,21 +1101,37 @@ class ScentDiffuserDevice:
             self._state.phase = updates["phase"]
             changed = True
         if "work_seconds" in updates:
+            if self._state.work_seconds != updates["work_seconds"]:
+                oil_state_changed = True
             self._state.work_seconds = updates["work_seconds"]
             changed = True
         if "pause_seconds" in updates:
+            if self._state.pause_seconds != updates["pause_seconds"]:
+                oil_state_changed = True
             self._state.pause_seconds = updates["pause_seconds"]
             changed = True
         if "work_seconds" in updates and "pause_seconds" in updates:
             self._schedule_durations_read = True
         if "start_hour" in updates:
+            new_start_minute = updates.get("start_minute", 0)
+            if (
+                self._state.start_hour != updates["start_hour"]
+                or self._state.start_minute != new_start_minute
+            ):
+                oil_state_changed = True
             self._state.start_hour = updates["start_hour"]
-            self._state.start_minute = updates.get("start_minute", 0)
+            self._state.start_minute = new_start_minute
             self._schedule_window_read = True
             changed = True
         if "end_hour" in updates:
+            new_end_minute = updates.get("end_minute", 59)
+            if (
+                self._state.end_hour != updates["end_hour"]
+                or self._state.end_minute != new_end_minute
+            ):
+                oil_state_changed = True
             self._state.end_hour = updates["end_hour"]
-            self._state.end_minute = updates.get("end_minute", 59)
+            self._state.end_minute = new_end_minute
             changed = True
         if "level" in updates:
             self._state.level = updates["level"]
@@ -1175,6 +1218,8 @@ class ScentDiffuserDevice:
         if "model_code" in updates or "firmware_version" in updates:
             self._update_device_entry()
         if "schedule_enabled" in updates:
+            if self._state.schedule_enabled != updates["schedule_enabled"]:
+                oil_state_changed = True
             self._state.schedule_enabled = updates["schedule_enabled"]
             changed = True
         if "air_pump" in updates:
@@ -1193,11 +1238,17 @@ class ScentDiffuserDevice:
                 slot = day[0]
             else:
                 slot = next((s for s in day if s["enabled"]), day[0])
+                if self._state.schedule_enabled != slot["enabled"]:
+                    oil_state_changed = True
                 self._state.schedule_enabled = slot["enabled"]
             self._state.slot_level = slot["level"]
             if slot["work_seconds"] > 0:
+                if self._state.work_seconds != slot["work_seconds"]:
+                    oil_state_changed = True
                 self._state.work_seconds = slot["work_seconds"]
             if slot["pause_seconds"] > 0:
+                if self._state.pause_seconds != slot["pause_seconds"]:
+                    oil_state_changed = True
                 self._state.pause_seconds = slot["pause_seconds"]
             if slot["work_seconds"] > 0 and slot["pause_seconds"] > 0:
                 self._schedule_durations_read = True
@@ -1221,6 +1272,8 @@ class ScentDiffuserDevice:
         if changed:
             self._ble_state_read = True
             self._ble_last_update = datetime.now().astimezone()
+            if oil_state_changed:
+                self._schedule_oil_advance()
 
             self._notify_state_changed()
 
@@ -1299,6 +1352,8 @@ class ScentDiffuserDevice:
         if self._ble_address:
             cmd = self._protocol.build_power(on)
             if await self._ble_execute(cmd):
+                if self._state.power != on:
+                    await self._advance_oil_estimate()
                 self._state.power = on
                 # A phase the unit already reported wins over an assumed idle.
                 if not on or self._state.phase in ("off", "unknown"):
@@ -1310,6 +1365,8 @@ class ScentDiffuserDevice:
         if self.supports_cloud and self._cloud:
             success = await self._cloud.set_power(self._cloud_device_id, on)
             if success:
+                if self._state.power != on:
+                    await self._advance_oil_estimate()
                 self._state.power = on
                 if not on or self._state.phase in ("off", "unknown"):
                     self._state.phase = "idle" if on else "off"
@@ -1494,6 +1551,8 @@ class ScentDiffuserDevice:
             return False
         if not self._protocol.is_v3:
             return await self.set_power(enabled)
+        if self._state.schedule_enabled != enabled:
+            await self._advance_oil_estimate()
         self._state.schedule_enabled = enabled
         self._notify_state_changed()
         if self._ble_address:
@@ -1575,6 +1634,8 @@ class ScentDiffuserDevice:
         self.require_schedule_read()
         self.require_app_mode()
         previous = self._state.work_seconds
+        if previous != seconds:
+            await self._advance_oil_estimate()
         self._state.work_seconds = seconds
         # Setting an explicit duration means the user wants Custom mode.
         if await self._write_schedule_to_device(custom_mode=True):
@@ -1590,6 +1651,8 @@ class ScentDiffuserDevice:
         self.require_schedule_read()
         self.require_app_mode()
         previous = self._state.pause_seconds
+        if previous != seconds:
+            await self._advance_oil_estimate()
         self._state.pause_seconds = seconds
         if await self._write_schedule_to_device(custom_mode=True):
             return True
@@ -1616,7 +1679,10 @@ class ScentDiffuserDevice:
         self.require_app_mode()
         fields = ("start_hour", "start_minute", "end_hour", "end_minute")
         previous = [getattr(self._state, f) for f in fields]
-        for field, value in zip(fields, (start_hour, start_minute, end_hour, end_minute)):
+        new_values = (start_hour, start_minute, end_hour, end_minute)
+        if tuple(previous) != new_values:
+            await self._advance_oil_estimate()
+        for field, value in zip(fields, new_values):
             setattr(self._state, field, value)
         if await self._write_schedule_to_device():
             return True
@@ -1648,6 +1714,7 @@ class ScentDiffuserDevice:
             isinstance(self._protocol, AromaLinkBleProtocol)
             and not weekday_mask & (1 << datetime.now().weekday())
         )
+        await self._advance_oil_estimate()
         self._state.work_seconds = work_seconds
         self._state.pause_seconds = pause_seconds
         self._state.start_hour = start_hour
@@ -2171,6 +2238,17 @@ class ScentDiffuserDevice:
             got_schedule_from_status = False
             status = await self._cloud.get_status(self._cloud_device_id)
             if status:
+                oil_fields = (
+                    "power", "start_hour", "start_minute",
+                    "end_hour", "end_minute", "work_seconds", "pause_seconds",
+                )
+                if any(
+                    field in status
+                    and status[field] is not None
+                    and getattr(self._state, field) != status[field]
+                    for field in oil_fields
+                ):
+                    await self._advance_oil_estimate()
                 if "power" in status and status["power"] is not None:
                     self._state.power = status["power"]
                 if "phase" in status:
@@ -2238,7 +2316,7 @@ class ScentDiffuserDevice:
         if not schedule:
             return
 
-        for field in (
+        fields = (
             "start_hour",
             "start_minute",
             "end_hour",
@@ -2246,7 +2324,14 @@ class ScentDiffuserDevice:
             "work_seconds",
             "pause_seconds",
             "schedule_enabled",
+        )
+        if any(
+            field in schedule
+            and getattr(self._state, field) != schedule[field]
+            for field in fields
         ):
+            await self._advance_oil_estimate()
+        for field in fields:
             if field in schedule:
                 setattr(self._state, field, schedule[field])
         self._notify_state_changed()
@@ -2299,6 +2384,7 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        await self._advance_oil_estimate()
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
