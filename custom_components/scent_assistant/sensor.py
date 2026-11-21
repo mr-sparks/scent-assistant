@@ -97,6 +97,14 @@ async def async_setup_entry(
         entities.append(DiffuserOilCapacitySensor(device, entry))
         entities.append(DiffuserOilConsumptionSensor(device, entry))
 
+    estimator = getattr(device, "oil_estimator", None)
+    if estimator is not None:
+        entities.extend(
+            entity
+            for entity in estimator.entities()
+            if isinstance(entity, SensorEntity)
+        )
+
     async_add_entities(entities)
 
 
