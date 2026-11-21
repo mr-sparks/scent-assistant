@@ -316,7 +316,7 @@ class EstimatedOilNumber(_EstimatedOilEntity, NumberEntity):
 class OilRefillButton(_EstimatedOilEntity, ButtonEntity):
     """Reset estimated volume to the configured bottle capacity."""
 
-    _attr_name = "Refill oil"
+    _attr_name = "Reset estimated oil"
     _attr_icon = "mdi:water-plus"
 
     def __init__(self, estimator: OilEstimator) -> None:
