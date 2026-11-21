@@ -1,5 +1,6 @@
 """Unit tests for estimated-oil schedule and duty-cycle calculations."""
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from custom_components.scent_assistant.estimated_oil import (
     estimate_consumption_ml,
@@ -13,6 +14,13 @@ def test_schedule_overlap_with_midnight_window() -> None:
     assert scheduled_seconds_between(start, end, 22 * 60, 2 * 60) == 3600
 
 
+def test_timezone_aware_schedule_overlap() -> None:
+    tz = ZoneInfo("America/Chicago")
+    start = datetime(2026, 1, 1, 6, 0, tzinfo=tz)
+    end = datetime(2026, 1, 1, 23, 0, tzinfo=tz)
+    assert scheduled_seconds_between(start, end, 6 * 60 + 30, 22 * 60) == 15.5 * 3600
+
+
 def test_schedule_overlap_outside_window() -> None:
     assert scheduled_seconds_between(
         datetime(2026, 1, 1, 8), datetime(2026, 1, 1, 9), 10 * 60, 11 * 60
@@ -22,11 +30,26 @@ def test_schedule_overlap_outside_window() -> None:
 def test_duty_cycle_consumption_and_clamping() -> None:
     kwargs = dict(
         start=datetime(2026, 1, 1, 10), end=datetime(2026, 1, 1, 11),
-        is_on=True, schedule_enabled=True, start_minute=0, end_minute=23 * 60 + 59,
+        is_on=True, schedule_enabled=True, start_minute=0, end_minute=0,
         work_seconds=10, pause_seconds=10, full_duty_consumption_mlh=2.25,
     )
     assert estimate_consumption_ml(remaining_ml=10, **kwargs) == 8.875
     assert estimate_consumption_ml(remaining_ml=0.1, **kwargs) == 0
+
+
+def test_continuous_spray_zero_pause() -> None:
+    assert estimate_consumption_ml(
+        remaining_ml=10,
+        start=datetime(2026, 1, 1, 10),
+        end=datetime(2026, 1, 1, 11),
+        is_on=True,
+        schedule_enabled=True,
+        start_minute=0,
+        end_minute=0,
+        work_seconds=10,
+        pause_seconds=0,
+        full_duty_consumption_mlh=2.25,
+    ) == 7.75
 
 
 def test_no_consumption_when_off_or_outside_schedule() -> None:
