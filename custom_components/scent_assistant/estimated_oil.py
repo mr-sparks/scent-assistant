@@ -6,21 +6,29 @@ option is enabled and call ``async_advance`` on state changes and a timer.
 """
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import datetime, time, timedelta
 from typing import Any
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.button import ButtonEntity
-from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
-from homeassistant.const import EntityCategory
+from homeassistant.components.number import NumberDeviceClass, NumberEntity, NumberMode
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.const import EntityCategory, UnitOfVolume
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 DEFAULT_OIL_ESTIMATION_ENABLED = False
 DEFAULT_OIL_BOTTLE_CAPACITY_ML = 1000.0
 DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH = 2.25
 DEFAULT_OIL_LOW_THRESHOLD_PERCENT = 10.0
 OIL_ESTIMATION_INTERVAL = timedelta(minutes=1)
+OIL_PERSIST_INTERVAL = timedelta(minutes=15)
 
 
 def scheduled_seconds_between(
@@ -36,18 +44,25 @@ def scheduled_seconds_between(
     """
     if end <= start:
         return 0.0
+    if start.tzinfo is not None and end.tzinfo is not None:
+        end = end.astimezone(start.tzinfo)
     start_minute = max(0, min(1439, int(start_minute)))
     end_minute = max(0, min(1439, int(end_minute)))
+    tz = start.tzinfo
+    start_t = time(start_minute // 60, start_minute % 60)
+    end_t = time(end_minute // 60, end_minute % 60)
+    crosses_midnight = end_minute <= start_minute
     total = 0.0
     day = start.date() - timedelta(days=1)
     last_day = end.date()
     while day <= last_day:
-        window_start = datetime.combine(day, time()) + timedelta(minutes=start_minute)
-        duration_minutes = (end_minute - start_minute) % 1440
-        if duration_minutes == 0:
-            duration_minutes = 1440
-        window_end = window_start + timedelta(minutes=duration_minutes)
-        total += max(0.0, (min(end, window_end) - max(start, window_start)).total_seconds())
+        window_start = datetime.combine(day, start_t, tzinfo=tz)
+        end_day = day + timedelta(days=1) if crosses_midnight else day
+        window_end = datetime.combine(end_day, end_t, tzinfo=tz)
+        overlap_start = max(start, window_start)
+        overlap_end = min(end, window_end)
+        if overlap_end > overlap_start:
+            total += (overlap_end - overlap_start).total_seconds()
         day += timedelta(days=1)
     return total
 
@@ -107,66 +122,82 @@ class OilEstimator:
         self._store = Store(hass, 1, f"scent_assistant_oil_estimate_{entry.entry_id}")
         self.remaining_ml = self.capacity_ml
         self.last_update: datetime | None = None
-        self._lock = None
+        self._last_saved: datetime | None = None
+        self._lock = asyncio.Lock()
+        self._listeners: list[Callable[[], None]] = []
 
     async def async_load(self) -> None:
         """Restore volume and timestamp from Home Assistant's storage."""
-        data = await self._store.async_load()
-        if data:
-            try:
-                self.remaining_ml = max(0.0, min(self.capacity_ml, float(data["remaining_ml"])))
-                stamp = data.get("last_update")
-                self.last_update = datetime.fromisoformat(stamp) if stamp else None
-            except (KeyError, TypeError, ValueError):
-                self.remaining_ml = self.capacity_ml
-                self.last_update = None
-        if self.last_update is None:
-            self.last_update = self._now()
-            await self._save()
+        async with self._lock:
+            data = await self._store.async_load()
+            if data:
+                try:
+                    self.remaining_ml = max(0.0, min(self.capacity_ml, float(data["remaining_ml"])))
+                    stamp = data.get("last_update")
+                    self.last_update = datetime.fromisoformat(stamp) if stamp else None
+                except (KeyError, TypeError, ValueError):
+                    self.remaining_ml = self.capacity_ml
+                    self.last_update = None
+            if self.last_update is None:
+                self.last_update = self._now()
+                await self._save(force=True)
+            else:
+                self._last_saved = self.last_update
 
     @staticmethod
     def _now() -> datetime:
-        from homeassistant.util import dt as dt_util
         return dt_util.now()
 
-    async def _save(self) -> None:
+    async def _save(self, *, force: bool = False) -> None:
+        now = self.last_update or self._now()
+        if (
+            not force
+            and self._last_saved is not None
+            and (now - self._last_saved) < OIL_PERSIST_INTERVAL
+        ):
+            return
         await self._store.async_save({
             "remaining_ml": round(self.remaining_ml, 3),
-            "last_update": self.last_update.isoformat() if self.last_update else None,
+            "last_update": now.isoformat(),
         })
+        self._last_saved = now
 
     async def async_advance(self, now: datetime | None = None) -> None:
         """Account once for time since the prior update and persist it."""
-        now = now or self._now()
-        previous = self.last_update
-        if previous is not None and now > previous and self.enabled:
-            state = self.device.state
-            start_minute = None
-            end_minute = None
-            if None not in (state.start_hour, state.start_minute, state.end_hour, state.end_minute):
-                start_minute = state.start_hour * 60 + state.start_minute
-                end_minute = state.end_hour * 60 + state.end_minute
-            self.remaining_ml = estimate_consumption_ml(
-                remaining_ml=self.remaining_ml,
-                start=previous,
-                end=now,
-                is_on=state.power,
-                schedule_enabled=state.schedule_enabled,
-                start_minute=start_minute,
-                end_minute=end_minute,
-                work_seconds=state.work_seconds or None,
-                pause_seconds=state.pause_seconds if state.pause_seconds else None,
-                full_duty_consumption_mlh=self.full_duty_mlh,
-            )
-        self.last_update = now
-        await self._save()
+        if not self.enabled:
+            return
+        async with self._lock:
+            now = now or self._now()
+            previous = self.last_update
+            if previous is not None and now > previous:
+                state = self.device.state
+                start_minute = None
+                end_minute = None
+                if None not in (state.start_hour, state.start_minute, state.end_hour, state.end_minute):
+                    start_minute = state.start_hour * 60 + state.start_minute
+                    end_minute = state.end_hour * 60 + state.end_minute
+                self.remaining_ml = estimate_consumption_ml(
+                    remaining_ml=self.remaining_ml,
+                    start=previous,
+                    end=now,
+                    is_on=state.power,
+                    schedule_enabled=state.schedule_enabled,
+                    start_minute=start_minute,
+                    end_minute=end_minute,
+                    work_seconds=state.work_seconds if state.work_seconds is not None else None,
+                    pause_seconds=state.pause_seconds if state.pause_seconds is not None else None,
+                    full_duty_consumption_mlh=self.full_duty_mlh,
+                )
+            self.last_update = now
+            await self._save()
         self._notify()
 
     async def async_set_remaining(self, volume_ml: float) -> None:
         """Apply a manual volume entry immediately and save it."""
-        self.remaining_ml = max(0.0, min(self.capacity_ml, float(volume_ml)))
-        self.last_update = self._now()
-        await self._save()
+        async with self._lock:
+            self.remaining_ml = max(0.0, min(self.capacity_ml, float(volume_ml)))
+            self.last_update = self._now()
+            await self._save(force=True)
         self._notify()
 
     async def async_refill(self) -> None:
@@ -175,27 +206,40 @@ class OilEstimator:
 
     async def async_update_options(self, options: dict[str, Any]) -> None:
         """Apply options, clamp to capacity and reset the interval baseline."""
-        self.enabled = bool(options.get("oil_estimation_enabled", DEFAULT_OIL_ESTIMATION_ENABLED))
-        self.capacity_ml = max(1.0, float(options.get("oil_bottle_capacity_ml", DEFAULT_OIL_BOTTLE_CAPACITY_ML)))
-        self.full_duty_mlh = max(0.0, float(options.get("oil_full_duty_consumption_mlh", DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH)))
-        self.low_threshold_percent = max(0.0, min(100.0, float(options.get("oil_low_threshold_percent", DEFAULT_OIL_LOW_THRESHOLD_PERCENT))))
-        self.remaining_ml = min(self.remaining_ml, self.capacity_ml)
-        self.last_update = self._now()
-        await self._save()
+        async with self._lock:
+            self.enabled = bool(options.get("oil_estimation_enabled", DEFAULT_OIL_ESTIMATION_ENABLED))
+            self.capacity_ml = max(1.0, float(options.get("oil_bottle_capacity_ml", DEFAULT_OIL_BOTTLE_CAPACITY_ML)))
+            self.full_duty_mlh = max(0.0, float(options.get("oil_full_duty_consumption_mlh", DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH)))
+            self.low_threshold_percent = max(0.0, min(100.0, float(options.get("oil_low_threshold_percent", DEFAULT_OIL_LOW_THRESHOLD_PERCENT))))
+            self.remaining_ml = min(self.remaining_ml, self.capacity_ml)
+            self.last_update = self._now()
+            await self._save(force=True)
         self._notify()
 
+    def async_add_listener(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Register an entity state listener and return an unsubscribe callback."""
+        self._listeners.append(callback)
+
+        def _remove() -> None:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
+
+        return _remove
+
     def _notify(self) -> None:
-        for callback in list(getattr(self.device, "_state_callbacks", ())):
-            try:
-                callback()
-            except Exception:
-                pass
+        for callback in list(self._listeners):
+            callback()
 
     def entities(self) -> list:
         """Return estimated-oil entities (caller adds them to its platform)."""
         if not self.enabled:
             return []
-        return [EstimatedOilSensor(self), EstimatedOilNumber(self), OilRefillButton(self), EstimatedLowOilBinarySensor(self)]
+        return [
+            EstimatedOilSensor(self),
+            EstimatedOilNumber(self),
+            OilRefillButton(self),
+            EstimatedLowOilBinarySensor(self),
+        ]
 
 
 class _EstimatedOilEntity:
@@ -206,21 +250,32 @@ class _EstimatedOilEntity:
         device = estimator.device
         self._attr_unique_id = f"{device.unique_id}_estimated_oil_{suffix}"
         self._attr_device_info = device.device_info
+        self._unsub_listener: Callable[[], None] | None = None
 
     @property
     def available(self) -> bool:
         return self.estimator.enabled and self.estimator.device.available
 
-    async def _write(self) -> None:
-        if self.hass is not None:
-            self.async_write_ha_state()
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._unsub_listener = self.estimator.async_add_listener(
+            self.async_write_ha_state
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_listener is not None:
+            self._unsub_listener()
+            self._unsub_listener = None
+        await super().async_will_remove_from_hass()
 
 
 class EstimatedOilSensor(_EstimatedOilEntity, SensorEntity):
     """Estimated oil volume in millilitres (never a physical sensor reading)."""
+
     _attr_name = "Estimated oil remaining"
     _attr_icon = "mdi:cup-water"
-    _attr_native_unit_of_measurement = "mL"
+    _attr_device_class = SensorDeviceClass.VOLUME
+    _attr_native_unit_of_measurement = UnitOfVolume.MILLILITERS
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, estimator: OilEstimator) -> None:
@@ -233,11 +288,13 @@ class EstimatedOilSensor(_EstimatedOilEntity, SensorEntity):
 
 class EstimatedOilNumber(_EstimatedOilEntity, NumberEntity):
     """Manual adjustment control for estimated oil remaining."""
+
     _attr_name = "Estimated oil volume"
     _attr_icon = "mdi:cup-water"
-    _attr_native_unit_of_measurement = "mL"
-    _attr_native_min_value = 0
-    _attr_native_step = 1
+    _attr_device_class = NumberDeviceClass.VOLUME
+    _attr_native_unit_of_measurement = UnitOfVolume.MILLILITERS
+    _attr_native_min_value = 0.0
+    _attr_native_step = 0.1
     _attr_mode = NumberMode.BOX
     _attr_entity_category = EntityCategory.CONFIG
 
@@ -258,6 +315,7 @@ class EstimatedOilNumber(_EstimatedOilEntity, NumberEntity):
 
 class OilRefillButton(_EstimatedOilEntity, ButtonEntity):
     """Reset estimated volume to the configured bottle capacity."""
+
     _attr_name = "Refill oil"
     _attr_icon = "mdi:water-plus"
 
@@ -270,6 +328,7 @@ class OilRefillButton(_EstimatedOilEntity, ButtonEntity):
 
 class EstimatedLowOilBinarySensor(_EstimatedOilEntity, BinarySensorEntity):
     """Low-oil alert derived from estimated volume and configured threshold."""
+
     _attr_name = "Low oil"
     _attr_icon = "mdi:water-alert"
 
@@ -278,4 +337,7 @@ class EstimatedLowOilBinarySensor(_EstimatedOilEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        return self.estimator.remaining_ml < self.estimator.capacity_ml * self.estimator.low_threshold_percent / 100
+        return (
+            self.estimator.remaining_ml
+            < self.estimator.capacity_ml * self.estimator.low_threshold_percent / 100
+        )
