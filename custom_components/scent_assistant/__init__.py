@@ -34,12 +34,29 @@ from .const import (
     DeviceType,
 )
 from .device import ScentDiffuserDevice
+from .estimated_oil import (
+    DEFAULT_OIL_BOTTLE_CAPACITY_ML,
+    DEFAULT_OIL_ESTIMATION_ENABLED,
+    DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH,
+    DEFAULT_OIL_LOW_THRESHOLD_PERCENT,
+    OIL_ESTIMATION_INTERVAL,
+    OilEstimator,
+)
 from .protocol_ble import ScheduleSlot, ScheduleSetup
 from .protocol_cloud import AromaLinkCloudClient
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["switch", "sensor", "number", "time", "button", "light", "select"]
+PLATFORMS = [
+    "switch",
+    "sensor",
+    "number",
+    "time",
+    "button",
+    "light",
+    "select",
+    "binary_sensor",
+]
 
 SERVICE_SET_SCHEDULE = "set_schedule"
 
@@ -139,6 +156,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = device
 
+    estimator = OilEstimator(hass, device, entry)
+    await estimator.async_load()
+    device.oil_estimator = estimator
+
+    async def _periodic_oil_estimate(now=None) -> None:
+        await estimator.async_advance(now)
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass,
+            _periodic_oil_estimate,
+            OIL_ESTIMATION_INTERVAL,
+        )
+    )
+
     # The setup-time read stays inline (platforms decide e.g. the fan
     # switch from it, #34), but a device HA couldn't reach then would
     # otherwise show "unknown" until the first command. Retry the read
@@ -200,32 +232,75 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # so their query-only registers only ever got read at setup. Protocols
     # that carry such telemetry opt in via `periodic_refresh`; the device
     # manager decides whether a given tick is safe to act on.
-    if device.supports_periodic_refresh:
-        async def _periodic_ble_refresh(now=None) -> None:
-            await device.async_periodic_refresh()
+    async def _periodic_ble_refresh(now=None) -> None:
+        await device.async_periodic_refresh()
 
+    if device.supports_periodic_refresh:
         device._unsub_ble_refresh = async_track_time_interval(
             hass,
             _periodic_ble_refresh,
             timedelta(seconds=device.refresh_interval),
         )
 
-        async def _options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-            # An update during unload must not re-arm the unloaded device.
-            if hass.data[DOMAIN].get(entry.entry_id) is not device:
-                return
+    async def _options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+        # An update during unload must not re-arm the unloaded device.
+        if hass.data[DOMAIN].get(entry.entry_id) is not device:
+            return
+        if device.supports_periodic_refresh:
             interval = _refresh_interval(entry)
-            if interval == device.refresh_interval:
-                return
-            device.refresh_interval = interval
-            device._unsub_ble_refresh()
-            device._unsub_ble_refresh = async_track_time_interval(
-                hass,
-                _periodic_ble_refresh,
-                timedelta(seconds=interval),
-            )
+            if interval != device.refresh_interval:
+                device.refresh_interval = interval
+                device._unsub_ble_refresh()
+                device._unsub_ble_refresh = async_track_time_interval(
+                    hass,
+                    _periodic_ble_refresh,
+                    timedelta(seconds=interval),
+                )
 
-        entry.async_on_unload(entry.add_update_listener(_options_updated))
+        options = entry.options
+        new_enabled = bool(
+            options.get("oil_estimation_enabled", DEFAULT_OIL_ESTIMATION_ENABLED)
+        )
+        if new_enabled != estimator.enabled:
+            await hass.config_entries.async_reload(entry.entry_id)
+            return
+
+        new_capacity = max(
+            1.0,
+            float(
+                options.get("oil_bottle_capacity_ml", DEFAULT_OIL_BOTTLE_CAPACITY_ML)
+            ),
+        )
+        new_rate = max(
+            0.0,
+            float(
+                options.get(
+                    "oil_full_duty_consumption_mlh",
+                    DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH,
+                )
+            ),
+        )
+        new_threshold = max(
+            0.0,
+            min(
+                100.0,
+                float(
+                    options.get(
+                        "oil_low_threshold_percent",
+                        DEFAULT_OIL_LOW_THRESHOLD_PERCENT,
+                    )
+                ),
+            ),
+        )
+        if (
+            new_capacity != estimator.capacity_ml
+            or new_rate != estimator.full_duty_mlh
+            or new_threshold != estimator.low_threshold_percent
+        ):
+            await estimator.async_update_options(options)
+
+    entry.async_on_unload(entry.add_update_listener(_options_updated))
+    if device.supports_periodic_refresh:
         # Applies options saved during the setup read.
         await _options_updated(hass, entry)
 
