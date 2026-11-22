@@ -515,22 +515,25 @@ class ScentDiffuserDevice:
             except Exception:
                 _LOGGER.exception("Error in state callback")
 
-    async def _advance_oil_estimate(self) -> None:
+    async def _advance_oil_estimate(self, *, force_save: bool = False) -> None:
         """Account for oil consumed up to now before mutating state."""
         if self.oil_estimator is not None:
-            await self.oil_estimator.async_advance()
+            await self.oil_estimator.async_advance(force_save=force_save)
 
-    def _schedule_oil_advance(self) -> None:
+    def _schedule_oil_advance(self, snapshot: dict | None = None) -> None:
         """Schedule an oil estimate update from a synchronous BLE callback."""
         if self.oil_estimator is None or not self.oil_estimator.enabled:
             return
+        coro = (
+            self.oil_estimator.async_advance_snapshot(**snapshot)
+            if snapshot is not None
+            else self.oil_estimator.async_advance()
+        )
         if self._hass is not None:
-            self._hass.async_create_task(self.oil_estimator.async_advance())
+            self._hass.async_create_task(coro)
         else:
             try:
-                asyncio.get_running_loop().create_task(
-                    self.oil_estimator.async_advance()
-                )
+                asyncio.get_running_loop().create_task(coro)
             except RuntimeError:
                 pass
 
@@ -1088,6 +1091,31 @@ class ScentDiffuserDevice:
 
         changed = False
         oil_state_changed = False
+        oil_snapshot = None
+        if self.oil_estimator is not None and self.oil_estimator.enabled:
+            window_known = getattr(self, "schedule_window_read", True)
+            durations_known = getattr(self, "schedule_durations_read", True)
+            start_min = (
+                self._state.start_hour * 60 + self._state.start_minute
+                if window_known and None not in (self._state.start_hour, self._state.start_minute)
+                else None
+            )
+            end_min = (
+                self._state.end_hour * 60 + self._state.end_minute
+                if window_known and None not in (self._state.end_hour, self._state.end_minute)
+                else None
+            )
+            oil_snapshot = {
+                "is_on": self._state.power,
+                "schedule_enabled": self._state.schedule_enabled,
+                "start_minute": start_min,
+                "end_minute": end_min,
+                "work_seconds": self._state.work_seconds if durations_known else None,
+                "pause_seconds": self._state.pause_seconds if durations_known else None,
+                "weekday_mask": self._state.weekday_mask,
+                "week_slots": self._state.week_slots if window_known else None,
+                "radar_mode": getattr(self._state, "radar_mode", None),
+            }
         if "power" in updates:
             if self._state.power != updates["power"]:
                 oil_state_changed = True
@@ -1273,7 +1301,7 @@ class ScentDiffuserDevice:
             self._ble_state_read = True
             self._ble_last_update = datetime.now().astimezone()
             if oil_state_changed:
-                self._schedule_oil_advance()
+                self._schedule_oil_advance(oil_snapshot)
 
             self._notify_state_changed()
 
@@ -1432,6 +1460,8 @@ class ScentDiffuserDevice:
         if isinstance(proto, AromaLinkBleProtocol):
             cmd = proto.build_radar_mode(radar)
             if await self._ble_execute(cmd):
+                if getattr(self._state, "radar_mode", None) != (1 if radar else 0):
+                    await self._advance_oil_estimate()
                 self._state.radar_mode = 1 if radar else 0
                 self._notify_state_changed()
                 return True
@@ -2384,7 +2414,7 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
-        await self._advance_oil_estimate()
+        await self._advance_oil_estimate(force_save=True)
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():

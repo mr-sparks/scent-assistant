@@ -43,10 +43,14 @@ def scheduled_seconds_between(
     The window is local wall time and may cross midnight. Equal start/end is
     treated as a full-day window, consistent with a 24-hour schedule.
     """
-    if end <= start:
-        return 0.0
     if start.tzinfo is not None and end.tzinfo is not None:
         end = end.astimezone(start.tzinfo)
+    elif start.tzinfo is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=start.tzinfo)
+    elif start.tzinfo is None and end.tzinfo is not None:
+        start = start.replace(tzinfo=end.tzinfo)
+    if end <= start:
+        return 0.0
     start_minute = max(0, min(1439, int(start_minute)))
     end_minute = max(0, min(1439, int(end_minute)))
     tz = start.tzinfo
@@ -77,10 +81,14 @@ def _week_slots_consumption_ml(
     full_duty_consumption_mlh: float,
 ) -> float:
     """Integrate consumption across Aroma-Link per-weekday schedule slots."""
-    if end <= start or full_duty_consumption_mlh <= 0:
-        return 0.0
     if start.tzinfo is not None and end.tzinfo is not None:
         end = end.astimezone(start.tzinfo)
+    elif start.tzinfo is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=start.tzinfo)
+    elif start.tzinfo is None and end.tzinfo is not None:
+        start = start.replace(tzinfo=end.tzinfo)
+    if end <= start or full_duty_consumption_mlh <= 0:
+        return 0.0
     tz = start.tzinfo
     used_ml = 0.0
     day = start.date() - timedelta(days=1)
@@ -140,7 +148,7 @@ def estimate_consumption_ml(
     periods consume nothing. Work/pause values model the average duty cycle,
     including while the device reports its paused phase.
     """
-    if full_duty_consumption_mlh < 0 or end <= start:
+    if full_duty_consumption_mlh <= 0 or end <= start:
         return remaining_ml
     if is_on is None or not is_on:
         return remaining_ml
@@ -201,6 +209,8 @@ class OilEstimator:
                     self.remaining_ml = max(0.0, min(self.capacity_ml, float(data["remaining_ml"])))
                     stamp = data.get("last_update")
                     self.last_update = datetime.fromisoformat(stamp) if stamp else None
+                    if self.last_update is not None and self.last_update.tzinfo is None:
+                        self.last_update = self.last_update.astimezone()
                 except (KeyError, TypeError, ValueError):
                     self.remaining_ml = self.capacity_ml
                     self.last_update = None
@@ -265,7 +275,7 @@ class OilEstimator:
             week_slots=state.week_slots if window_known else None,
         )
 
-    async def async_advance(self, now: datetime | None = None) -> None:
+    async def async_advance(self, now: datetime | None = None, *, force_save: bool = False) -> None:
         """Account once for time since the prior update and persist it."""
         if not self.enabled:
             return
@@ -275,7 +285,7 @@ class OilEstimator:
             if previous is not None and now > previous:
                 self.remaining_ml = self._compute_for_current_state(previous, now)
             self.last_update = now
-            await self._save()
+            await self._save(force=force_save)
         self._notify()
 
     async def async_advance_snapshot(
@@ -291,6 +301,7 @@ class OilEstimator:
         week_slots: list[list[dict[str, Any]]] | None = None,
         radar_mode: int | None = None,
         now: datetime | None = None,
+        force_save: bool = False,
     ) -> None:
         """Advance using a pre-mutation state snapshot (used by BLE notifications)."""
         if not self.enabled:
@@ -314,7 +325,7 @@ class OilEstimator:
                     week_slots=week_slots,
                 )
             self.last_update = now
-            await self._save()
+            await self._save(force=force_save)
         self._notify()
 
     async def async_set_remaining(self, volume_ml: float) -> None:
@@ -332,12 +343,15 @@ class OilEstimator:
     async def async_update_options(self, options: dict[str, Any]) -> None:
         """Apply options, clamp to capacity and reset the interval baseline."""
         async with self._lock:
+            now = self._now()
+            if self.enabled and self.last_update is not None and now > self.last_update:
+                self.remaining_ml = self._compute_for_current_state(self.last_update, now)
             self.enabled = bool(options.get("oil_estimation_enabled", DEFAULT_OIL_ESTIMATION_ENABLED))
             self.capacity_ml = max(1.0, float(options.get("oil_bottle_capacity_ml", DEFAULT_OIL_BOTTLE_CAPACITY_ML)))
             self.full_duty_mlh = max(0.0, float(options.get("oil_full_duty_consumption_mlh", DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH)))
             self.low_threshold_percent = max(0.0, min(100.0, float(options.get("oil_low_threshold_percent", DEFAULT_OIL_LOW_THRESHOLD_PERCENT))))
             self.remaining_ml = min(self.remaining_ml, self.capacity_ml)
-            self.last_update = self._now()
+            self.last_update = now
             await self._save(force=True)
         self._notify()
 
@@ -376,6 +390,7 @@ class _EstimatedOilEntity:
         self._attr_unique_id = f"{device.unique_id}_estimated_oil_{suffix}"
         self._attr_device_info = device.device_info
         self._unsub_listener: Callable[[], None] | None = None
+        self._unsub_device: Callable[[], None] | None = None
 
     @property
     def available(self) -> bool:
@@ -386,11 +401,17 @@ class _EstimatedOilEntity:
         self._unsub_listener = self.estimator.async_add_listener(
             self.async_write_ha_state
         )
+        self._unsub_device = self.estimator.device.register_state_callback(
+            self.async_write_ha_state
+        )
 
     async def async_will_remove_from_hass(self) -> None:
         if self._unsub_listener is not None:
             self._unsub_listener()
             self._unsub_listener = None
+        if self._unsub_device is not None:
+            self._unsub_device()
+            self._unsub_device = None
         await super().async_will_remove_from_hass()
 
 
