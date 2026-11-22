@@ -36,6 +36,7 @@ def scheduled_seconds_between(
     end: datetime,
     start_minute: int,
     end_minute: int,
+    weekday_mask: int | None = None,
 ) -> float:
     """Return the seconds in [start, end) that fall within a daily schedule.
 
@@ -56,15 +57,65 @@ def scheduled_seconds_between(
     day = start.date() - timedelta(days=1)
     last_day = end.date()
     while day <= last_day:
-        window_start = datetime.combine(day, start_t, tzinfo=tz)
-        end_day = day + timedelta(days=1) if crosses_midnight else day
-        window_end = datetime.combine(end_day, end_t, tzinfo=tz)
-        overlap_start = max(start, window_start)
-        overlap_end = min(end, window_end)
-        if overlap_end > overlap_start:
-            total += (overlap_end - overlap_start).total_seconds()
+        if weekday_mask is None or (weekday_mask & (1 << day.weekday())):
+            window_start = datetime.combine(day, start_t, tzinfo=tz)
+            end_day = day + timedelta(days=1) if crosses_midnight else day
+            window_end = datetime.combine(end_day, end_t, tzinfo=tz)
+            overlap_start = max(start, window_start)
+            overlap_end = min(end, window_end)
+            if overlap_end > overlap_start:
+                total += (overlap_end - overlap_start).total_seconds()
         day += timedelta(days=1)
     return total
+
+
+def _week_slots_consumption_ml(
+    *,
+    start: datetime,
+    end: datetime,
+    week_slots: list[list[dict[str, Any]]],
+    full_duty_consumption_mlh: float,
+) -> float:
+    """Integrate consumption across Aroma-Link per-weekday schedule slots."""
+    if end <= start or full_duty_consumption_mlh <= 0:
+        return 0.0
+    if start.tzinfo is not None and end.tzinfo is not None:
+        end = end.astimezone(start.tzinfo)
+    tz = start.tzinfo
+    used_ml = 0.0
+    day = start.date() - timedelta(days=1)
+    last_day = end.date()
+    while day <= last_day:
+        wd = day.weekday()
+        if 0 <= wd < len(week_slots):
+            for slot in week_slots[wd]:
+                if not slot.get("enabled"):
+                    continue
+                work = slot.get("work_seconds") or 0
+                pause = slot.get("pause_seconds")
+                if work <= 0 or pause is None or pause < 0:
+                    continue
+                sh = slot.get("start_hour")
+                sm = slot.get("start_minute")
+                eh = slot.get("end_hour")
+                em = slot.get("end_minute")
+                if None in (sh, sm, eh, em):
+                    continue
+                start_min = max(0, min(1439, int(sh) * 60 + int(sm)))
+                end_min = max(0, min(1439, int(eh) * 60 + int(em)))
+                start_t = time(start_min // 60, start_min % 60)
+                end_t = time(end_min // 60, end_min % 60)
+                window_start = datetime.combine(day, start_t, tzinfo=tz)
+                end_day = day + timedelta(days=1) if end_min <= start_min else day
+                window_end = datetime.combine(end_day, end_t, tzinfo=tz)
+                overlap_start = max(start, window_start)
+                overlap_end = min(end, window_end)
+                if overlap_end > overlap_start:
+                    seconds = (overlap_end - overlap_start).total_seconds()
+                    duty = work / (work + pause)
+                    used_ml += seconds / 3600 * full_duty_consumption_mlh * duty
+        day += timedelta(days=1)
+    return used_ml
 
 
 def estimate_consumption_ml(
@@ -79,6 +130,8 @@ def estimate_consumption_ml(
     work_seconds: int | None,
     pause_seconds: int | None,
     full_duty_consumption_mlh: float,
+    weekday_mask: int | None = None,
+    week_slots: list[list[dict[str, Any]]] | None = None,
 ) -> float:
     """Calculate an estimated remaining volume for one time interval.
 
@@ -87,6 +140,20 @@ def estimate_consumption_ml(
     periods consume nothing. Work/pause values model the average duty cycle,
     including while the device reports its paused phase.
     """
+    if full_duty_consumption_mlh < 0 or end <= start:
+        return remaining_ml
+    if is_on is None or not is_on:
+        return remaining_ml
+
+    if week_slots:
+        used = _week_slots_consumption_ml(
+            start=start,
+            end=end,
+            week_slots=week_slots,
+            full_duty_consumption_mlh=full_duty_consumption_mlh,
+        )
+        return max(0.0, remaining_ml - used)
+
     if (
         start_minute is None
         or end_minute is None
@@ -94,14 +161,13 @@ def estimate_consumption_ml(
         or pause_seconds is None
         or work_seconds <= 0
         or pause_seconds < 0
-        or full_duty_consumption_mlh < 0
     ):
         return remaining_ml
-    if is_on is None or schedule_enabled is None:
+    if schedule_enabled is None or not schedule_enabled:
         return remaining_ml
-    if not is_on or not schedule_enabled or end <= start:
-        return remaining_ml
-    seconds = scheduled_seconds_between(start, end, start_minute, end_minute)
+    seconds = scheduled_seconds_between(
+        start, end, start_minute, end_minute, weekday_mask=weekday_mask
+    )
     duty = work_seconds / (work_seconds + pause_seconds)
     used = seconds / 3600 * full_duty_consumption_mlh * duty
     return max(0.0, remaining_ml - used)
@@ -162,6 +228,43 @@ class OilEstimator:
         })
         self._last_saved = now
 
+    def _compute_for_current_state(self, start: datetime, end: datetime) -> float:
+        """Evaluate consumption for [start, end) against the current device state."""
+        state = self.device.state
+        # Radar mode does not follow the time-of-day schedule.
+        if getattr(state, "radar_mode", None) == 1:
+            return self.remaining_ml
+
+        window_known = getattr(self.device, "schedule_window_read", True)
+        durations_known = getattr(self.device, "schedule_durations_read", True)
+
+        start_minute = None
+        end_minute = None
+        if (
+            window_known
+            and None not in (state.start_hour, state.start_minute, state.end_hour, state.end_minute)
+        ):
+            start_minute = state.start_hour * 60 + state.start_minute
+            end_minute = state.end_hour * 60 + state.end_minute
+
+        work_seconds = state.work_seconds if durations_known else None
+        pause_seconds = state.pause_seconds if durations_known else None
+
+        return estimate_consumption_ml(
+            remaining_ml=self.remaining_ml,
+            start=start,
+            end=end,
+            is_on=state.power,
+            schedule_enabled=state.schedule_enabled,
+            start_minute=start_minute,
+            end_minute=end_minute,
+            work_seconds=work_seconds,
+            pause_seconds=pause_seconds,
+            full_duty_consumption_mlh=self.full_duty_mlh,
+            weekday_mask=state.weekday_mask,
+            week_slots=state.week_slots if window_known else None,
+        )
+
     async def async_advance(self, now: datetime | None = None) -> None:
         """Account once for time since the prior update and persist it."""
         if not self.enabled:
@@ -170,23 +273,45 @@ class OilEstimator:
             now = now or self._now()
             previous = self.last_update
             if previous is not None and now > previous:
-                state = self.device.state
-                start_minute = None
-                end_minute = None
-                if None not in (state.start_hour, state.start_minute, state.end_hour, state.end_minute):
-                    start_minute = state.start_hour * 60 + state.start_minute
-                    end_minute = state.end_hour * 60 + state.end_minute
+                self.remaining_ml = self._compute_for_current_state(previous, now)
+            self.last_update = now
+            await self._save()
+        self._notify()
+
+    async def async_advance_snapshot(
+        self,
+        *,
+        is_on: bool | None,
+        schedule_enabled: bool | None,
+        start_minute: int | None,
+        end_minute: int | None,
+        work_seconds: int | None,
+        pause_seconds: int | None,
+        weekday_mask: int | None = None,
+        week_slots: list[list[dict[str, Any]]] | None = None,
+        radar_mode: int | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Advance using a pre-mutation state snapshot (used by BLE notifications)."""
+        if not self.enabled:
+            return
+        async with self._lock:
+            now = now or self._now()
+            previous = self.last_update
+            if previous is not None and now > previous and radar_mode != 1:
                 self.remaining_ml = estimate_consumption_ml(
                     remaining_ml=self.remaining_ml,
                     start=previous,
                     end=now,
-                    is_on=state.power,
-                    schedule_enabled=state.schedule_enabled,
+                    is_on=is_on,
+                    schedule_enabled=schedule_enabled,
                     start_minute=start_minute,
                     end_minute=end_minute,
-                    work_seconds=state.work_seconds if state.work_seconds is not None else None,
-                    pause_seconds=state.pause_seconds if state.pause_seconds is not None else None,
+                    work_seconds=work_seconds,
+                    pause_seconds=pause_seconds,
                     full_duty_consumption_mlh=self.full_duty_mlh,
+                    weekday_mask=weekday_mask,
+                    week_slots=week_slots,
                 )
             self.last_update = now
             await self._save()
