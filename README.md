@@ -55,7 +55,7 @@
 | Scent Marketing diffusers (SA_* series) | Scent Marketing | BLE | V2 + V3 variants; Power, Fan, Program switch, intensity, schedule read-back |
 | Home Luxury Scents HLS-450+ | Home Luxury Scents | BLE | Rebadged Scent Marketing AK family |
 | Aromely Aro Max | Aromely | BLE | Power, Fan, daily schedule (work/pause), HVAC scent diffuser |
-| ADS644BT | AI-Diffuser | BLE | Power, schedule window + work/pause of the active slot, all six slots (the app's "Modes") as Schedule 1–6 entities, time sync, oil level/capacity/consumption; detected by its `1F71` service UUID. Status and oil are polled every 5 min; the Refresh button re-reads everything. The clock is only set from Sync Time, because setting it makes the unit beep three times |
+| ADS644BT | AI-Diffuser | BLE | Power, schedule window + work/pause of the active slot, all six slots (the app's "Modes") as Schedule 1–6 entities, time sync, oil level/capacity/consumption with Oil Level and Oil Consumption numbers (refills, and the rate the unit counts down with) (HA keeps the level when the unit falls back to its last Oil Set after a power cycle or a schedule read; a refill entered while it is out of reach is written on the next connection). Oil writes make the unit beep, so they only happen when you set one of these; detected by its `1F71` service UUID. Status and oil are polled every 5 min; the Refresh button re-reads everything. The clock is only set from Sync Time, because setting it makes the unit beep three times |
 
 ### Likely Compatible
 

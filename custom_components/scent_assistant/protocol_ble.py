@@ -72,7 +72,7 @@ from .const import (
     AI_DIFFUSER_CMD_STATUS, AI_DIFFUSER_CMD_GEAR, AI_DIFFUSER_CMD_CUSTOM,
     AI_DIFFUSER_CMD_HARDWARE, AI_DIFFUSER_CMD_WEEK, AI_DIFFUSER_CMD_OIL,
     AI_DIFFUSER_SUB_TIME, AI_DIFFUSER_SUB_POWER, AI_DIFFUSER_SUB_SLOT,
-    AI_DIFFUSER_SUB_WEEK, AI_DIFFUSER_SLOTS,
+    AI_DIFFUSER_SUB_WEEK, AI_DIFFUSER_SUB_OIL, AI_DIFFUSER_SLOTS,
     BLE_NAME_PATTERNS,
     AL_NAME_CODES,
     TUYA_HEADER, TUYA_VERSION,
@@ -2804,6 +2804,8 @@ class AiDiffuserProtocol(BleProtocol):
         # 5-minute refresh, commands) only send what they need, which also
         # leaves fewer frames to lose on a weak link.
         self.full_read_needed = True
+        self.oil_speed: tuple[int, int] | None = None
+        self.oil_capacity: int | None = None
         # Set when a week (09) / schedule table (06, 07) reply is decoded;
         # cleared by begin_schedule_read() before a read-modify-write.
         self._week_fresh = False
@@ -2911,6 +2913,33 @@ class AiDiffuserProtocol(BleProtocol):
             self._read(AI_DIFFUSER_CMD_OIL),
             self._read(AI_DIFFUSER_CMD_STATUS),
         ]
+
+    def build_oil_set(self, current_ml: float, rate_mlh: float | None = None) -> bytes:
+        """Set the oil left in the bottle (00 19, the app's Oil Set "save").
+
+        Carries the consumption rate and capacity too: the rate as last
+        read unless `rate_mlh` is given, the capacity as last read.
+        Values go out big-endian like the app's (read back LE).
+        The unit returns to the last value set this way after a power
+        cycle, which is why device.py restores the tracked level.
+        """
+        if self.oil_speed is None or self.oil_capacity is None:
+            raise ValueError("oil settings not read yet")
+        if rate_mlh is None:
+            speed, speed_dec = self.oil_speed
+        else:
+            speed = int(rate_mlh)
+            speed_dec = int(round((rate_mlh - speed) * 10000))
+            if speed_dec >= 10000:
+                speed, speed_dec = speed + 1, 0
+        current_ml = max(0.0, min(float(self.oil_capacity), float(current_ml)))
+        whole = int(current_ml)
+        frac = int(round((current_ml - whole) * 10000))
+        if frac >= 10000:
+            whole, frac = whole + 1, 0
+        values = (speed, whole, self.oil_capacity, speed_dec, frac)
+        payload = [b for v in values for b in ((v >> 8) & 0xFF, v & 0xFF)]
+        return self._envelope(self._frame(0x00, AI_DIFFUSER_SUB_OIL, *payload))
 
     def build_power(self, on: bool) -> bytes:
         # Verified on an ADS644BT: 00 starts the program, 01 stops it.
@@ -3150,14 +3179,20 @@ class AiDiffuserProtocol(BleProtocol):
     def _decode_oil(self, f: list[int]) -> dict:
         out: dict = {}
         current = self._le16(f[5], f[6])
+        current_dec = self._le16(f[11], f[12])
         capacity = self._le16(f[7], f[8])
-        if current != 0xFFFF:
-            out["oil_current_ml"] = current
-        if capacity not in (0, 0xFFFF):
-            out["oil_max_ml"] = capacity
         speed = self._le16(f[3], f[4])
         decimal = self._le16(f[9], f[10])
-        if speed != 0xFFFF and decimal != 0xFFFF:
+        # Kept for the oil write (00 19), which carries all of them.
+        self.oil_speed = (speed, decimal) if speed != 0xFFFF and decimal != 0xFFFF else None
+        self.oil_capacity = capacity if capacity not in (0, 0xFFFF) else None
+        if current != 0xFFFF:
+            # Same as the app: integer mL plus a fraction in 1/10000 mL.
+            frac = current_dec / 10000 if current_dec != 0xFFFF else 0.0
+            out["oil_current_ml"] = round(current + frac, 1)
+        if self.oil_capacity is not None:
+            out["oil_max_ml"] = capacity
+        if self.oil_speed is not None:
             out["oil_consumption_mlh"] = round(speed + decimal / 10000, 2)
         if "oil_current_ml" in out and "oil_max_ml" in out:
             out["oil_remaining"] = round(100 * out["oil_current_ml"] / out["oil_max_ml"])

@@ -21,6 +21,7 @@ from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.device_registry as dr
 
 from .const import (
+    DOMAIN,
     DeviceType,
     AL_DURATION_LIMITS,
     AL_DURATION_LIMITS_DEFAULT,
@@ -216,6 +217,24 @@ class ScentDiffuserDevice:
         self._timer_write_lock = asyncio.Lock()
         # AI-Diffuser: whether the last connect sent the full read-back.
         self._ai_read_sent = False
+        # AI-Diffuser oil tracking (see _ai_oil_guard): the level HA has
+        # followed, the last level written with 00 19 (what the unit
+        # returns to after a power cycle) and a write awaiting its echo.
+        self._ai_oil_tracked: float | None = None
+        self._ai_oil_saved: float | None = None
+        self._ai_oil_expected: float | None = None
+        self._ai_oil_expected_until = 0.0
+        # A level entered while the unit was out of reach, written on the
+        # next oil report (kept across HA restarts).
+        self._ai_oil_pending: float | None = None
+        self._ai_oil_rate_warned: float | None = None
+        # The unit's own count at the last report, to follow its drops.
+        self._ai_oil_unit_last: float | None = None
+        self._ai_oil_store = None
+        # Connect failures: the first of an outage is a warning, the
+        # retries until it reconnects are debug.
+        self._ble_unreachable = False
+        self._ble_last_error: str | None = None
         self._timers_received = asyncio.Event()
         self._timer_write_acked = asyncio.Event()
 
@@ -776,6 +795,11 @@ class ScentDiffuserDevice:
                         _LOGGER.info("BLE connected: %s", self._ble_name)
                     self._ble_has_synced_time = True
 
+                if self._ble_unreachable:
+                    _LOGGER.info("BLE connection to %s restored", self._ble_name)
+                    self._ble_unreachable = False
+                self._ble_last_error = None
+
                 # GW family password handshake. We send unconditionally —
                 # the firmware ignores a password write on unprotected
                 # devices, and there's no reliable pre-connect way to tell
@@ -799,9 +823,15 @@ class ScentDiffuserDevice:
                     and self._hass is not None
                     and self._hass.state is not CoreState.running
                 )
-                (_LOGGER.debug if quiet else _LOGGER.warning)(
-                    "BLE connect failed for %s: %s", self._ble_name, err
-                )
+                self._ble_last_error = str(err) or type(err).__name__
+                if quiet or self._ble_unreachable:
+                    _LOGGER.debug("BLE connect failed for %s: %s", self._ble_name, err)
+                else:
+                    _LOGGER.warning(
+                        "BLE connect failed for %s: %s (further failures are logged "
+                        "at debug level until it reconnects)", self._ble_name, err,
+                    )
+                    self._ble_unreachable = True
                 await self._teardown_ble_client()
                 self._ble_last_failure_ts = loop.time()
                 return False
@@ -1058,6 +1088,11 @@ class ScentDiffuserDevice:
                 end = start
         if not updates:
             return
+        if isinstance(self._protocol, AiDiffuserProtocol):
+            if "oil_consumption_mlh" in updates:
+                self._ai_oil_rate_check(updates["oil_consumption_mlh"])
+            if "oil_current_ml" in updates:
+                self._ai_oil_guard(updates)
         if "nack" in updates:
             self._ble_nack_seq += 1
             self._ble_nacks[updates["nack"]] = self._ble_nack_seq
@@ -1877,6 +1912,226 @@ class ScentDiffuserDevice:
                 async with self._ble_lock:
                     await self._teardown_ble_client(reason="write-failure")
                 return False
+
+    # ---- AI-Diffuser oil level -------------------------------------------
+
+    _AI_OIL_JUMP_ML = 0.5
+    _AI_OIL_EMPTY_ML = 1.0
+    # Well above any real diffuser; 3960 mL/h is 3.96 typed without the
+    # decimal point in the app's Oil Set, which empties the count in hours.
+    _AI_OIL_RATE_MAX_MLH = 50.0
+
+    def _ai_oil_rate_check(self, rate: float) -> None:
+        """Flag a consumption rate the unit can't really have, once per value."""
+        notification_id = f"{DOMAIN}_oil_rate_{self.unique_id}"
+        if rate <= self._AI_OIL_RATE_MAX_MLH:
+            if self._ai_oil_rate_warned is not None and self._hass is not None:
+                try:
+                    from homeassistant.components import persistent_notification
+                    persistent_notification.async_dismiss(self._hass, notification_id)
+                except Exception as err:
+                    _LOGGER.debug("Oil rate notification dismiss failed: %s", err)
+            self._ai_oil_rate_warned = None
+            return
+        if self._ai_oil_rate_warned == rate:
+            return
+        self._ai_oil_rate_warned = rate
+        msg = (
+            f"{self._ble_name} reports an oil consumption of {rate:g} mL/h, so it "
+            f"counts the oil down far too fast. It was probably entered without "
+            f"the decimal point in the app's Oil Set; set the real rate with the "
+            f"Oil Consumption number (e.g. 3.96)."
+        )
+        _LOGGER.warning(msg)
+        if self._hass is not None:
+            try:
+                from homeassistant.components import persistent_notification
+                persistent_notification.async_create(
+                    self._hass, msg, title="Scent Assistant",
+                    notification_id=notification_id,
+                )
+            except Exception as err:  # notification is best-effort
+                _LOGGER.debug("Oil rate notification failed: %s", err)
+
+    def _ai_oil_guard(self, updates: dict) -> None:
+        """Follow the oil level across the unit's resets, without writing.
+
+        The unit counts the oil down only in RAM and goes back to the last
+        value set with 00 19 (its "saved" level) after a power cycle and
+        on the schedule/hardware reads, ours on connect or Refresh and the
+        app's (verified: a Refresh took it from 94 back to 95 mL). Writing
+        the level back would fix the unit's count, but every 00 19 write
+        makes the unit beep, so HA keeps its own level instead: it follows
+        the unit's count-downs and ignores a rise that lands on the saved
+        level. Any other rise, or one from an empty bottle, is a refill
+        made in the app. A refill in the app back to the saved level can't
+        be told from a reset; refills go through the Oil Level number.
+        """
+        value = updates["oil_current_ml"]
+        tracked, saved = self._ai_oil_tracked, self._ai_oil_saved
+        last = self._ai_oil_unit_last
+        pending = self._ai_oil_pending
+        if pending is not None and self._ai_oil_expected is None:
+            if abs(value - pending) <= self._AI_OIL_JUMP_ML:
+                # Already there (also entered in the app): nothing to write.
+                self._ai_oil_pending = None
+                self._ai_oil_saved = value
+                self._ai_oil_follow(value, value)
+                return
+            _LOGGER.info(
+                "AI-Diffuser %s: writing the oil level entered while it was out "
+                "of reach (%.1f mL, unit reports %.1f mL)",
+                self._ble_name, pending, value,
+            )
+            self._ai_oil_show(updates, pending)
+            if self._hass is not None:
+                self._hass.async_create_task(self._ai_write_oil(pending))
+            return
+        if self._ai_oil_expected is not None:
+            if abs(value - self._ai_oil_expected) <= self._AI_OIL_JUMP_ML:
+                self._ai_oil_expected = None
+                self._ai_oil_follow(value, value)
+                return
+            if time.monotonic() < self._ai_oil_expected_until:
+                self._ai_oil_show(updates, tracked if tracked is not None else value)
+                return   # our write in flight: ignore the stale report
+            self._ai_oil_expected = None   # write never echoed: track again
+        if tracked is None:
+            self._ai_oil_follow(value, value)
+            return
+        ref = last if last is not None else tracked
+        if value <= ref + self._AI_OIL_JUMP_ML:
+            # Counting down (or noise): follow the drop. Without a previous
+            # unit reading (first report since HA started) the unit's own
+            # count is the newer one when it's lower.
+            if last is None:
+                level = min(tracked, value)
+            else:
+                level = max(0.0, tracked - max(0.0, last - value))
+            self._ai_oil_follow(round(level, 1), value)
+            self._ai_oil_show(updates, self._ai_oil_tracked)
+            return
+        reset = (
+            tracked > self._AI_OIL_EMPTY_ML
+            and (saved is None or abs(value - saved) <= self._AI_OIL_JUMP_ML)
+        )
+        if reset:
+            _LOGGER.info(
+                "AI-Diffuser %s: unit went back to its saved %.1f mL of oil "
+                "(power cycle or a schedule read); keeping %.1f mL",
+                self._ble_name, value, tracked,
+            )
+            self._ai_oil_follow(tracked, value)
+            self._ai_oil_show(updates, tracked)
+            return
+        # A refill entered in the app, which also became the saved level.
+        self._ai_oil_saved = value
+        self._ai_oil_follow(value, value)
+
+    def _ai_oil_follow(self, level: float, unit_value: float) -> None:
+        """Set HA's level and remember the unit's own count it goes with."""
+        self._ai_oil_tracked = level
+        self._ai_oil_unit_last = unit_value
+        self._ai_oil_persist()
+
+    def _ai_oil_show(self, updates: dict, level: float) -> None:
+        """Report `level` instead of what the unit sent."""
+        updates["oil_current_ml"] = level
+        max_ml = updates.get("oil_max_ml") or self._state.oil_max_ml
+        if max_ml:
+            updates["oil_remaining"] = round(100 * level / max_ml)
+
+    def _ai_oil_persist(self) -> None:
+        if self._ai_oil_store is not None:
+            self._ai_oil_store.async_delay_save(
+                lambda: {
+                    "tracked": self._ai_oil_tracked,
+                    "saved": self._ai_oil_saved,
+                    "pending": self._ai_oil_pending,
+                    "unit_last": self._ai_oil_unit_last,
+                },
+                60,
+            )
+
+    async def async_load_ai_oil(self) -> None:
+        """Load the tracked/saved oil levels kept across HA restarts."""
+        if not isinstance(self._protocol, AiDiffuserProtocol) or self._hass is None:
+            return
+        from homeassistant.helpers.storage import Store
+        self._ai_oil_store = Store(
+            self._hass, 1, f"{DOMAIN}.ai_diffuser_oil.{self._entry_id or self.unique_id}",
+        )
+        data = await self._ai_oil_store.async_load() or {}
+        self._ai_oil_tracked = data.get("tracked")
+        self._ai_oil_saved = data.get("saved")
+        self._ai_oil_pending = data.get("pending")
+        self._ai_oil_unit_last = data.get("unit_last")
+
+    async def _ai_write_oil(self, level: float, rate_mlh: float | None = None) -> bool:
+        """Write the oil level with 00 19 and remember it as the saved level."""
+        try:
+            frame = self._protocol.build_oil_set(level, rate_mlh)
+        except ValueError:
+            _LOGGER.debug("AI-Diffuser %s: oil settings not read yet", self._ble_name)
+            return False
+        self._ai_oil_expected = level
+        self._ai_oil_expected_until = time.monotonic() + 30
+        if not await self._ble_execute(frame):
+            self._ai_oil_expected = None
+            return False
+        self._ai_oil_saved = level
+        self._ai_oil_tracked = level
+        self._ai_oil_unit_last = level
+        self._ai_oil_pending = None
+        self._ai_oil_persist()
+        await self._ble_execute(self._protocol.build_oil_query())
+        return True
+
+    async def async_set_oil_level(self, level: float) -> None:
+        """Refill: set the oil now in the bottle (Oil Level number)."""
+        if not isinstance(self._protocol, AiDiffuserProtocol):
+            raise HomeAssistantError("Setting the oil level isn't supported on this device")
+        written = self._protocol.oil_capacity is not None and await self._ai_write_oil(level)
+        if written:
+            self._ai_oil_pending = None
+        else:
+            # Out of reach (or the oil settings, which the write carries,
+            # not read yet): keep the level and write it on the next oil
+            # report, so the refill isn't lost.
+            self._ai_oil_pending = level
+            self._ai_oil_tracked = level
+            self._ai_oil_persist()
+        self._state.oil_current_ml = level
+        if self._state.oil_max_ml:
+            self._state.oil_remaining = round(100 * level / self._state.oil_max_ml)
+        self._notify_state_changed()
+        if not written:
+            reason = self._ble_last_error or "no reply"
+            raise HomeAssistantError(
+                f"Could not reach {self._ble_name} over Bluetooth ({reason}). "
+                f"{level:g} mL is kept and will be written on the next connection."
+            )
+
+    async def async_set_oil_rate(self, rate_mlh: float) -> None:
+        """Set the consumption rate the unit counts the oil down with.
+
+        00 19 carries the level too: the level HA follows goes with it, so
+        changing the rate doesn't move the level.
+        """
+        if not isinstance(self._protocol, AiDiffuserProtocol):
+            raise HomeAssistantError("Setting the oil consumption isn't supported on this device")
+        level = self._ai_oil_tracked
+        if level is None:
+            level = self._state.oil_current_ml
+        if level is None or self._protocol.oil_capacity is None:
+            raise HomeAssistantError(
+                f"{self._ble_name}: the oil settings haven't been read yet, press Refresh"
+            )
+        if not await self._ai_write_oil(level, rate_mlh):
+            reason = self._ble_last_error or "no reply"
+            raise HomeAssistantError(
+                f"Could not set the oil consumption on {self._ble_name} ({reason})"
+            )
 
     async def _set_ai_diffuser_active_slot(self, **changes) -> bool:
         """Edit the slot the unit is in (the single Start/End/Work/Pause entities).

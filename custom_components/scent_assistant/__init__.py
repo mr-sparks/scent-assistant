@@ -131,6 +131,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if device.supports_periodic_refresh:
         device.refresh_interval = _refresh_interval(entry)
 
+    # AI-Diffuser: the oil level HA tracked before a restart (no-op otherwise).
+    await device.async_load_ai_oil()
+
     # Initial state query (BLE: connects briefly then disconnects; Cloud: polls API)
     try:
         await device.async_setup()

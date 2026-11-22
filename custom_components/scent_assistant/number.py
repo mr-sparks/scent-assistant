@@ -58,6 +58,8 @@ async def async_setup_entry(
         )
     # AI-Diffuser: durations of the slot in use, plus all six slots.
     if device.device_type == DeviceType.AI_DIFFUSER:
+        entities.append(AiDiffuserOilLevelNumber(device, entry))
+        entities.append(AiDiffuserOilRateNumber(device, entry))
         entities.extend(
             ScentTechTimerDuration(device, slot, field)
             for slot in timer_slots_for(device)
@@ -352,3 +354,78 @@ class ScentTechTimerDuration(ScentTechTimerEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._async_set_timer_fields(**{self._field: int(value)})
+
+
+class AiDiffuserOilLevelNumber(NumberEntity):
+    """Oil in the bottle (mL), set after a refill (AI-Diffuser).
+
+    Writes the unit's Oil Set (00 19). The unit counts down from it and
+    returns to it after a power cycle; the integration restores its own
+    tracked level when that happens (see ScentDiffuserDevice._ai_oil_guard).
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Oil Level"
+    _attr_icon = "mdi:water-plus"
+    _attr_native_unit_of_measurement = "mL"
+    _attr_native_min_value = 0
+    _attr_native_step = 1
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_oil_level"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_max_value(self) -> float:
+        return float(self._device.state.oil_max_ml or 500)
+
+    @property
+    def native_value(self) -> float | None:
+        return self._device.state.oil_current_ml
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and self._device.state.oil_max_ml is not None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.async_set_oil_level(value)
+
+
+class AiDiffuserOilRateNumber(AiDiffuserOilLevelNumber):
+    """Consumption rate (mL/h) the unit counts the oil down with (AI-Diffuser).
+
+    Same Oil Set write (00 19) as the level, which it keeps.
+    """
+
+    _attr_name = "Oil Consumption"
+    _attr_icon = "mdi:water-sync"
+    _attr_native_unit_of_measurement = "mL/h"
+    _attr_native_min_value = 0.01
+    _attr_native_max_value = 100
+    _attr_native_step = 0.01
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        super().__init__(device, entry)
+        self._attr_unique_id = f"{device.unique_id}_oil_rate"
+
+    @property
+    def native_max_value(self) -> float:
+        return 100.0
+
+    @property
+    def native_value(self) -> float | None:
+        return self._device.state.oil_consumption_mlh
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.async_set_oil_rate(value)

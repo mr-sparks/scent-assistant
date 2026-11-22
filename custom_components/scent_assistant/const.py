@@ -89,6 +89,7 @@ AI_DIFFUSER_SUB_TIME = 0x07        # write: set device clock
 AI_DIFFUSER_SUB_POWER = 0x0E       # write: 00 = run, 01 = stop
 AI_DIFFUSER_SUB_SLOT = 0x18        # write: one schedule slot
 AI_DIFFUSER_SUB_WEEK = 0x14        # write: one slot's day mask
+AI_DIFFUSER_SUB_OIL = 0x19         # write: oil left, capacity, consumption rate
 AI_DIFFUSER_SLOTS = 6
 
 # Frame: 55 <dir> <reg> <type> [<len> <payload...>] <checksum>
