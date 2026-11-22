@@ -319,6 +319,7 @@ register in byte 2; writes put `00` in byte 2 and the sub-command in byte 3.
 | Clock | `07 YYYY MM DD WD HH MM SS` | Year big-endian, weekday 1 = Mon … 7 = Sun. The unit beeps three times on every clock write; reads and connects are silent |
 | Slot | `18 <gear 00/01> <slot 1-6> HH MM HH MM WORK PAUSE 05 0A <off-bit> <gear> 00 00 00 <pump>` | WORK/PAUSE are u16 **big-endian**; off-bit is `00` when enabled, else `1 << (slot-1)` |
 | Day mask | `14 <gear 00/01> <slot> <mask>` | Sent ~1 s after the slot write; bit 0 = Monday … bit 6 = Sunday (`41` = Mon + Sun) |
+| Oil | `19 RATE CUR CAP RATEDEC CURDEC` | The app's Oil Set: u16 BE each; rate and current are integer mL(/h) plus a fraction in 1/10000. The unit counts the oil down in RAM only and returns to this value after a power cycle (and after some app sessions) |
 | Fan | `0B <00/01>` | From the app, not verified |
 
 Values are read back **little-endian** although the app writes them
@@ -350,7 +351,25 @@ table for the mode in use carries a live clock.
 
 Little-endian: rate integer `[3-4]`, current volume `[5-6]` (`FFFF` until a
 fragrance is set in the app), capacity `[7-8]`, rate fraction `[9-10]` in
-1/10000 (so `03 00 … 80 25` = 3.96 mL/h), oil type `[15-16]`.
+1/10000 (so `03 00 … 80 25` = 3.96 mL/h), current fraction `[11-12]`, oil
+type `[15-16]`.
+
+The count-down is right (≈2.7 mL/day on a 5 % duty cycle, matching the
+rate) but lives in RAM: unplugging the unit, or an app session, puts the
+current volume back to the last Oil Set value. So does reading the
+schedule/hardware (`08`/`09`/`06`/`07`, verified with a Refresh: 94 → 95);
+the status (`05`) and oil (`0A`) reads don't. Every `00 19` write makes
+the unit beep (like the clock write), so the integration never writes it
+on its own: it keeps its own level, following the unit's count-downs and
+ignoring a rise that lands on the saved value. Any other rise, or one from
+an empty bottle, is taken as a refill made in the app; a refill in the app
+back to the saved value can't be told from a reset, so refills go through
+the Oil Level number (one write). A refill entered while the unit is out
+of reach is kept and written on the next oil report.
+
+The rate is written in the same frame; typing `3960` for 3.96 mL/h in the
+app's Oil Set makes the unit count ~11 mL off per spray and empty the
+counter within hours, so the integration flags rates above 50 mL/h.
 
 ## Building Packets (Python)
 
