@@ -87,6 +87,57 @@ class _NoConnectableScanner(BleakError):
     """No connectable adapter or proxy has registered yet (HA startup)."""
 
 
+MOMENTARY_STOP_CONFIRM_SECONDS = 5
+
+
+class _MomentaryStopReadback:
+    """Passive receipt scoped to one stop and one subscribed BLE generation."""
+
+    def __init__(self, owner: asyncio.Task) -> None:
+        self.owner = owner
+        self.parser = AromaLinkBleProtocol()
+        self.changed = asyncio.Event()
+        self.token: object | None = None
+        self.deadline: float | None = None
+        self.power: bool | None = None
+        self.superseded = False
+
+    def arm(self, token: object, now: float) -> None:
+        if not self.superseded:
+            self.token = token
+            self.deadline = now + MOMENTARY_STOP_CONFIRM_SECONDS
+
+    def observe(self, token: object, data: bytearray, now: float) -> None:
+        if (self.superseded or token is not self.token or self.deadline is None
+                or now >= self.deadline):
+            return
+        power = self.parser.parse_explicit_power_report(data)
+        if power is not None:
+            self.power = power
+            self.changed.set()
+
+    def invalidate(self) -> None:
+        self.superseded = True
+        self.changed.set()
+
+    async def confirmed(self, link_current: Callable[[object], bool]) -> bool:
+        loop = asyncio.get_running_loop()
+        while self.token is not None and self.deadline is not None:
+            if self.superseded or not link_current(self.token):
+                return False
+            remaining = self.deadline - loop.time()
+            if remaining <= 0:
+                return False
+            if self.power is False:
+                return True
+            self.changed.clear()
+            try:
+                await asyncio.wait_for(self.changed.wait(), timeout=remaining)
+            except TimeoutError:
+                return False
+        return False
+
+
 class ScentDiffuserDevice:
     """Manages a single scent diffuser via BLE and/or cloud."""
 
@@ -201,6 +252,10 @@ class ScentDiffuserDevice:
         # auto-off after this many seconds via a background task.
         self.momentary_seconds: int = DEFAULT_MOMENTARY_SECONDS
         self._momentary_task: asyncio.Task | None = None
+        self._momentary_stop_readback: _MomentaryStopReadback | None = None
+        self._momentary_notify_token: object | None = None
+        self._momentary_ble_closed = False
+        self._aroma_power_in_flight = 0
 
         # Loop time the timed refresh in flight started, or None.
         self._periodic_refresh_ts: float | None = None
@@ -602,9 +657,17 @@ class ScentDiffuserDevice:
                 # whether the subscription took, so the disconnect path
                 # can call stop_notify before tearing the link down.
                 try:
-                    await self._ble_client.start_notify(
-                        self._protocol.notify_char_uuid, self._on_ble_notification
-                    )
+                    notify = self._on_ble_notification
+                    if isinstance(self._protocol, AromaLinkBleProtocol):
+                        client = self._ble_client
+                        token = self._momentary_notify_token = object()
+
+                        def notify(sender, data):
+                            if (not self._momentary_ble_closed and self._ble_client is client
+                                    and self._momentary_notify_token is token):
+                                self._on_momentary_notification(token, sender, data)
+
+                    await self._ble_client.start_notify(self._protocol.notify_char_uuid, notify)
                     self._ble_notify_subscribed = True
                 except Exception as err:
                     self._ble_notify_subscribed = False
@@ -906,6 +969,7 @@ class ScentDiffuserDevice:
         Caller must hold `_ble_lock` if called from anywhere other than
         the connect / delayed-disconnect paths (which already do).
         """
+        self._momentary_notify_token = None
         client = self._ble_client
         if client is not None and self._ble_notify_subscribed:
             try:
@@ -1000,9 +1064,41 @@ class ScentDiffuserDevice:
 
     async def _ble_execute(self, data: bytes) -> bool:
         """Connect, send command, schedule disconnect."""
+        if (not isinstance(self._protocol, AromaLinkBleProtocol)
+                or self._protocol.write_sub(data) != AL_SUB_POWER):
+            return await self._ble_execute_once(data)
+
+        self._aroma_power_in_flight += 1
+        readback = self._momentary_stop_readback
+        try:
+            if readback is not None:
+                if readback.owner is not asyncio.current_task():
+                    readback.invalidate()
+                    readback = None
+                elif self._aroma_power_in_flight != 1:
+                    # A manual command was already in flight before this
+                    # timer started stopping. Its report is not proof.
+                    readback.invalidate()
+            return await self._ble_execute_once(data, readback)
+        finally:
+            self._aroma_power_in_flight -= 1
+
+    async def _ble_execute_once(
+        self, data: bytes, readback: _MomentaryStopReadback | None = None,
+    ) -> bool:
         if not await self._ble_connect():
             return False
+        if readback is not None and (
+            self._momentary_task is not readback.owner
+            or self._momentary_stop_readback is not readback
+        ):
+            # The old timer can be cancelled while the BLE backend is
+            # connecting. A late return must not issue its stop.
+            return False
         nack_mark = self._ble_nack_seq
+        token = self._momentary_notify_token
+        if readback is not None and self._momentary_link_current(token):
+            readback.arm(token, asyncio.get_running_loop().time())
         try:
             success = await self._ble_send(data)
         except (BleakError, asyncio.TimeoutError, OSError) as err:
@@ -1023,6 +1119,19 @@ class ScentDiffuserDevice:
     def _nacked_since(self, sub: int, mark: int) -> bool:
         """True if a NACK for `sub` arrived after `mark` (a _ble_nack_seq value)."""
         return self._ble_nacks.get(sub, 0) > mark
+
+    def _momentary_link_current(self, token: object | None) -> bool:
+        return (
+            not self._momentary_ble_closed and token is not None
+            and token is self._momentary_notify_token and self._ble_notify_subscribed and self._ble_client is not None
+            and self._ble_client.is_connected
+        )
+
+    def _on_momentary_notification(self, token: object, sender: int, data: bytearray) -> None:
+        readback = self._momentary_stop_readback
+        if readback is not None and self._momentary_link_current(token):
+            readback.observe(token, data, asyncio.get_running_loop().time())
+        self._on_ble_notification(sender, data)
 
     def _on_ble_notification(self, sender: int, data: bytearray) -> None:
         """Handle incoming BLE notification."""
@@ -1348,11 +1457,40 @@ class ScentDiffuserDevice:
 
     async def _momentary_off_later(self, delay: int) -> None:
         await asyncio.sleep(delay)
-        if not await self.set_power(False):
-            _LOGGER.warning(
-                "Momentary diffusion on %s: auto power-off failed — "
-                "the diffuser may still be running", self.name,
-            )
+        if (not self._ble_address or self.supports_cloud
+                or not isinstance(self._protocol, AromaLinkBleProtocol)):
+            if not await self.set_power(False):
+                self._warn_momentary_stop_failed()
+            return
+
+        # Same single BLE power-off command as set_power(False), but only
+        # the normal notification handler may publish actual device Off.
+        readback = _MomentaryStopReadback(asyncio.current_task())
+        self._momentary_stop_readback = readback
+        try:
+            sent = await self._ble_execute(self._protocol.build_power(False))
+            confirmed = sent and await readback.confirmed(self._momentary_link_current)
+            if (self._momentary_task is not readback.owner
+                    or self._momentary_stop_readback is not readback):
+                return
+            if not sent:
+                self._warn_momentary_stop_failed()
+            elif confirmed:
+                _LOGGER.debug("Momentary diffusion on %s: device reported power off", self.name)
+            else:
+                _LOGGER.warning(
+                    "Momentary diffusion on %s: auto power-off was not confirmed "
+                    "by the device — it may still be running", self.name,
+                )
+        finally:
+            if self._momentary_stop_readback is readback:
+                self._momentary_stop_readback = None
+
+    def _warn_momentary_stop_failed(self) -> None:
+        _LOGGER.warning(
+            "Momentary diffusion on %s: auto power-off failed — "
+            "the diffuser may still be running", self.name,
+        )
 
     async def set_fan(self, on: bool) -> bool:
         """Turn fan on or off (Aroma-Link + Scent Marketing AK)."""
@@ -2299,6 +2437,11 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        self._momentary_ble_closed = True
+        if self._momentary_stop_readback is not None:
+            self._momentary_stop_readback.invalidate()
+            self._momentary_stop_readback = None
+        self._momentary_notify_token = None
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():

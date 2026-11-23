@@ -642,6 +642,25 @@ class AromaLinkBleProtocol(BleProtocol):
             # Trailer bytes inside the payload — not the end yet.
         return None
 
+    def parse_explicit_power_report(self, data: bytes) -> bool | None:
+        """Return only a framed binary power observation, not an ACK or phase.
+
+        Use a fresh parser instance for a bounded post-command observation
+        so an earlier partial notification cannot complete into evidence.
+        """
+        frame = self._feed(bytes(data))
+        if not frame or frame[:3] != AL_HEADER or frame[-3:] != AL_TRAILER:
+            return None
+        payload = frame[4:-3]
+        if len(payload) >= 3 and payload[:2] == bytes((AL_CMD_STATUS, AL_SUB_POWER)):
+            power = payload[2]
+        elif (len(payload) >= 13
+              and payload[:2] == bytes((AL_CMD_STATUS, AL_SUB_ALL_WORK_INFO))):
+            power = payload[11]
+        else:
+            return None
+        return bool(power) if power in (0, 1) else None
+
     def reset_rx(self) -> None:
         """Drop a partial frame left from the previous link."""
         self._rx_buffer.clear()
@@ -700,7 +719,8 @@ class AromaLinkBleProtocol(BleProtocol):
                 except ValueError:
                     # An impossible date counts as drift; a new object each read.
                     result["device_clock"] = datetime(1, 1, 1)
-            if len(payload) >= 13:
+            # The app's on/off field is binary. Unknown values are not Off.
+            if len(payload) >= 13 and payload[11] in (0, 1):
                 result["power"] = payload[11] == 0x01
                 result["phase"] = self._phase_from_status(payload[12], result["power"])
             if len(payload) >= 17:
@@ -753,7 +773,7 @@ class AromaLinkBleProtocol(BleProtocol):
             return result
 
         if cmd == AL_CMD_STATUS:
-            if sub == AL_SUB_POWER and len(payload) >= 3:
+            if sub == AL_SUB_POWER and len(payload) >= 3 and payload[2] in (0, 1):
                 result["power"] = payload[2] == 0x01
                 if not result["power"]:
                     result["phase"] = "off"

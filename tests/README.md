@@ -36,3 +36,18 @@ The ACK/table timeout is shortened for tests; event waits and the existing
 post-write settle delay are real asyncio operations. These tests do not prove
 HA service dispatch, translations, BLE/proxy behavior, firmware timing or a
 physical device write. No live credentials, logs or captures are used.
+
+## Aroma-Link timed stop
+
+The same command runs synthetic Aroma-Link Bluetooth reports through the
+original connection, command and notification paths. The timer sends the
+usual single Off command. Only framed, checksum-valid unsolicited On/Off telemetry
+received after command dispatch starts on that subscribed connection can
+confirm it. An acknowledgement, preexisting state, an incomplete frame or
+a newer On report cannot confirm Off. Replies to other requests do not qualify. A missing confirmation warns after
+the bounded wait, without retrying or sending a new read.
+
+The wire format does not correlate the push with a command ID. This is a
+device-reported power setting, not proof of electrical isolation.
+The reports and device are synthetic; this does not validate installed
+Home Assistant, real Bluetooth transports or firmware timing.
