@@ -245,8 +245,8 @@ class OilEstimator:
         if getattr(state, "radar_mode", None) == 1:
             return self.remaining_ml
 
-        window_known = getattr(self.device, "schedule_window_read", True)
-        durations_known = getattr(self.device, "schedule_durations_read", True)
+        window_known = getattr(self.device, "schedule_window_read", False)
+        durations_known = getattr(self.device, "schedule_durations_read", False)
 
         start_minute = None
         end_minute = None

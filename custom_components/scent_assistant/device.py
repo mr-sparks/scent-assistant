@@ -1093,8 +1093,8 @@ class ScentDiffuserDevice:
         oil_state_changed = False
         oil_snapshot = None
         if self.oil_estimator is not None and self.oil_estimator.enabled:
-            window_known = getattr(self, "schedule_window_read", True)
-            durations_known = getattr(self, "schedule_durations_read", True)
+            window_known = getattr(self, "schedule_window_read", False)
+            durations_known = getattr(self, "schedule_durations_read", False)
             start_min = (
                 self._state.start_hour * 60 + self._state.start_minute
                 if window_known and None not in (self._state.start_hour, self._state.start_minute)
