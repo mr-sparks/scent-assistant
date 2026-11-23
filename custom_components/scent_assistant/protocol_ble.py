@@ -646,6 +646,20 @@ class AromaLinkBleProtocol(BleProtocol):
         """Drop a partial frame left from the previous link."""
         self._rx_buffer.clear()
 
+    @staticmethod
+    def week_schedule_matches(report: dict, expected: bytes) -> bool:
+        """Compare a parsed, checksum-valid week to all 35 expected slot records.
+
+        Pass the report from a fresh read. This comparison cannot establish
+        freshness itself, or infer anything from a cached or partial table.
+        """
+        actual = report.get("week_schedule_bytes")
+        return (
+            isinstance(actual, bytes)
+            and len(expected) == 7 * 5 * 9
+            and actual == expected
+        )
+
     def parse_notification(self, data: bytes) -> dict:
         """Parse Aroma-Link notification packets."""
         result: dict = {}
@@ -842,6 +856,15 @@ class AromaLinkBleProtocol(BleProtocol):
                     })
                 week.append(day)
             result["week_slots"] = week
+            # Keep the untouched and reserved slot bits for exact comparison.
+            # Bare and oversized reports retain their legacy decoded fields
+            # but do not provide a verifiable raw schedule.
+            if (
+                len(payload) == 2 + 7 * 5 * 9
+                and frame[:3] == AL_HEADER
+                and frame[-3:] == AL_TRAILER
+            ):
+                result["week_schedule_bytes"] = payload[2:]
 
         elif cmd == AL_CMD_QUERY and sub == AL_SUB_OIL_LEVEL and len(payload) >= 3:
             # Read-register reply for the liquid level: `52 1E <percent>`.

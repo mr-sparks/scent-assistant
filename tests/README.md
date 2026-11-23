@@ -36,3 +36,14 @@ The ACK/table timeout is shortened for tests; event waits and the existing
 post-write settle delay are real asyncio operations. These tests do not prove
 HA service dispatch, translations, BLE/proxy behavior, firmware timing or a
 physical device write. No live credentials, logs or captures are used.
+
+
+## Aroma-Link full-week comparison
+
+The same command checks the complete 35-slot schedule using synthetic,
+fragmented protocol reports. Verification compares the seven-day table byte
+for byte, including untouched records and the raw enable and level flags.
+An invalid checksum, incomplete or oversized table, or another register's
+report cannot confirm a match. The protocol comparison does not establish
+report freshness or change any Home Assistant read/write behavior; a caller
+must acquire a fresh report separately.
