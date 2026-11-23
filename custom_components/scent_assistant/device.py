@@ -20,6 +20,7 @@ from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.device_registry as dr
 
+from .aroma_report import AromaLinkReport, PHASE_MIN_MAX_AGE
 from .const import (
     DeviceType,
     AL_DURATION_LIMITS,
@@ -139,6 +140,9 @@ class ScentDiffuserDevice:
         self._ble_nack_seq = 0
         self._ble_nacks: dict[int, int] = {}
         self._ble_time_acked = False
+        self._aroma_report = AromaLinkReport()
+        self._aroma_expiry: asyncio.TimerHandle | None = None
+        self._aroma_reports_closed = False
         # Monotonic timestamp of the last failed BLE connect/write —
         # used to back off after errors instead of hammering a stuck
         # device (which can wedge a V3 diffuser's GATT stack badly
@@ -204,7 +208,7 @@ class ScentDiffuserDevice:
 
         # Loop time the timed refresh in flight started, or None.
         self._periodic_refresh_ts: float | None = None
-        self.refresh_interval: int = BLE_REFRESH_INTERVAL_SECONDS
+        self._refresh_interval: int = BLE_REFRESH_INTERVAL_SECONDS
         # Loop time the last full read started, or None.
         self._ble_full_refresh_ts: float | None = None
         # The last full read ended with no state read since setup.
@@ -503,7 +507,74 @@ class ScentDiffuserDevice:
 
         return _remove
 
+    @property
+    def refresh_interval(self) -> int:
+        return self._refresh_interval
+
+    @refresh_interval.setter
+    def refresh_interval(self, interval: int) -> None:
+        previous = self._refresh_interval
+        self._refresh_interval = interval
+        if interval == previous or not self.uses_aroma_report_expiry:
+            return
+        report = self._aroma_report
+        max_age = max(PHASE_MIN_MAX_AGE, 2 * interval + 60)
+        if max_age == report.phase_max_age:
+            return
+        if report.phase_at is not None and report.current_phase(time.monotonic()) is None:
+            # A preference change is not a device report: don't resurrect an
+            # already-expired snapshot when the allowed age grows.
+            report = self._aroma_report = AromaLinkReport()
+        report.phase_max_age = max_age
+        self._schedule_aroma_report_expiry()
+        self._notify_state_changed()
+
+    @property
+    def uses_aroma_report_expiry(self) -> bool:
+        """Gate only Aroma-Link Bluetooth; cloud and other families are unchanged."""
+        return bool(self._ble_address) and isinstance(self._protocol, AromaLinkBleProtocol)
+
+    @property
+    def aroma_reported_phase(self) -> str | None:
+        """Phase from a recent device report, not optimistic command state."""
+        if not self.available or self._state.power is not self._aroma_report.power:
+            return None
+        return self._aroma_report.current_phase(time.monotonic())
+
+    def aroma_reported_countdown(self, phase: str) -> int | None:
+        """Countdown from the same report as the requested active phase."""
+        if self.aroma_reported_phase != phase:
+            return None
+        return self._aroma_report.current_countdown(phase, time.monotonic())
+
+    def _schedule_aroma_report_expiry(self) -> None:
+        if self._aroma_expiry is not None:
+            self._aroma_expiry.cancel()
+            self._aroma_expiry = None
+        now = time.monotonic()
+        deadline = self._aroma_report.next_expiry(now)
+        if deadline is not None and not self._aroma_reports_closed:
+            self._aroma_expiry = asyncio.get_running_loop().call_later(
+                deadline - now, self._expire_aroma_report,
+            )
+
+    def _expire_aroma_report(self) -> None:
+        self._aroma_expiry = None
+        if self._aroma_reports_closed:
+            return
+        self._schedule_aroma_report_expiry()
+        # This is a local state publication, never a Bluetooth read.
+        self._notify_state_changed()
+
     def _notify_state_changed(self) -> None:
+        if (self.uses_aroma_report_expiry and self._aroma_report.power is not None
+                and self._state.power is not self._aroma_report.power):
+            # Existing command paths may publish an optimistic power change.
+            # It can hide evidence, but never make an old report current again.
+            self._aroma_report = AromaLinkReport(
+                phase_max_age=self._aroma_report.phase_max_age,
+            )
+            self._schedule_aroma_report_expiry()
         for cb in list(self._state_callbacks):
             try:
                 cb()
@@ -1058,6 +1129,9 @@ class ScentDiffuserDevice:
                 end = start
         if not updates:
             return
+        if self.uses_aroma_report_expiry and not self._aroma_reports_closed:
+            if self._aroma_report.ingest(updates, time.monotonic()):
+                self._schedule_aroma_report_expiry()
         if "nack" in updates:
             self._ble_nack_seq += 1
             self._ble_nacks[updates["nack"]] = self._ble_nack_seq
@@ -2299,6 +2373,9 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        self._aroma_reports_closed = True
+        self._aroma_report = AromaLinkReport()
+        self._schedule_aroma_report_expiry()
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():

@@ -36,3 +36,22 @@ The ACK/table timeout is shortened for tests; event waits and the existing
 post-write settle delay are real asyncio operations. These tests do not prove
 HA service dispatch, translations, BLE/proxy behavior, firmware timing or a
 physical device write. No live credentials, logs or captures are used.
+
+## Aroma-Link phase and countdown freshness
+
+The same command exercises expiry with fabricated Aroma-Link Bluetooth frames
+fed into the production parser and entity callbacks. Only a received phase
+makes the phase current, and an active countdown needs its own field in that
+same report. A true zero is still a valid snapshot. Unrelated packets, partial
+packets, optimistic commands, and the mere passage of time do not establish
+freshness.
+
+Phase expires after 660 seconds by default (300-second timed refresh).
+The freshness window is the greater of 660 seconds or twice the configured
+refresh interval plus 60 seconds, so healthy longer intervals do not cause
+premature expiry. Countdown still expires after 10 seconds and is not
+decremented locally. With reports farther apart (including a 20-second
+held-link cadence), countdown can intentionally become unavailable between
+reports. Expiry only republishes cached state locally; it does not change
+polling, connect, write settings, or start a new read. The synthetic suite
+does not validate physical timing or an installed Home Assistant.

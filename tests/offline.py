@@ -58,11 +58,15 @@ def load_modules():
         ("switch", "SwitchEntity"), ("time", "TimeEntity"),
     ):
         module(f"homeassistant.components.{name}", **{entity_name: Entity})
+    module("homeassistant.components.sensor", SensorEntity=Entity,
+           SensorDeviceClass=SimpleNamespace(DURATION="duration", BATTERY="battery", ENUM="enum"),
+           SensorStateClass=SimpleNamespace(MEASUREMENT="measurement"))
     stubs["homeassistant.components.number"].NumberMode = SimpleNamespace(
         BOX="box", SLIDER="slider"
     )
     module("homeassistant.config_entries", ConfigEntry=object)
-    module("homeassistant.const", EntityCategory=SimpleNamespace(CONFIG="config"))
+    module("homeassistant.const", EntityCategory=SimpleNamespace(CONFIG="config", DIAGNOSTIC="diagnostic"),
+           PERCENTAGE="%", UnitOfTime=SimpleNamespace(SECONDS="s"))
     module("homeassistant.core", HomeAssistant=object, CoreState=object)
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError)
     module("homeassistant.helpers")
@@ -79,7 +83,7 @@ def load_modules():
     root.__path__ = [str(source)]
     stubs[package] = root
     names = ("const", "protocol_ble", "device", "timer_entity",
-             "number", "select", "switch", "time")
+             "number", "select", "switch", "time", "sensor", "aroma_report")
     with patch.dict(sys.modules, stubs):
         return SimpleNamespace(**{
             name: import_module(f"{package}.{name}") for name in names

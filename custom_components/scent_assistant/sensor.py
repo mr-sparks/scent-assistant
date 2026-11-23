@@ -63,8 +63,12 @@ async def async_setup_entry(
             [DiffuserOilLevelSensor(device, entry)],
             lambda: device.oil_detect_present,
         )
-        entities.append(DiffuserWorkRemainSensor(device, entry))
-        entities.append(DiffuserPauseRemainSensor(device, entry))
+        if device.uses_aroma_report_expiry:
+            entities.append(_FreshDiffuserWorkRemainSensor(device, entry))
+            entities.append(_FreshDiffuserPauseRemainSensor(device, entry))
+        else:
+            entities.append(DiffuserWorkRemainSensor(device, entry))
+            entities.append(DiffuserPauseRemainSensor(device, entry))
         add_when_present(
             hass, entry, device, async_add_entities,
             [DiffuserBatterySensor(device, entry)],
@@ -119,7 +123,9 @@ class DiffuserStatusSensor(SensorEntity):
         self.async_write_ha_state()
 
     @property
-    def native_value(self) -> str:
+    def native_value(self) -> str | None:
+        if self._device.uses_aroma_report_expiry:
+            return self._device.aroma_reported_phase
         return self._device.state.phase
 
     @property
@@ -136,7 +142,9 @@ class DiffuserStatusSensor(SensorEntity):
 
     @property
     def available(self) -> bool:
-        return self._device.available
+        return self._device.available and (
+            not self._device.uses_aroma_report_expiry or self.native_value is not None
+        )
 
 
 class DiffuserBatterySensor(SensorEntity):
@@ -549,3 +557,27 @@ class DiffuserConnectionSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         return self._device.connection_mode
+
+
+class _FreshDiffuserWorkRemainSensor(DiffuserWorkRemainSensor):
+    """Keep the existing entity ID while requiring same-report freshness."""
+
+    @property
+    def native_value(self) -> int | None:
+        return self._device.aroma_reported_countdown("spraying")
+
+    @property
+    def available(self) -> bool:
+        return self.native_value is not None
+
+
+class _FreshDiffuserPauseRemainSensor(DiffuserPauseRemainSensor):
+    """Keep the existing entity ID while requiring same-report freshness."""
+
+    @property
+    def native_value(self) -> int | None:
+        return self._device.aroma_reported_countdown("paused")
+
+    @property
+    def available(self) -> bool:
+        return self.native_value is not None
