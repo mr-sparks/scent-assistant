@@ -152,6 +152,8 @@ def estimate_consumption_ml(
         return remaining_ml
     if is_on is None or not is_on:
         return remaining_ml
+    if schedule_enabled is None or not schedule_enabled:
+        return remaining_ml
 
     if week_slots:
         used = _week_slots_consumption_ml(
@@ -170,8 +172,6 @@ def estimate_consumption_ml(
         or work_seconds <= 0
         or pause_seconds < 0
     ):
-        return remaining_ml
-    if schedule_enabled is None or not schedule_enabled:
         return remaining_ml
     seconds = scheduled_seconds_between(
         start, end, start_minute, end_minute, weekday_mask=weekday_mask
@@ -284,7 +284,9 @@ class OilEstimator:
             previous = self.last_update
             if previous is not None and now > previous:
                 self.remaining_ml = self._compute_for_current_state(previous, now)
-            self.last_update = now
+                self.last_update = now
+            elif previous is None:
+                self.last_update = now
             await self._save(force=force_save)
         self._notify()
 
@@ -324,7 +326,9 @@ class OilEstimator:
                     weekday_mask=weekday_mask,
                     week_slots=week_slots,
                 )
-            self.last_update = now
+                self.last_update = now
+            elif previous is None:
+                self.last_update = now
             await self._save(force=force_save)
         self._notify()
 

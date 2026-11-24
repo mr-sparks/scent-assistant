@@ -267,14 +267,14 @@ class WeekSlotsConsumptionTests(unittest.TestCase):
                 start=start_aware, end=datetime(2026, 1, 1, 12, 0),
                 week_slots=self.empty_week, full_duty_consumption_mlh=2.0,
             ),
-            1.0,
+            2.0,
         )
         self.assertAlmostEqual(
             _week_slots_consumption_ml(
                 start=datetime(2026, 1, 1, 10, 0), end=datetime(2026, 1, 1, 12, 0, tzinfo=tz),
                 week_slots=self.empty_week, full_duty_consumption_mlh=2.0,
             ),
-            1.0,
+            2.0,
         )
 
 
@@ -368,6 +368,48 @@ class EstimateConsumptionTests(unittest.TestCase):
         )
         # 1h * 2.0 * 50% = 1.0 consumed -> 99.0
         self.assertAlmostEqual(res, 99.0)
+
+    def test_week_slots_schedule_disabled_consumes_nothing(self) -> None:
+        week = [[{"enabled": False} for _ in range(5)] for _ in range(7)]
+        week[3][0] = {
+            "enabled": True, "start_hour": 10, "start_minute": 0,
+            "end_hour": 11, "end_minute": 0, "work_seconds": 10, "pause_seconds": 10,
+        }
+        # schedule_enabled=False must prevent consumption even with active week_slots
+        res = estimate_consumption_ml(
+            remaining_ml=100.0,
+            start=datetime(2026, 1, 1, 10), end=datetime(2026, 1, 1, 11),
+            is_on=True, schedule_enabled=False,
+            start_minute=None, end_minute=None, work_seconds=None, pause_seconds=None,
+            full_duty_consumption_mlh=2.0, week_slots=week,
+        )
+        self.assertEqual(res, 100.0)
+
+        # schedule_enabled=None must also prevent consumption
+        res_none = estimate_consumption_ml(
+            remaining_ml=100.0,
+            start=datetime(2026, 1, 1, 10), end=datetime(2026, 1, 1, 11),
+            is_on=True, schedule_enabled=None,
+            start_minute=None, end_minute=None, work_seconds=None, pause_seconds=None,
+            full_duty_consumption_mlh=2.0, week_slots=week,
+        )
+        self.assertEqual(res_none, 100.0)
+
+    def test_week_slots_outside_scheduled_window_consumes_nothing(self) -> None:
+        week = [[{"enabled": False} for _ in range(5)] for _ in range(7)]
+        week[3][0] = {
+            "enabled": True, "start_hour": 10, "start_minute": 0,
+            "end_hour": 11, "end_minute": 0, "work_seconds": 10, "pause_seconds": 10,
+        }
+        # 08:00 to 09:00 on Thursday is outside the 10:00-11:00 slot
+        res = estimate_consumption_ml(
+            remaining_ml=100.0,
+            start=datetime(2026, 1, 1, 8), end=datetime(2026, 1, 1, 9),
+            is_on=True, schedule_enabled=True,
+            start_minute=None, end_minute=None, work_seconds=None, pause_seconds=None,
+            full_duty_consumption_mlh=2.0, week_slots=week,
+        )
+        self.assertEqual(res, 100.0)
 
 
 class MockDiffuserDevice:
@@ -499,6 +541,34 @@ class OilEstimatorTests(unittest.IsolatedAsyncioTestCase):
         self.estimator.remaining_ml = 100.0
 
         await self.estimator.async_advance(now=t1)
+        self.assertEqual(self.estimator.remaining_ml, 100.0)
+        self.assertEqual(self.estimator.last_update, t0)
+
+    async def test_async_advance_out_of_order_does_not_regress_last_update(self) -> None:
+        t0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        t_older = datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)
+        self.estimator.last_update = t0
+        self.estimator.remaining_ml = 100.0
+
+        await self.estimator.async_advance(now=t_older)
+        self.assertEqual(self.estimator.remaining_ml, 100.0)
+        self.assertEqual(self.estimator.last_update, t0)
+
+    async def test_async_advance_snapshot_out_of_order_does_not_regress_last_update(self) -> None:
+        t0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        t_older = datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)
+        self.estimator.last_update = t0
+        self.estimator.remaining_ml = 100.0
+
+        await self.estimator.async_advance_snapshot(
+            is_on=True,
+            schedule_enabled=True,
+            start_minute=0,
+            end_minute=0,
+            work_seconds=10,
+            pause_seconds=10,
+            now=t_older,
+        )
         self.assertEqual(self.estimator.remaining_ml, 100.0)
         self.assertEqual(self.estimator.last_update, t0)
 

@@ -440,17 +440,17 @@ class ScentDiffuserDevice:
 
     @property
     def schedule_window_read(self) -> bool:
-        """False while a BLE Aroma-Link unit has not reported its window."""
-        if self._ble_address and isinstance(self._protocol, AromaLinkBleProtocol):
-            return self._schedule_window_read
-        return True
+        """False while a device has not reported its schedule window."""
+        if self._device_type == DeviceType.SCENT_TECH:
+            return self._state.timer_slots is not None
+        return self._schedule_window_read
 
     @property
     def schedule_durations_read(self) -> bool:
-        """False while a BLE Aroma-Link unit has not reported its durations."""
-        if self._ble_address and isinstance(self._protocol, AromaLinkBleProtocol):
-            return self._schedule_durations_read or self._durations_unreported
-        return True
+        """False while a device has not reported its durations."""
+        if self._device_type == DeviceType.SCENT_TECH:
+            return self._state.timer_slots is not None
+        return self._schedule_durations_read or self._durations_unreported
 
     @property
     def durations_unreported(self) -> bool:
@@ -1231,6 +1231,8 @@ class ScentDiffuserDevice:
             self._state.intensity = updates["intensity"]
             changed = True
         if "weekday_mask" in updates:
+            if self._state.weekday_mask != updates["weekday_mask"]:
+                oil_state_changed = True
             self._state.weekday_mask = updates["weekday_mask"]
             changed = True
         if "schedule_slot" in updates:
@@ -1260,7 +1262,10 @@ class ScentDiffuserDevice:
             self._state.device_code = updates["device_code"]
             changed = True
         if "week_slots" in updates:
+            if self._state.week_slots != updates["week_slots"]:
+                oil_state_changed = True
             self._state.week_slots = updates["week_slots"]
+            self._schedule_window_read = True
             day = updates["week_slots"][datetime.now().weekday()]
             if self._state.device_code in AL_MANY_PUMP_DEVICE_CODES:
                 slot = day[0]
@@ -2364,6 +2369,10 @@ class ScentDiffuserDevice:
         for field in fields:
             if field in schedule:
                 setattr(self._state, field, schedule[field])
+        if "start_hour" in schedule:
+            self._schedule_window_read = True
+        if "work_seconds" in schedule and "pause_seconds" in schedule:
+            self._schedule_durations_read = True
         self._notify_state_changed()
 
     async def async_full_refresh(self) -> None:
