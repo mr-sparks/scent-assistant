@@ -63,6 +63,14 @@ async def async_setup_entry(
             for slot in timer_slots_for(device)
             for field in ("run_seconds", "pause_seconds")
         )
+
+    estimator = getattr(device, "oil_estimator", None)
+    if estimator is not None:
+        entities.extend(
+            entity
+            for entity in estimator.entities()
+            if isinstance(entity, NumberEntity)
+        )
     async_add_entities(entities)
 
 

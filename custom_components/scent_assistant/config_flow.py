@@ -15,6 +15,8 @@ from homeassistant.components.bluetooth import (
     async_ble_device_from_address,
     async_discovered_service_info,
 )
+from homeassistant.helpers import selector
+
 from .const import (
     BLE_CONNECT_MAX_ATTEMPTS,
     DOMAIN,
@@ -31,6 +33,12 @@ from .const import (
     BLE_REFRESH_INTERVAL_SECONDS,
     BLE_REFRESH_INTERVAL_MIN_SECONDS,
     DeviceType,
+)
+from .estimated_oil import (
+    DEFAULT_OIL_BOTTLE_CAPACITY_ML,
+    DEFAULT_OIL_ESTIMATION_ENABLED,
+    DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH,
+    DEFAULT_OIL_LOW_THRESHOLD_PERCENT,
 )
 from .protocol_ble import (
     classify_gatt,
@@ -77,6 +85,20 @@ def _advertised_name(info: BluetoothServiceInfoBleak) -> str:
     return name
 
 
+def _supports_refresh_interval(config_entry: config_entries.ConfigEntry) -> bool:
+    """Return True if the entry is a BLE device with a timed refresh."""
+    data = config_entry.data
+    if data.get(CONF_CONNECTION_MODE, "ble") != "ble":
+        return False
+    # A downgrade can leave a type this release lacks; raising here
+    # would fail HA's config entry list.
+    try:
+        protocol = get_protocol(DeviceType(data.get(CONF_DEVICE_TYPE, "aroma_link")))
+    except ValueError:
+        return False
+    return protocol.periodic_refresh
+
+
 class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle config flow for Scent Diffuser."""
 
@@ -103,17 +125,8 @@ class ScentDiffuserConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_supports_options_flow(
         cls, config_entry: config_entries.ConfigEntry
     ) -> bool:
-        """Offer options only to BLE entries with a timed refresh."""
-        data = config_entry.data
-        if data.get(CONF_CONNECTION_MODE, "ble") != "ble":
-            return False
-        # A downgrade can leave a type this release lacks; raising here
-        # would fail HA's config entry list.
-        try:
-            protocol = get_protocol(DeviceType(data.get(CONF_DEVICE_TYPE, "aroma_link")))
-        except ValueError:
-            return False
-        return protocol.periodic_refresh
+        """Offer options to all entries for estimated oil tracking."""
+        return True
 
     def _create_ble_entry(self) -> config_entries.ConfigFlowResult:
         """Build the BLE-mode config entry. Shared by all BLE setup paths."""
@@ -472,25 +485,117 @@ class ScentDiffuserOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Set the BLE refresh interval."""
+        """Set the BLE refresh interval and estimated oil options."""
+        supports_refresh = _supports_refresh_interval(self._entry)
+
         if user_input is not None:
             options = dict(self._entry.options)
-            options.pop(CONF_REFRESH_INTERVAL, None)
-            interval = user_input[CONF_REFRESH_INTERVAL]
-            if interval != BLE_REFRESH_INTERVAL_SECONDS:
-                options[CONF_REFRESH_INTERVAL] = interval
+            if supports_refresh:
+                options.pop(CONF_REFRESH_INTERVAL, None)
+                interval = user_input[CONF_REFRESH_INTERVAL]
+                if interval != BLE_REFRESH_INTERVAL_SECONDS:
+                    options[CONF_REFRESH_INTERVAL] = interval
+            options["oil_estimation_enabled"] = bool(
+                user_input.get("oil_estimation_enabled", DEFAULT_OIL_ESTIMATION_ENABLED)
+            )
+            options["oil_bottle_capacity_ml"] = float(
+                user_input.get("oil_bottle_capacity_ml", DEFAULT_OIL_BOTTLE_CAPACITY_ML)
+            )
+            options["oil_full_duty_consumption_mlh"] = float(
+                user_input.get(
+                    "oil_full_duty_consumption_mlh",
+                    DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH,
+                )
+            )
+            options["oil_low_threshold_percent"] = float(
+                user_input.get(
+                    "oil_low_threshold_percent",
+                    DEFAULT_OIL_LOW_THRESHOLD_PERCENT,
+                )
+            )
             return self.async_create_entry(data=options)
 
-        current = self._entry.options.get(
-            CONF_REFRESH_INTERVAL, BLE_REFRESH_INTERVAL_SECONDS
+        current_options = self._entry.options
+        schema_dict: dict[Any, Any] = {}
+
+        if supports_refresh:
+            current = current_options.get(
+                CONF_REFRESH_INTERVAL, BLE_REFRESH_INTERVAL_SECONDS
+            )
+            current = max(BLE_REFRESH_INTERVAL_MIN_SECONDS, int(current))
+            schema_dict[vol.Required(CONF_REFRESH_INTERVAL, default=current)] = vol.All(
+                vol.Coerce(int),
+                vol.Range(min=BLE_REFRESH_INTERVAL_MIN_SECONDS, max=3600),
+            )
+
+        schema_dict[
+            vol.Optional(
+                "oil_estimation_enabled",
+                default=bool(
+                    current_options.get(
+                        "oil_estimation_enabled", DEFAULT_OIL_ESTIMATION_ENABLED
+                    )
+                ),
+            )
+        ] = selector.BooleanSelector()
+        schema_dict[
+            vol.Optional(
+                "oil_bottle_capacity_ml",
+                default=float(
+                    current_options.get(
+                        "oil_bottle_capacity_ml", DEFAULT_OIL_BOTTLE_CAPACITY_ML
+                    )
+                ),
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=10,
+                max=10000,
+                step=10,
+                unit_of_measurement="mL",
+                mode=selector.NumberSelectorMode.BOX,
+            )
         )
-        current = max(BLE_REFRESH_INTERVAL_MIN_SECONDS, int(current))
+        schema_dict[
+            vol.Optional(
+                "oil_full_duty_consumption_mlh",
+                default=float(
+                    current_options.get(
+                        "oil_full_duty_consumption_mlh",
+                        DEFAULT_OIL_FULL_DUTY_CONSUMPTION_MLH,
+                    )
+                ),
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0.05,
+                max=50.0,
+                step=0.05,
+                unit_of_measurement="mL/h",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        )
+        schema_dict[
+            vol.Optional(
+                "oil_low_threshold_percent",
+                default=float(
+                    current_options.get(
+                        "oil_low_threshold_percent",
+                        DEFAULT_OIL_LOW_THRESHOLD_PERCENT,
+                    )
+                ),
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=1,
+                max=50,
+                step=1,
+                unit_of_measurement="%",
+                mode=selector.NumberSelectorMode.SLIDER,
+            )
+        )
+
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({
-                vol.Required(CONF_REFRESH_INTERVAL, default=current): vol.All(
-                    vol.Coerce(int),
-                    vol.Range(min=BLE_REFRESH_INTERVAL_MIN_SECONDS, max=3600),
-                ),
-            }),
+            data_schema=vol.Schema(schema_dict),
         )

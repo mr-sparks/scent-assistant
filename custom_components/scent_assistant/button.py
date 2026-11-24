@@ -36,7 +36,16 @@ async def async_setup_entry(
     # AI-Diffuser polls status and oil only; Refresh re-reads everything.
     if device.device_type == DeviceType.AI_DIFFUSER:
         entities.append(AiDiffuserRefreshButton(device, entry))
-    async_add_entities(entities)
+    
+    estimator = getattr(device, "oil_estimator", None)
+    if estimator is not None:
+        entities.extend(
+            entity
+            for entity in estimator.entities()
+            if isinstance(entity, ButtonEntity)
+        )
+    if entities:
+        async_add_entities(entities)
 
 
 class MomentaryDiffuseButton(ButtonEntity):

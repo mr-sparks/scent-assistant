@@ -60,10 +60,20 @@
   "options": {
     "step": {
       "init": {
-        "title": "Bluetooth refresh",
-        "description": "Seconds between Bluetooth reads of this diffuser (60-3600, default 300). Each read connects once and holds the connection for about 10 seconds, during which the phone app cannot connect and one connection slot on the Bluetooth adapter or proxy is in use. Reads below 300 seconds connect the same way and may skip Oil remaining, Work Duration and Pause Duration, which are still read at least every 300 seconds.",
+        "title": "Scent Diffuser Options",
         "data": {
-          "refresh_interval": "Refresh interval (seconds)"
+          "refresh_interval": "Refresh interval (seconds)",
+          "oil_estimation_enabled": "Enable estimated oil tracking",
+          "oil_bottle_capacity_ml": "Bottle capacity",
+          "oil_full_duty_consumption_mlh": "Full-duty consumption rate",
+          "oil_low_threshold_percent": "Low-oil alert threshold"
+        },
+        "data_description": {
+          "refresh_interval": "Seconds between Bluetooth reads of this diffuser (60-3600, default 300). Each read connects once and holds the connection for about 10 seconds, during which the phone app cannot connect and one connection slot on the Bluetooth adapter or proxy is in use. Reads below 300 seconds connect the same way and may skip Oil remaining, Work Duration and Pause Duration, which are still read at least every 300 seconds.",
+          "oil_estimation_enabled": "Estimate remaining oil volume from active schedule windows and work/pause duty cycles.",
+          "oil_bottle_capacity_ml": "Total capacity of the installed oil bottle in millilitres.",
+          "oil_full_duty_consumption_mlh": "Oil consumption in mL/h at 100% continuous spray (typically 2.0–2.5 mL/h for 1000 mL units).",
+          "oil_low_threshold_percent": "Trigger the low-oil binary sensor when estimated volume drops below this percentage."
         }
       }
     }
