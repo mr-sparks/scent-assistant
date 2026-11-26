@@ -20,7 +20,7 @@ def adv(local_name=None, manufacturer_data=None, service_uuids=None):
 class AromelyDetectionTest(unittest.TestCase):
     def test_aro_pro_name_without_af30_or_marker(self):
         # Aro Pro: FFE0 only in GATT, nothing Aromely-specific advertised.
-        name = "YGZK-XXJ-V3TJ-CA2032112AC6"
+        name = "YGZK-XXJ-V3TJ-0123456789AB"
         self.assertEqual(detect(name, adv(local_name=name)),
                          DeviceType.AROMELY_ARO_MAX)
         self.assertEqual(detect(name, None), DeviceType.AROMELY_ARO_MAX)
