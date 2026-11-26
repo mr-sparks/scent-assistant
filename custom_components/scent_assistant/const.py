@@ -302,7 +302,10 @@ BLE_NAME_PATTERNS = {
     # Most Aro Max units advertise a per-unit serial as the local name and
     # are detected via the AF30 service / manufacturer data instead, but
     # some expose "DiffuserAroMax" directly — match that as a fallback.
-    DeviceType.AROMELY_ARO_MAX: ["DiffuserAroMax", "DiffuserAro"],
+    # "YGZK-XXJ-" — Aromely Aro Pro (e.g. "YGZK-XXJ-V3TJ-CA2032112AC6").
+    # It speaks the same FFE0 55-framed protocol, but advertises neither
+    # the AF30 service nor "AroMax" in its manufacturer data.
+    DeviceType.AROMELY_ARO_MAX: ["DiffuserAroMax", "DiffuserAro", "YGZK-XXJ-"],
     # "SA_" — Scent Marketing AK sold under other brands (AromaTech
     # Ambience SA_AT600, #29). Normally these are identified by their
     # manufacturer data, but some units advertise none at all: just the
