@@ -12,6 +12,7 @@
     { "manufacturer_id": 17932 },
     { "manufacturer_id": 61441 },
     { "manufacturer_id": 17750, "manufacturer_data_start": [82] },
+    { "manufacturer_id": 60829 },
     { "service_uuid": "0000af30-0000-1000-8000-00805f9b34fb" },
     { "service_uuid": "00001f71-0000-1000-8000-00805f9b34fb" }
   ],

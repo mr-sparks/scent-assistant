@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import AI_DIFFUSER_SLOTS, SCENT_TECH_TIMER_SLOTS, DeviceType
+from .const import AI_DIFFUSER_SLOTS, SCENT_MASTER_SLOTS, SCENT_TECH_TIMER_SLOTS, DeviceType
 from .device import ScentDiffuserDevice
 from .protocol_ble import ScentTechTimer
 
@@ -24,6 +24,8 @@ def timer_slots_for(device: ScentDiffuserDevice) -> range:
         return TIMER_SLOTS
     if device.device_type == DeviceType.AI_DIFFUSER:
         return AI_DIFFUSER_TIMER_SLOTS
+    if device.device_type == DeviceType.SCENT_MASTER:
+        return range(1, SCENT_MASTER_SLOTS + 1)
     return range(0)
 
 

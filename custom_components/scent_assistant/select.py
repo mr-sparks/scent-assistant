@@ -62,8 +62,8 @@ async def async_setup_entry(
         entities.append(ScheduleModeSelect(device, entry))
     if device.device_type == DeviceType.SCENT_TECH:
         entities.extend(ScentTechTimerDays(device, slot) for slot in TIMER_SLOTS)
-    # AI-Diffuser: the app's six "Modes".
-    if device.device_type == DeviceType.AI_DIFFUSER:
+    # AI-Diffuser: the app's six "Modes"; Scent Master: its five settings.
+    if device.device_type in (DeviceType.AI_DIFFUSER, DeviceType.SCENT_MASTER):
         entities.extend(
             ScentTechTimerDays(device, slot) for slot in timer_slots_for(device)
         )

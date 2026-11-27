@@ -53,6 +53,17 @@ from .const import (
     SM_GW_GEAR_LEN, SM_GW_GEAR_DEFAULT_LIMITS,
     AROMELY_SERVICE_UUID, AROMELY_CHAR_WRITE_UUID, AROMELY_CHAR_NOTIFY_UUID,
     AROMELY_ADV_SERVICE_UUID,
+    SCENT_MASTER_SERVICE_UUID, SCENT_MASTER_CHAR_WRITE_UUID,
+    SCENT_MASTER_CHAR_NOTIFY_UUID,
+    SCENT_MASTER_FRAME_HEADER, SCENT_MASTER_DIR_WRITE, SCENT_MASTER_DIR_NOTIFY,
+    SCENT_MASTER_FN_READ, SCENT_MASTER_FN_DATA,
+    SCENT_MASTER_REG_CLOCK, SCENT_MASTER_REG_SCHEDULE_1, SCENT_MASTER_REG_FAN,
+    SCENT_MASTER_REG_SESSION, SCENT_MASTER_REG_ENABLE_1,
+    SCENT_MASTER_REG_BATTERY, SCENT_MASTER_REG_STATUS, SCENT_MASTER_REG_MODE,
+    SCENT_MASTER_REG_NAME, SCENT_MASTER_REG_NOTE, SCENT_MASTER_REG_STATUS_ALT,
+    SCENT_MASTER_SLOTS, SCENT_MASTER_RECORD_SIZE, SCENT_MASTER_STATUS_BYTES,
+    SCENT_MASTER_DAYS, SCENT_MASTER_LEVELS, SCENT_MASTER_MFR_ID,
+    SCENT_MASTER_NAME_MARKERS,
     SCENT_TECH_SERVICE_UUID, SCENT_TECH_CHAR_UUID,
     SCENT_TECH_HEADER, SCENT_TECH_TRAILER,
     SCENT_TECH_CMD_TIME_SYNC, SCENT_TECH_CMD_CONTROL,
@@ -1017,6 +1028,233 @@ class AromelyAroMaxProtocol(BleProtocol):
             result["work_seconds"] = work
         if 0 < pause <= 0xFFFF:
             result["pause_seconds"] = pause
+
+
+# ---------------------------------------------------------------------------
+# Scent Master Pro — 55-framed OEM register protocol
+# ---------------------------------------------------------------------------
+
+class ScentMasterProtocol(BleProtocol):
+    """Scent Master Pro diffusers (com.xxiot.bx.scent).
+
+    Frame layout, decoded from the app and checked against a live trace:
+
+        55 <dir> <cmd> <fn> [<len> <payload…>] <chk>
+
+    `dir` is 0x10 (app->device) or 0x11 (device->app), `fn` is 0x00 for a bare
+    read request and 0x05 for a data write/response, and `chk` is the sum of
+    every byte after the 0x55, mod 256. Registers 0x01..0x05 and 0x11..0x15
+    are the five schedules and their enable flags. See PROTOCOL.md.
+
+    The PIN the app asks for is read from the advertisement and compared
+    client-side; the diffuser itself accepts commands without it.
+    """
+
+    device_type = DeviceType.SCENT_MASTER
+    service_uuid = SCENT_MASTER_SERVICE_UUID
+    write_char_uuid = SCENT_MASTER_CHAR_WRITE_UUID
+    notify_char_uuid = SCENT_MASTER_CHAR_NOTIFY_UUID
+
+    def __init__(self) -> None:
+        # Which of the five schedules the generic single-schedule path follows
+        # (first enabled slot with a program; see `_parse_status`).
+        self.slot: int = 1
+
+    # -- framing ----------------------------------------------------------
+
+    @staticmethod
+    def _frame(cmd: int, payload: bytes | None = None) -> bytes:
+        """Wrap a read or a data write in the 55 envelope with its checksum."""
+        body = bytearray([SCENT_MASTER_DIR_WRITE, cmd & 0xFF])
+        if payload is None:
+            body.append(SCENT_MASTER_FN_READ)
+        else:
+            body.append(SCENT_MASTER_FN_DATA)
+            body.append(len(payload) & 0xFF)
+            body.extend(payload)
+        body.append(sum(body) & 0xFF)
+        return bytes([SCENT_MASTER_FRAME_HEADER]) + bytes(body)
+
+    # -- session / reads --------------------------------------------------
+
+    def build_session_start(self) -> bytes:
+        """`07 05 01 01` — the app's first write after connecting."""
+        return self._frame(SCENT_MASTER_REG_SESSION, bytes([0x01]))
+
+    def build_read_queries(self) -> list[bytes]:
+        """Schedules, working level and mode, as the app reads them."""
+        return [
+            self._frame(SCENT_MASTER_REG_STATUS),
+            self._frame(SCENT_MASTER_REG_FAN),
+            self._frame(SCENT_MASTER_REG_MODE),
+        ]
+
+    def build_query(self) -> bytes:
+        return self._frame(SCENT_MASTER_REG_STATUS)
+
+    def build_time_sync(self, now: datetime | None = None) -> bytes:
+        """`00 05 04 <day> HH MM SS` — binary clock, day mask Mon=1 … Sun=64."""
+        if now is None:
+            now = datetime.now()
+        day = SCENT_MASTER_DAYS[now.weekday()]
+        return self._frame(
+            SCENT_MASTER_REG_CLOCK,
+            bytes([day, now.hour & 0xFF, now.minute & 0xFF, now.second & 0xFF]),
+        )
+
+    # -- controls ---------------------------------------------------------
+
+    def build_power(self, on: bool) -> bytes:
+        """Register 0x06 (level 1/2, 0 = off).
+
+        The `-TJ-` models do not answer this register and their app exposes no
+        power switch, so no Power entity is registered for the family; this
+        exists only because the base class requires it.
+        """
+        return self._frame(SCENT_MASTER_REG_FAN, bytes([0x01 if on else 0x00]))
+
+    def supports_fan(self) -> bool:
+        # The same register that powers the unit carries the level; a second
+        # switch would fight the power entity.
+        return False
+
+    def build_enable(self, on: bool) -> bytes:
+        """Enable/disable the schedule in use (its `11`..`15` app switch)."""
+        return self.build_slot_enable(self.slot, on)
+
+    def build_slot_enable(self, slot: int, on: bool) -> bytes:
+        """Enable/disable one of the five schedules (registers 0x11..0x15)."""
+        index = max(1, min(SCENT_MASTER_SLOTS, int(slot)))
+        register = SCENT_MASTER_REG_ENABLE_1 + index - 1
+        return self._frame(register, bytes([0x01 if on else 0x00]))
+
+    def build_slot_frame(self, slot: int, timer) -> bytes:
+        """Write one schedule record (registers 0x01..0x05)."""
+        start, stop = timer.start_minute, timer.stop_minute
+        work = max(0, min(0xFFFF, int(timer.run_seconds)))
+        pause = max(0, min(0xFFFF, int(timer.pause_seconds)))
+        payload = bytes([
+            timer.weekdays & 0x7F,
+            (start // 60) & 0xFF, (start % 60) & 0xFF,
+            (stop // 60) & 0xFF, (stop % 60) & 0xFF,
+            (work >> 8) & 0xFF, work & 0xFF,
+            (pause >> 8) & 0xFF, pause & 0xFF,
+        ])
+        index = max(1, min(SCENT_MASTER_SLOTS, int(slot)))
+        return self._frame(SCENT_MASTER_REG_SCHEDULE_1 + index - 1, payload)
+
+    def build_schedule(
+        self,
+        slot: ScheduleSlot,
+        weekday_mask: int = 0x7F,
+        intensity: int = 0,
+        mode: int | None = None,
+    ) -> bytes:
+        """One of the five schedules: day mask, window, work/pause (u16 s).
+
+        `mode` overrides the schedule the device was last seen running; by
+        default the write goes to the record the entities are following.
+        """
+        work = max(0, min(0xFFFF, int(slot.work_seconds)))
+        pause = max(0, min(0xFFFF, int(slot.pause_seconds)))
+        payload = bytes([
+            weekday_mask & 0x7F,
+            slot.start_hour & 0xFF, slot.start_minute & 0xFF,
+            slot.end_hour & 0xFF, slot.end_minute & 0xFF,
+            (work >> 8) & 0xFF, work & 0xFF,
+            (pause >> 8) & 0xFF, pause & 0xFF,
+        ])
+        index = self.slot if mode is None else mode
+        register = SCENT_MASTER_REG_SCHEDULE_1 + max(1, min(SCENT_MASTER_SLOTS, index)) - 1
+        return self._frame(register, payload)
+
+    # -- parsing ----------------------------------------------------------
+
+    def parse_notification(self, data: bytes) -> dict:
+        result: dict = {}
+        if (
+            len(data) < 5
+            or data[0] != SCENT_MASTER_FRAME_HEADER
+            or data[1] != SCENT_MASTER_DIR_NOTIFY
+            or data[3] != SCENT_MASTER_FN_DATA
+        ):
+            return result
+        cmd = data[2]
+        length = data[4]
+        payload = data[5:5 + length]
+
+        if cmd in (SCENT_MASTER_REG_STATUS, SCENT_MASTER_REG_STATUS_ALT):
+            if len(payload) >= SCENT_MASTER_STATUS_BYTES:
+                self._parse_status(payload, result)
+        elif cmd == SCENT_MASTER_REG_NAME and payload:
+            name = payload.strip(b"\x00 ").decode("utf-8", "replace").strip()
+            if name:
+                result["device_name"] = name
+        elif cmd == SCENT_MASTER_REG_NOTE and payload:
+            note = payload.strip(b"\x00 ").decode("utf-8", "replace").strip()
+            if note:
+                result["device_label"] = note
+        return result
+
+    def _parse_status(self, payload: bytes, result: dict) -> None:
+        """50-byte block: five `enabled + 9-byte record` groups.
+
+        The single Start/End/Work/Pause entity set follows the first schedule
+        the device reports as enabled (schedule 1 when none is), which is also
+        the one edits are written back to.
+        """
+        records = [
+            payload[i * SCENT_MASTER_RECORD_SIZE:(i + 1) * SCENT_MASTER_RECORD_SIZE]
+            for i in range(SCENT_MASTER_SLOTS)
+        ]
+        index = next(
+            (i for i, r in enumerate(records) if len(r) == SCENT_MASTER_RECORD_SIZE and r[0] == 0x01),
+            0,
+        )
+        slots: dict[int, ScentTechTimer] = {}
+        for position, group in enumerate(records, start=1):
+            if len(group) != SCENT_MASTER_RECORD_SIZE:
+                continue
+            slots[position] = ScentTechTimer(
+                enabled=group[0] == 0x01,
+                serial=position,
+                weekdays=group[1] & 0x7F,
+                start_minute=min(group[2] * 60 + group[3], 1439),
+                stop_minute=min(group[4] * 60 + group[5], 1439),
+                run_seconds=(group[6] << 8) | group[7],
+                pause_seconds=(group[8] << 8) | group[9],
+                timer_id=position,
+            )
+        result["timer_slots"] = slots
+
+        def configured(timer: ScentTechTimer) -> bool:
+            return bool(
+                timer.weekdays or timer.run_seconds or timer.pause_seconds
+                or timer.start_minute or timer.stop_minute
+            )
+
+        # Units report unconfigured slots as enabled with an all-zero record,
+        # so "the schedule in use" is the first enabled slot with a program.
+        active = (
+            next((t for t in slots.values() if t.enabled and configured(t)), None)
+            or next((t for t in slots.values() if configured(t)), None)
+            or slots.get(1)
+        )
+        if active is None:
+            return
+        self.slot = active.serial
+        result["schedule_enabled"] = active.enabled
+        # No power register on these units: an enabled schedule is the closest
+        # thing to "running" the firmware reports, so the status sensor is not
+        # stuck on "unknown".
+        result["phase"] = "idle" if active.enabled else "off"
+        result["weekday_mask"] = active.weekdays
+        result["start_hour"], result["start_minute"] = divmod(active.start_minute, 60)
+        result["end_hour"], result["end_minute"] = divmod(active.stop_minute, 60)
+        if 0 < active.run_seconds <= 0xFFFF:
+            result["work_seconds"] = active.run_seconds
+        if 0 < active.pause_seconds <= 0xFFFF:
+            result["pause_seconds"] = active.pause_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -3241,6 +3479,8 @@ def get_protocol(
         return ScentMarketingGwXorProtocol(mac=mac, tuya_dp_mode=tuya)
     elif device_type == DeviceType.AROMELY_ARO_MAX:
         return AromelyAroMaxProtocol()
+    elif device_type == DeviceType.SCENT_MASTER:
+        return ScentMasterProtocol()
     elif device_type == DeviceType.SCENT_TECH:
         return ScentTechProtocol()
     elif device_type == DeviceType.AI_DIFFUSER:
@@ -3338,6 +3578,9 @@ def detect_device_type(
     if sm_type is not None:
         return sm_type
 
+    if _detect_scent_master(ble_name, advertisement_data):
+        return DeviceType.SCENT_MASTER
+
     if _detect_aromely(advertisement_data):
         return DeviceType.AROMELY_ARO_MAX
 
@@ -3356,6 +3599,27 @@ def detect_device_type(
             if lowered.startswith(pattern.lower()):
                 return dtype
     return None
+
+
+def _detect_scent_master(ble_name: str, advertisement_data) -> bool:
+    """Match a Scent Master Pro unit (the OEM behind the app's whole family).
+
+    Two signals, cheapest first: a model marker in the advertised local name
+    (`-TJ-`, `-DCTJ-`, `-DC-`, `-BLEWIFI-`, …), or the manufacturer data in the
+    app's own layout — 3-byte device code, 16-byte name, 6-byte 4-digit PIN.
+
+    Runs before the Aromely check on purpose: these units advertise the same
+    AF30 service the Aro Max is detected by, and the Aro Max itself keeps the
+    "AroMax"/"Diffuser" marker in its manufacturer data.
+    """
+    if advertisement_data is not None:
+        mfr_data = getattr(advertisement_data, "manufacturer_data", None) or {}
+        # Company ID is the OEM's own and unambiguous; the Aro Max (same OEM
+        # firmware, different app) advertises 0xAF30 service but not this ID.
+        if SCENT_MASTER_MFR_ID in mfr_data:
+            return True
+    name = (ble_name or "").upper()
+    return any(marker.upper() in name for marker in SCENT_MASTER_NAME_MARKERS)
 
 
 def _detect_aromely(advertisement_data) -> bool:
