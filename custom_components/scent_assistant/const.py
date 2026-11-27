@@ -17,6 +17,7 @@ class DeviceType(StrEnum):
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
     SCENT_TECH = "scent_tech"                          # YooAI OEM, ScentLab / Scent Tech apps (FFE1, 55 AA … 5A frames)
     AI_DIFFUSER = "ai_diffuser"                        # AI-Diffuser app (com.lm.aidiffuser), Telink 1910/2b10, JSON-wrapped FE EF frames
+    SCENT_MASTER = "scent_master"                      # Scent Master Pro app (com.xxiot.bx.scent), 55-framed register protocol
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,64 @@ AROMELY_REG_INFO = 0xDB         # device flags (read)
 AROMELY_REG_LABEL = 0xDC        # note/label (read)
 AROMELY_REG_SCHED1 = 0xF1       # schedule slot 1 incl. enabled flag (read)
 AROMELY_REG_SCHED_ALL = 0xF2    # all four schedule slots (read)
+
+# ---------------------------------------------------------------------------
+# Scent Master Pro (com.xxiot.bx.scent) — same 55-framed OEM firmware family
+# ---------------------------------------------------------------------------
+# Decoded from the app itself (1.0.43 is a WeChat mini-program inside an
+# Android wrapper) and verified against an iPhone trace of a "-TJ-" unit.
+# Frame: `55 <dir> <cmd> <fn> [<len> <payload…>] <chk>`, chk = sum of every
+# byte after the 0x55, mod 256; dir 0x10 = write, 0x11 = notify; fn 0x00 =
+# bare read, 0x05 = data write/response. The Aromely Aro Max is a rebadged
+# unit of the same family. See PROTOCOL.md.
+# The advertisement carries company ID 0xED9D (raw AD: `9D ED` little-endian)
+# followed by MAC bytes 2..5, a 16-byte name and a 6-byte PIN. WeChat's
+# `advertisData` includes the company ID, which is why the app reads the
+# device code as the first three MAC bytes (9D ED F1 on the traced unit).
+SCENT_MASTER_MFR_ID = 0xED9D
+SCENT_MASTER_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
+SCENT_MASTER_CHAR_WRITE_UUID = "0000ffe2-0000-1000-8000-00805f9b34fb"
+SCENT_MASTER_CHAR_NOTIFY_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+SCENT_MASTER_FRAME_HEADER = 0x55
+SCENT_MASTER_DIR_WRITE = 0x10
+SCENT_MASTER_DIR_NOTIFY = 0x11
+SCENT_MASTER_FN_READ = 0x00
+SCENT_MASTER_FN_DATA = 0x05
+
+SCENT_MASTER_REG_CLOCK = 0x00        # 04 <day> HH MM SS (binary, day mask below)
+SCENT_MASTER_REG_SCHEDULE_1 = 0x01   # 09 <record>; 0x01..0x05 = schedules 1..5
+SCENT_MASTER_REG_FAN = 0x06          # 00 off, 01 level 1, 02 level 2
+SCENT_MASTER_REG_SESSION = 0x07      # 01 01 sent once after connect
+SCENT_MASTER_REG_ENABLE_1 = 0x11     # 01 <00|01>; 0x11..0x15 = schedules 1..5
+SCENT_MASTER_REG_BATTERY = 0x26      # read: one byte, percent
+SCENT_MASTER_REG_LAMP = 0xB0
+SCENT_MASTER_REG_SENSOR = 0xB1
+SCENT_MASTER_REG_STATUS = 0xD1       # read: 50-byte schedule block
+SCENT_MASTER_REG_MODE = 0xD2         # 01 performance / 02 balanced / 03 quiet
+SCENT_MASTER_REG_NAME = 0xDA         # read/write 16-byte UTF-8 name
+SCENT_MASTER_REG_NOTE = 0xDB         # read/write 16-byte UTF-8 note
+SCENT_MASTER_REG_PASSWORD = 0xDC     # 06 <PIN x4> 00 00
+SCENT_MASTER_REG_STATUS_ALT = 0xF2   # "-TJ-" firmware replies to D1 with F2
+
+SCENT_MASTER_SLOTS = 5
+# Each record is ten bytes: enabled, day mask, start h/m, end h/m,
+# work u16 BE, pause u16 BE.
+SCENT_MASTER_RECORD_SIZE = 10
+SCENT_MASTER_STATUS_BYTES = SCENT_MASTER_SLOTS * SCENT_MASTER_RECORD_SIZE
+# Day mask: Mon=1 … Sun=64 (also the clock payload's weekday flag).
+SCENT_MASTER_DAYS = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40)
+SCENT_MASTER_SUNDAY = 0x40
+SCENT_MASTER_LEVELS = (1, 2)
+SCENT_MASTER_MODES = {1: "performance", 2: "balanced", 3: "quiet"}
+
+# The advertised local name carries the model marker; these units all speak
+# the same protocol. The Aromely Aro Max advertises the same AF30 service, so
+# the marker has to win before Aromely's service-UUID fallback runs.
+SCENT_MASTER_NAME_MARKERS = (
+    "-TJ-", "-DCTJ-", "-TJUN-", "-V3TJ-", "-V3NF-",
+    "-DC-", "-DCL-", "-BLEWIFI-", "-XXJV", "-XXJ-2",
+)
 
 # ---------------------------------------------------------------------------
 # Scent Tech / ScentLab (YooAI OEM) — `55 AA LEN CMD DATA… CHK 5A`

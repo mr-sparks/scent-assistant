@@ -352,6 +352,205 @@ Little-endian: rate integer `[3-4]`, current volume `[5-6]` (`FFFF` until a
 fragrance is set in the app), capacity `[7-8]`, rate fraction `[9-10]` in
 1/10000 (so `03 00 … 80 25` = 3.96 mL/h), oil type `[15-16]`.
 
+## Scent Master Pro (com.xxiot.bx.scent)
+
+Decoded from the app itself — version 1.0.43 is a WeChat mini-program shipped
+inside an Android wrapper (APK `assets/SaaA_embed/…(%page_ble%).wxapkg`,
+unpacked with the standard `0xBE` wxapkg container) — and cross-checked
+against an iPhone HCI trace of a `-TJ-` unit (Nov 2026, MAC `9D:ED:F1:…`).
+The app is the OEM firmware family behind Breeze / Diffmely X-series /
+Aromatex / Guangdong B500 hotel units; the Aromely Aro Max (above) is a
+rebadged unit of the same family, which is why the framing and several
+registers match.
+
+### Advertisement, password and device code
+
+The manufacturer-specific data uses the OEM's own company ID **0xED9D** (raw
+AD starts `9D ED`, little-endian). CoreBluetooth/bleak hand you the payload
+without it, i.e. starting at MAC byte 2:
+
+```
+raw AD:         9D ED | F1 D5 B9 BD | 16-byte name | 6-byte PIN
+bleak payload:        | F1 D5 B9 BD | 16-byte name | 6-byte PIN
+```
+
+WeChat's `advertisData` includes the company ID, which is why the app's
+`s.slice(0, 6)` yields the device **code** = the first three MAC bytes
+(`9D ED F1` on the traced unit) and `s.slice(6, 22)` the name. On the unit
+tested, the name and PIN fields are all zeros — the default PIN is app-side.
+The advertised local name has the form `YGZK-XXJ-TJ-<MAC>`; the model marker
+(`-TJ-`, `-DCTJ-`, `-DC-`, `-DCL-`, `-BLEWIFI-`, `-XXJV`, `-XXJ-2`, …) selects
+the connect-time command set, and the unit also advertises the `AF30` service.
+
+**The PIN never reaches the device.** The app compares the typed PIN with the
+advertised value and only then opens the control page, so any BLE client can
+drive the diffuser without it. Command `0xDC` writes a *new* PIN:
+`55 10 DC 05 06 <ASCII PIN ×4> 00 00 <chk>`.
+
+### GATT
+
+Service `FFE0`, notifications on `FFE1` (handle 0x0044, CCCD 0x0045), writes on
+`FFE2` (handle 0x0042, write-without-response). MTU 185/256.
+
+### Frame
+
+```
+55 <dir> <cmd> <fn> [<len> <payload…>] <chk>
+```
+
+- `dir` — `0x10` app→device, `0x11` device→app.
+- `fn` — `0x00` bare read request, `0x05` data (length + payload follow).
+- `chk` — sum of every byte after `0x55`, mod 256.
+- Frames have no terminator; one ATT write/notification is one frame.
+- After the checksum, `-DC-`/`-DCL-` units append `00 00` and `-XXJV`/`-XXJ-2`
+  units append two code bytes from the advertisement. Not used here.
+
+### Registers
+
+| Cmd | fn 00 (read) | fn 05 (write) payload |
+|-----|--------------|------------------------|
+| `00` | — | `04 <day> <HH> <MM> <SS>` clock (binary, not BCD) |
+| `01`–`05` | — | `09 <mask> <sH sM> <eH eM> <work u16 BE> <pause u16 BE>` schedule 1–5 |
+| `06` | fan level | `01 <00 off | 01 level 1 | 02 level 2>` |
+| `07` | — | `01 01` session start, sent once after connect |
+| `11`–`15` | schedule 1–5 enabled | `01 <00 | 01>` — changing the value also runs one spray cycle (see *Manual spray*) |
+| `26` | battery | — (one byte, percent) |
+| `B0` | lamp / RGB | `01 <code>` (0 off, 1–7 colours, 255 gradient), `02 <code> <move>` |
+| `B1` | presence sensor | `06 <enabled> <work s> <pause s> …` |
+| `D1` | all five schedules | — |
+| `D2` | mode | `01 <01 performance | 02 balanced | 03 quiet>` |
+| `DA` | device name (16 bytes) | `10 <16-byte UTF-8 name>` |
+| `DB` | note (16 bytes) | `10 <16-byte UTF-8 note>` |
+| `DC` | — | `06 <PIN ×4> 00 00` |
+| `F1` / `F2` | schedule block aliases | — |
+
+Clock payload: first byte after the length is the weekday flag
+`Sun=64, Mon=1, Tue=2, Wed=4, Thu=8, Fri=16, Sat=32`, then local hour, minute,
+second as plain binary.
+
+### Schedule record
+
+Ten bytes, both in `D1`/`F2` read-backs and inside each write:
+
+```
+[0]  enabled (00/01)
+[1]  weekday mask — Mon=1, Tue=2, Wed=4, Thu=8, Fri=16, Sat=32, Sun=64
+[2]  start hour    [3] start minute
+[4]  end hour      [5] end minute
+[6:8]  work seconds  (u16 big-endian)
+[8:10] pause seconds (u16 big-endian)
+```
+
+A `D1` read (50-byte reply) is five of these back to back:
+`enabled, record 1, enabled, record 2, …`. On `-TJ-` firmware the reply arrives
+with command byte `F2` instead of `D1`; both are 50 bytes and are parsed the
+same way.
+
+### Chip check (anti-clone)
+
+After the first reads, the app sends a frame derived from the advertised code,
+with `dir` replaced by `code[0] ^ code[1] | code[2]` and the command byte taken
+from the server-side licence config (`CONFIG_PUNISHMENT3_CMD`, `0xDA` on the
+Nov 2026 build):
+
+```
+i = code[0], s = code[1], t = code[2]
+55 <i^s|t> <check_cmd> 00 <s^t> <t> <i^s|t> 55 <i> <s> <t> <i> <s> <t> <t> FF 55 <chk>
+```
+
+For code `9D ED F1` that is
+`55 F1 DA 00 1C F1 F1 55 9D ED F1 9D ED F1 F1 FF 55 59`. The reply
+(`55 11 DA 05 10 …`) is only used by the app to decide whether it is talking to
+a genuine board — nothing in it is needed for control, so a client may skip it.
+
+### Connect sequence (`-TJ-` unit, from the trace)
+
+```
+55 10 D1 00 E1                              read all schedules
+55 11 F2 05 32 01 …                         50-byte schedule block
+55 10 00 05 04 40 0E 1F 32 B8               clock: Sun, 14:31:50
+55 11 00 05 04 40 0E 1F 32 B9               echo
+55 10 DB 00 EB                              read note
+55 11 DB 05 10 4E 6F 74 65 …                "Note…" (16 bytes)
+55 10 D2 00 E2                              read mode
+```
+
+Confirmed on hardware (22 Nov 2026, `YGZK-XXJ-TJ-<mac>`, macOS/bleak):
+
+```
+-> 55 10 07 05 01 01 1E                  session start: no reply (fine)
+-> 55 10 00 05 04 40 0F 07 16 85         clock accepted, echoed as 55 11 … 86
+-> 55 10 D1 00 E1                        answered as 55 11 F2 05 32 … (50 bytes)
+-> 55 10 06 00 16                        no answer — this model has no level
+-> 55 10 D2 00 E2                        no answer — no mode
+-> 55 10 DA 00 EA                        16 zero bytes: name lives in the ad
+-> 55 10 DB 00 EB                        55 11 DB 05 10 "Note" + zeros
+```
+
+Schedule writes are accepted with no PIN and without the chip-check frame:
+
+```
+-> 55 10 02 05 09 52 09 00 13 00 00 05 03 84 1A   echoed as 55 11 … 1B
+-> 55 10 12 05 01 01 29                          echoed as 55 11 … 2A
+-> 55 10 D1 00 E1                                identical 50-byte block back
+```
+
+The captured block reported **Setting 1 as enabled with an all-zero record**
+— an unused slot — while the configured program was Setting 2. Anything that
+picks "the schedule in use" must therefore require a non-empty record, not
+just the enabled flag.
+
+### Manual spray
+
+Neither the app nor the register table has a one-shot spray command; `0x07`
+only arms the unit. Bench tests on the `-TJ-` firmware:
+
+| Action | Result |
+|--------|--------|
+| write a 2–3 minute window that is open right now (record + enable) | no spray at all, for the whole window |
+| write `0x13 01 00` while the flag is already `0` | no spray — an identical write is dropped |
+| write `0x13 01 00` while the flag is `1` | spray within ~0–5 s |
+| write `0x13 01 01` | spray within ~0–5 s |
+| clear a slot's record and disable it | spray within ~1 s |
+
+So the firmware runs one cycle whenever a slot's enable register *changes*
+value, which is a one-shot primitive that does not need a schedule at all:
+pulse a slot that holds no program on and straight back off. Home Assistant
+exposes it as a **Spray Now** button, using the first schedule whose flag is
+off and whose record is all zeros.
+
+The two writes 20 s apart in the original trace show a start-hour edit on
+mode 2:
+
+```
+55 10 02 05 09 52 0B 00 13 00 00 05 03 84 1C   mask 52 (Tue+Fri+Sun), 11:00–19:00, 5 s / 900 s
+55 10 02 05 09 52 09 00 13 00 00 05 03 84 1A   start moved to 09:00
+```
+
+Work must stay within 3–10 s and pause within 120–900 s for the B500-class
+units; the firmware stores whatever it is given.
+
+### What the app exposes (confirmed on screen)
+
+The unit's page shows only **Name**, **Note**, **Reset PWD** and five
+"Setting N" cards (switch, start/end time, work/pause, weekday picker). There
+is no power switch, no level, no mode and no battery readout — the device runs
+from its schedules. Home Assistant mirrors exactly that: five schedules with
+their own switch, times, durations and days, plus the name/note read-back; no
+Power, Level or Battery entities. The advertised name has the form
+`YGZK-XXJ-TJ-<MAC>`, which is what routes it through the `-TJ-` connect
+sequence above.
+
+### Open questions
+
+- `0x07` (`session start`) gets no reply and the unit accepted a schedule
+  write after it, but it has not been tried *without* it — cosmetic either way.
+- `0x06` (level / off), `0x26` (battery) and `0xD2` (mode) get no answer on
+  this model, and its app shows none of them: the schedules are the whole
+  control surface.
+- Lamp (`B0`), presence sensor (`B1`) and music (`C0`/`C3`) belong to other
+  models of the family and were not exercised.
+
 ## Building Packets (Python)
 
 ```python

@@ -30,7 +30,11 @@ async def async_setup_entry(
     """Set up switch entities."""
     device: ScentDiffuserDevice = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[SwitchEntity] = [DiffuserPowerSwitch(device, entry)]
+    entities: list[SwitchEntity] = []
+    # Scent Master units have no power switch in their app — the device runs
+    # from its schedules, each with its own switch below.
+    if device.device_type != DeviceType.SCENT_MASTER:
+        entities.append(DiffuserPowerSwitch(device, entry))
 
     is_cloud = entry.data.get("connection_mode") == "cloud"
     if not is_cloud:
@@ -59,8 +63,8 @@ async def async_setup_entry(
 
     if device.device_type == DeviceType.SCENT_TECH:
         entities.extend(ScentTechTimerSwitch(device, slot) for slot in TIMER_SLOTS)
-    # AI-Diffuser: the app's six "Modes".
-    if device.device_type == DeviceType.AI_DIFFUSER:
+    # AI-Diffuser: the app's six "Modes"; Scent Master: its five settings.
+    if device.device_type in (DeviceType.AI_DIFFUSER, DeviceType.SCENT_MASTER):
         entities.extend(ScentTechTimerSwitch(device, slot) for slot in timer_slots_for(device))
 
     async_add_entities(entities)

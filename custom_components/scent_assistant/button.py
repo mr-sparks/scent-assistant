@@ -36,6 +36,10 @@ async def async_setup_entry(
     # AI-Diffuser polls status and oil only; Refresh re-reads everything.
     if device.device_type == DeviceType.AI_DIFFUSER:
         entities.append(AiDiffuserRefreshButton(device, entry))
+    # Scent Master has no one-shot command, but pulsing a free slot's enable
+    # register makes the firmware spray once.
+    if device.device_type == DeviceType.SCENT_MASTER:
+        entities.append(ScentMasterSprayButton(device, entry))
     async_add_entities(entities)
 
 
@@ -117,6 +121,29 @@ class RefreshSchedulesButton(ButtonEntity):
 
     async def async_press(self) -> None:
         await self._device.refresh_state()
+
+
+class ScentMasterSprayButton(ButtonEntity):
+    """One spray cycle on demand, for automations."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Spray Now"
+    _attr_icon = "mdi:spray"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry) -> None:
+        self._device = device
+        self._attr_unique_id = f"{device.unique_id}_spray_now"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.unique_id)},
+        }
+
+    @property
+    def available(self) -> bool:
+        return self._device.connection_mode == "ble"
+
+    async def async_press(self) -> None:
+        if not await self._device.spray_now():
+            _LOGGER.warning("Manual spray failed on %s", self._device.name)
 
 
 class AiDiffuserRefreshButton(RefreshSchedulesButton):

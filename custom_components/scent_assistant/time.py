@@ -25,11 +25,12 @@ async def async_setup_entry(
     device: ScentDiffuserDevice = hass.data[DOMAIN][entry.entry_id]
     if device.device_type == DeviceType.SCENTIMENT:
         return
-    # Scent Tech has five independent timers instead of one window.
-    if device.device_type == DeviceType.SCENT_TECH:
+    # Scent Tech and Scent Master have independent schedules instead of one
+    # window.
+    if device.device_type in (DeviceType.SCENT_TECH, DeviceType.SCENT_MASTER):
         async_add_entities(
             ScentTechTimerTime(device, slot, field)
-            for slot in TIMER_SLOTS
+            for slot in timer_slots_for(device)
             for field in ("start_minute", "stop_minute")
         )
         return

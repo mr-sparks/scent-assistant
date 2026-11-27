@@ -34,7 +34,7 @@ from .const import (
     DeviceType,
 )
 from .device import ScentDiffuserDevice
-from .protocol_ble import ScheduleSlot, ScheduleSetup
+from .protocol_ble import ScheduleSlot, ScheduleSetup, detect_device_type
 from .protocol_cloud import AromaLinkCloudClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -95,6 +95,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ble_address = entry.data.get(CONF_BLE_ADDRESS)
     ble_name = entry.data.get(CONF_BLE_NAME, "")
     device_type = DeviceType(entry.data.get(CONF_DEVICE_TYPE, "aroma_link"))
+
+    # Entries created before their family was known are stored as the
+    # Aroma-Link default and never answer. Re-check the advertisement for the
+    # Scent Master OEM id and switch to the protocol that drives it.
+    if device_type == DeviceType.AROMA_LINK and ble_address:
+        info = bluetooth.async_last_service_info(hass, ble_address, connectable=False)
+        if info is not None and detect_device_type(
+            info.name or ble_name, info
+        ) == DeviceType.SCENT_MASTER:
+            _LOGGER.info(
+                "Scent Assistant: %s is a Scent Master unit; using its protocol",
+                ble_name or ble_address,
+            )
+            device_type = DeviceType.SCENT_MASTER
 
     connection_mode = entry.data.get(CONF_CONNECTION_MODE, "ble")
 
